@@ -1,0 +1,6 @@
+scratch/
+run.log
+report.md
+dist/
+.env
+lefthook-local.yml

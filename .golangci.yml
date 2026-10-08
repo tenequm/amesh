@@ -1,0 +1,43 @@
+version: "2"
+run:
+  timeout: 5m
+  allow-serial-runners: true
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - durationcheck
+    - errorlint
+    - fatcontext
+    - gosec
+    - intrange
+    - misspell
+    - modernize
+    - musttag
+    - nilerr
+    - noctx
+    - nolintlint
+    - nonamedreturns
+    - thelper
+    - unconvert
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+  settings:
+    govet:
+      enable: [shadow]
+  exclusions:
+    presets: [comments, std-error-handling, common-false-positives]
+    rules:
+      - path: _test\.go
+        linters: [errcheck, gosec]
+formatters:
+  enable: [gofumpt, goimports]
+  settings:
+    gofumpt:
+      extra:
+        group-params: true
+        clothe-returns: true
+        balance-calls: false

@@ -1,0 +1,15 @@
+assert_lefthook_installed: true
+min_version: 2.1.17
+pre-commit:
+  piped: true
+  commands:
+    check:
+      run: just check
+pre-merge-commit:
+  commands:
+    check:
+      run: just check
+pre-push:
+  commands:
+    test:
+      run: just test
