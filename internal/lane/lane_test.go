@@ -5,8 +5,11 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/tenequm/amesh/internal/envelope"
@@ -43,9 +46,10 @@ func (s *seat) Live(ctx context.Context, k registry.Key) (bool, error) {
 }
 
 type recorder struct {
-	path    string
-	handler relay.Handler
-	writes  []relay.Delivery
+	idleID, idleMode string
+	path             string
+	handler          relay.Handler
+	writes           []relay.Delivery
 }
 
 func (r *recorder) Listen(_ context.Context, p string, h relay.Handler) (io.Closer, error) {
@@ -59,7 +63,10 @@ func (r *recorder) Write(_ context.Context, d relay.Delivery) error {
 	return nil
 }
 
-func (*recorder) NotifyWhenIdle(context.Context, string, string, string, string) error { return nil }
+func (r *recorder) NotifyWhenIdle(_ context.Context, _, _, mode, id string) error {
+	r.idleID, r.idleMode = id, mode
+	return nil
+}
 
 func TestLaneRouting(t *testing.T) {
 	ctx := t.Context()
@@ -137,4 +144,89 @@ func TestLaneRouting(t *testing.T) {
 	if _, err = b.Connect(ctx, child, parentID); err != nil || r.path != oldPath {
 		t.Fatal(r.path, err)
 	}
+}
+
+func TestLaneNotices(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		s := &seat{rows: map[int]registry.Session{}}
+		r := new(recorder)
+		b := New(ctx, s, r, "local")
+		defer func() { cancel(); b.Wait() }()
+		p := registry.Session{PID: 11, ProcStart: "p", SessionID: "p", Name: "parent", FromMode: "bypass", SocketPath: "/tmp/cc-socks/11.sock"}
+		child := registry.Session{PID: 12, ProcStart: "c", SessionID: "c", Name: "child", CWD: "/project", SocketPath: "/tmp/cc-socks/12.sock", Status: "idle"}
+		s.put(p)
+		s.put(child)
+		connect := func() {
+			t.Helper()
+			if _, e := b.Connect(ctx, child, "p"); e != nil {
+				t.Fatal(e)
+			}
+			synctest.Wait()
+		}
+		advance := func(d time.Duration) { time.Sleep(d); synctest.Wait() }
+		connect()
+		advance(2 * time.Second)
+		s.remove(child.PID)
+		advance(time.Second)
+		if len(r.writes) != 0 || len(b.lanes) != 0 {
+			t.Fatal("transient child announced")
+		}
+		s.put(child)
+		connect()
+		advance(3 * time.Second)
+		if len(r.writes) != 1 || !strings.HasPrefix(r.writes[0].Message.Body, "Lane started: child") || r.writes[0].Message.FromMode != "bypass" {
+			t.Fatal(r.writes)
+		}
+		child.Status = "busy"
+		s.put(child)
+		advance(time.Second)
+		idle := func(id string) {
+			t.Helper()
+			if err := r.handler(ctx, relay.Event{Action: "peer_idle_notice", OriginalID: id, Peer: peercred.Credentials{PID: child.PID}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		first := r.idleID
+		if first == "" || r.idleMode != "" {
+			t.Fatal("missing or misclassified idle subscription")
+		}
+		if _, e := b.SendToParent(ctx, child, "p", "reply"); e != nil {
+			t.Fatal(e)
+		}
+		child.Status = "idle"
+		s.put(child)
+		advance(time.Second)
+		child.Status = "busy"
+		child.FromMode = "bypass"
+		s.put(child)
+		advance(time.Second)
+		if r.idleID == first || r.idleMode != "bypass" {
+			t.Fatal("second busy edge")
+		}
+		idle(first)
+		if len(r.writes) != 2 {
+			t.Fatal("replied turn sent a separate notice")
+		}
+		p.FromMode = "prompting"
+		s.put(p)
+		idle(r.idleID)
+		d := r.writes[len(r.writes)-1]
+		if d.Message.Body != "child finished its turn and is idle. No reply needed." || d.Message.FromMode != "" {
+			t.Fatal(d)
+		}
+		s.remove(child.PID)
+		advance(time.Second)
+		d = r.writes[len(r.writes)-1]
+		if d.Message.Body != "Lane ended: child exited. No reply needed." || d.Message.From != r.writes[0].Message.From || len(b.lanes) != 0 {
+			t.Fatal(d)
+		}
+		child.PID++
+		s.put(child)
+		connect()
+		advance(250 * time.Millisecond)
+		if len(r.writes) != 5 || !strings.HasPrefix(r.writes[4].Message.Body, "Lane started:") {
+			t.Fatal("busy child should announce immediately")
+		}
+	})
 }
