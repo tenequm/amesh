@@ -80,14 +80,19 @@ func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {
 		}
 		pid = parent
 	}
-	return Session{}, fmt.Errorf("no live Claude session for caller: %w", os.ErrNotExist)
+	return Session{}, errNoSession
 }
 
 var (
+	errNoSession        = fmt.Errorf("no live Claude session for caller: %w", os.ErrNotExist)
 	ErrEntryUnavailable = errors.New("session registry entry unavailable")
 	errNotReady         = errors.New("session registry entry not ready")
 	errStaleProcess     = errors.New("registry identity differs from live process")
 )
+
+func PendingEntry(err error) bool {
+	return errors.Is(err, errNoSession) || errors.Is(err, errNotReady)
+}
 
 // A bad entry can hide a valid entry for the same process in another seat.
 // If no seat verifies it, Resolve must stop before inheriting an ancestor's identity.
@@ -99,7 +104,7 @@ func (r *Registry) readPID(pid int, start string) (Session, error) {
 			return s, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errStaleProcess) {
-			unavailable = err
+			unavailable = errors.Join(unavailable, err)
 		}
 	}
 	if unavailable != nil {
@@ -333,19 +338,23 @@ func (r *Registry) Live(ctx context.Context, key Key) (bool, error) {
 }
 
 func (s Session) MeshExcluded(dirs, roots []string) bool {
-	return (len(dirs) > 0 && s.ConfigDir != dirs[0]) || excluded(s.CWD, roots)
+	_, excluded := s.MeshExclusionRoot(dirs, roots)
+	return excluded
 }
 
-func excluded(cwd string, roots []string) bool {
+func (s Session) MeshExclusionRoot(dirs, roots []string) (string, bool) {
 	for _, root := range roots {
-		if cwd == root || strings.HasPrefix(cwd, strings.TrimRight(root, "/")+"/") {
-			return true
+		if s.CWD == root || strings.HasPrefix(s.CWD, strings.TrimRight(root, "/")+"/") {
+			return root, true
 		}
-		resolved, err := filepath.EvalSymlinks(cwd)
+		resolved, err := filepath.EvalSymlinks(s.CWD)
 		base, e := filepath.EvalSymlinks(root)
 		if err == nil && e == nil && (resolved == base || strings.HasPrefix(resolved, strings.TrimRight(base, "/")+"/")) {
-			return true
+			return root, true
 		}
 	}
-	return false
+	if len(dirs) > 0 && s.ConfigDir != dirs[0] {
+		return s.ConfigDir, true
+	}
+	return "", false
 }

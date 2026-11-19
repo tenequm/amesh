@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -60,15 +61,144 @@ func TestUpgradeArgumentsAndRefusals(t *testing.T) {
 		t.Fatal("directory boundary")
 	}
 	dir, key := liveEntry(t, "2.1.330")
-	d.cfg.ClaudeConfigDirs = []string{filepath.Join(dir, "primary"), dir}
-	d.registry = registry.New(d.cfg.ClaudeConfigDirs)
-	r := request(t, "")
-	w = httptest.NewRecorder()
-	d.upgrade(w, r.WithContext(context.WithValue(r.Context(), peerPID{}, key.PID)))
-	var refusal contract.LocalError
-	if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != http.StatusForbidden || refusal.Error != "excluded" {
-		t.Fatal(w.Code, refusal, err)
+	for _, tc := range []struct {
+		name        string
+		dirs, roots []string
+	}{
+		{"secondary seat", []string{filepath.Join(dir, "primary"), dir}, nil},
+		{"excluded cwd", []string{dir}, []string{dir}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			prior := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			defer slog.SetDefault(prior)
+			d.cfg.ClaudeConfigDirs, d.cfg.ExcludeRoots = tc.dirs, tc.roots
+			d.registry = registry.New(tc.dirs)
+			r := request(t, "")
+			w := httptest.NewRecorder()
+			d.upgrade(w, r.WithContext(context.WithValue(r.Context(), peerPID{}, key.PID)))
+			var refusal contract.LocalError
+			if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != http.StatusForbidden || refusal.Error != "excluded" {
+				t.Fatal(w.Code, refusal, err)
+			}
+			if got := logs.String(); strings.Count(got, "pipe upgrade refused") != 1 || !strings.Contains(got, "cause=excluded") || !strings.Contains(got, "root="+dir) || !strings.Contains(got, fmt.Sprintf("pid=%d", key.PID)) {
+				t.Fatal(got)
+			}
+		})
 	}
+}
+
+type admissionLane struct{ laneService }
+
+func (admissionLane) Connect(context.Context, registry.Session, string) (io.Closer, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func TestPipeWaitsForRegistryEntry(t *testing.T) {
+	const socket = "admission.sock"
+	const childSeat = "AMESH_TEST_ADMISSION_SEAT"
+	connect := func() error {
+		conn, err := dialPipe(t.Context(), socket, []string{"--parent", "parent"}, false)
+		if err != nil {
+			return err
+		}
+		return conn.Close()
+	}
+	writeEntry := func(dir string, pid int, ready bool) {
+		t.Helper()
+		start, err := registry.ProcessStart(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := map[string]any{"pid": pid, "procStart": start, "sessionId": strconv.Itoa(pid), "name": "lane", "cwd": dir, "messagingSocketPath": "/tmp/inbox.sock", "peerProtocol": 1}
+		if ready {
+			entry["status"] = "idle"
+		}
+		b, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if seat := os.Getenv(childSeat); seat != "" {
+		writeEntry(seat, os.Getpid(), true)
+		if err := connect(); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	t.Chdir(t.TempDir())
+	seat := t.TempDir()
+	if err := os.Mkdir(filepath.Join(seat, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dirs := []string{t.TempDir(), seat}
+	d := daemon{ctx: t.Context(), registry: registry.New(dirs), lane: admissionLane{}, pipes: make(map[*registration]struct{})}
+	started := make(chan struct{}, 1)
+	server := http.Server{ConnContext: connContext, ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(peerPID{}) == os.Getpid() {
+			started <- struct{}{}
+		}
+		d.upgrade(w, r)
+	})}
+	ln, err := listen(t.Context(), socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan struct{})
+	go func() { defer close(stopped); _ = server.Serve(ln) }()
+	t.Cleanup(func() { _ = server.Close(); <-stopped; d.work.Wait() })
+	first := make(chan error, 1)
+	go func() { first <- connect() }()
+	select {
+	case <-started:
+	case err := <-first:
+		t.Fatalf("first pipe did not reach admission: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestPipeWaitsForRegistryEntry$")
+	cmd.Env = append(os.Environ(), childSeat+"="+seat, "GORACE=atexit_sleep_ms=0")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ready pipe: %v: %s", err, output)
+	}
+	writeEntry(seat, os.Getppid(), false)
+	select {
+	case err := <-first:
+		t.Fatalf("first pipe returned before status was written: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	writeEntry(seat, os.Getppid(), true)
+	if err := <-first; err != nil {
+		t.Fatalf("original pipe: %v", err)
+	}
+}
+
+func TestUnregisteredPipeRefusedAfterBound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var logs bytes.Buffer
+		prior := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+		defer slog.SetDefault(prior)
+		d := daemon{registry: registry.New([]string{t.TempDir()})}
+		r := request(t, "")
+		w := httptest.NewRecorder()
+		start := time.Now()
+		d.upgrade(w, r.WithContext(context.WithValue(r.Context(), peerPID{}, os.Getpid())))
+		var refusal contract.LocalError
+		if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != http.StatusForbidden || refusal.Error != contract.LocalErrorErrorNotInSession {
+			t.Fatal(w.Code, refusal, err)
+		}
+		if elapsed := time.Since(start); elapsed != pipeAdmissionWait {
+			t.Fatalf("refused after %s", elapsed)
+		}
+		if got := logs.String(); strings.Count(got, "pipe upgrade refused") != 1 || !strings.Contains(got, fmt.Sprintf("pid=%d", os.Getpid())) || !strings.Contains(got, "no live Claude session") {
+			t.Fatal(got)
+		}
+	})
 }
 
 func TestReconnectBudget(t *testing.T) {

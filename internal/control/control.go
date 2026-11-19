@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -201,21 +202,49 @@ type bufferedConn struct {
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
 
+const pipeAdmissionWait = 3 * time.Second
+
+func (d *daemon) resolvePipe(ctx context.Context, pid int) (registry.Session, error) {
+	deadline := time.Now().Add(pipeAdmissionWait)
+	for {
+		s, err := d.registry.Resolve(ctx, pid)
+		remaining := time.Until(deadline)
+		if !registry.PendingEntry(err) || pid <= 0 || remaining <= 0 {
+			return s, err
+		}
+		select {
+		case <-ctx.Done():
+			return registry.Session{}, errors.Join(err, ctx.Err())
+		case <-time.After(min(100*time.Millisecond, remaining)):
+		}
+	}
+}
+
 func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
+	pid, _ := r.Context().Value(peerPID{}).(int)
+	log := slog.With("pid", pid)
 	parent, reconnect, err := mode(r)
+	defer func() {
+		if err != nil {
+			log.Warn("pipe upgrade refused", "cause", err)
+		}
+	}()
 	if err != nil {
 		reject(w, 400, contract.LocalErrorErrorBadRequest, err.Error())
 		return
 	}
-	pid, _ := r.Context().Value(peerPID{}).(int)
-	s, err := d.registry.Resolve(r.Context(), pid)
+	s, err := d.resolvePipe(r.Context(), pid)
 	if err != nil {
 		reject(w, 403, contract.LocalErrorErrorNotInSession, "This only works inside a Claude Code session.")
 		return
 	}
-	if parent == "" && d.meshExcluded(s) {
-		reject(w, 403, contract.LocalErrorErrorExcluded, "amesh is turned off for this directory.")
-		return
+	if parent == "" {
+		if root, excluded := s.MeshExclusionRoot(d.cfg.ClaudeConfigDirs, d.cfg.ExcludeRoots); excluded {
+			err = errors.New("excluded")
+			log = log.With("root", root)
+			reject(w, 403, contract.LocalErrorErrorExcluded, "amesh is turned off for this directory.")
+			return
+		}
 	}
 	var handle io.Closer
 	if parent == "" {
