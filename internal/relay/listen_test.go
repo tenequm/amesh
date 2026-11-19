@@ -17,6 +17,7 @@ import (
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
 	"github.com/tenequm/amesh/internal/relay/relaytest"
+	"github.com/tenequm/amesh/internal/state"
 )
 
 func TestPathVectors(t *testing.T) {
@@ -46,6 +47,9 @@ func TestListenReplyHeldAndIdle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
+	if !m.OwnsRelay(envelope.Address(path)) || m.OwnsRelay(path) || m.OwnsRelay(envelope.Address(inbox)) || m.OwnsRelay("") {
+		t.Fatal("incorrect relay membership")
+	}
 	info, err := os.Stat(path)
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatal(info, err)
@@ -58,7 +62,7 @@ func TestListenReplyHeldAndIdle(t *testing.T) {
 	}
 	<-lines
 	var idle frame
-	if err = json.Unmarshal(<-lines, &idle); err != nil || idle.Action != "notify_when_idle" || idle.ID != d.ID || idle.Mode != "prompting" {
+	if err = json.Unmarshal(<-lines, &idle); err != nil || idle.Action != "notify_when_idle" || idle.ID != d.ID || idle.Mode != "" {
 		t.Fatal(idle, err)
 	}
 	send := func(f frame) {
@@ -113,6 +117,9 @@ func TestListenReplyHeldAndIdle(t *testing.T) {
 	}
 	if err = listener.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if m.OwnsRelay(envelope.Address(path)) {
+		t.Fatal("closed relay is still owned")
 	}
 	if _, err = os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatal("socket survived close", err)
@@ -215,7 +222,11 @@ func TestAcceptWindowAndPeerCorrelation(t *testing.T) {
 		if got := <-events; got.Status != "accepted" || got.OriginalID != d.ID || got.Peer != peer {
 			t.Fatal(got)
 		}
-		<-p.done
+		select {
+		case <-p.done:
+			t.Fatal("accepted delivery stopped tracking late drops")
+		default:
+		}
 		idle := newWatch(d.ID, true)
 		time.Sleep(12 * time.Hour)
 		<-idle.done
@@ -296,5 +307,99 @@ func TestNativeIdleBeforeFirstTurn(t *testing.T) {
 	got, err := decode(b)
 	if err != nil || got.Action != "peer_idle_notice" || got.FromMode != "" || got.FinishedAt != 0 {
 		t.Fatal(got, err)
+	}
+}
+
+func TestAcceptedAndLaneDrops(t *testing.T) {
+	for _, kind := range []string{"hub", "lane"} {
+		t.Run(kind, func(t *testing.T) {
+			m := manager(t)
+			path, lines, err := relaytest.Inbox(t)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = m.store.SetLog("log"); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				d := delivery(path, 1)
+				d.Log, d.Session = "log", "session"
+				if kind == "lane" {
+					d.Message.FromSession = "ln_0d049992f294f2a2"
+				}
+				var reports []Event
+				e := &endpoint{manager: m, ctx: ctx, pending: make(map[subscription]*pending), handle: func(_ context.Context, ev Event) error {
+					reports = append(reports, ev)
+					if ev.Status == "accepted" {
+						return m.store.MarkReported(ev.Log, ev.OriginalID)
+					}
+					return nil
+				}}
+				m.endpoints[d.Message.From] = e
+				if err := m.Write(ctx, d); err != nil {
+					t.Fatal(err)
+				}
+				first := string(<-lines)
+				synctest.Wait()
+				entries, err := m.store.OpenEntries("log")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if kind == "hub" {
+					if entries[d.ID].Phase != state.Written || entries[d.ID].Session != d.Session {
+						t.Fatal(entries)
+					}
+					time.Sleep(8 * time.Second)
+					synctest.Wait()
+					if len(reports) != 1 || reports[0].Status != "accepted" || reports[0].Session != d.Session {
+						t.Fatal(reports)
+					}
+				} else if len(entries) != 0 {
+					t.Fatal(entries)
+				}
+				receipt := Event{Action: "peer_message_status", ID: "drop1", OriginalID: d.ID, Status: "dropped", DropReason: "rate-limited", Peer: peercred.Credentials{PID: os.Getpid(), UID: uint32(os.Geteuid())}}
+				if err = e.route(receipt); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				time.Sleep(31 * time.Second)
+				synctest.Wait()
+				if got := string(<-lines); got != first {
+					t.Fatal("retry changed the frame")
+				}
+				// A coalesced repeat of the first receipt must not consume another rewrite.
+				if err = e.route(receipt); err != nil {
+					t.Fatal(err)
+				}
+				receipt.ID, receipt.Status = "hold", "held"
+				if err = e.route(receipt); err != nil {
+					t.Fatal(err)
+				}
+				receipt.ID, receipt.Status = "deny", "denied"
+				if err = e.route(receipt); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				entries, err = m.store.OpenEntries("log")
+				if err != nil || len(entries) != 0 {
+					t.Fatal(entries, err)
+				}
+				if kind == "hub" && len(reports) != 1 || kind == "lane" && len(reports) != 0 {
+					t.Fatal(reports)
+				}
+				if err := m.Write(ctx, d); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-lines:
+					t.Fatal("terminal delivery replayed")
+				default:
+				}
+				cancel()
+				e.wg.Wait()
+			})
+		})
 	}
 }

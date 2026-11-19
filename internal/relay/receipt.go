@@ -11,7 +11,7 @@ import (
 	"github.com/tenequm/amesh/internal/peercred"
 )
 
-const acceptWindow = 5 * time.Second
+const acceptWindow = 8 * time.Second
 
 type (
 	subscription struct {
@@ -105,19 +105,29 @@ func (e *endpoint) route(event Event) error {
 }
 
 func (p *pending) report(event Event) {
+	event.Log, event.Session = p.d.Log, p.d.Session
+	if event.Action == "peer_message_status" && (p.d.notice || p.d.lane()) {
+		if event.Status != "accepted" {
+			slog.Info("local native delivery receipt", "id", p.d.ID, "status", event.Status, "drop_reason", event.DropReason)
+		}
+		return
+	}
 	if err := p.e.handle(p.e.ctx, event); err != nil && p.e.ctx.Err() == nil {
 		slog.Error("native delivery handler failed", "error", err)
 	}
 }
 
 func (p *pending) run(written time.Time) {
-	window := acceptWindow
+	window := p.d.AcceptWindow
+	if window <= 0 {
+		window = acceptWindow
+	}
 	if p.key.idle {
 		window = 12 * time.Hour
 	}
 	timer := time.NewTimer(time.Until(written.Add(window)))
 	defer timer.Stop()
-	held := false
+	held, accepted := false, false
 	rewrites := 0
 	var processed []string
 	for {
@@ -125,8 +135,11 @@ func (p *pending) run(written time.Time) {
 		case <-p.e.ctx.Done():
 			return
 		case <-timer.C:
-			if !p.key.idle && !held {
+			if !p.key.idle && !held && !accepted {
 				p.report(Event{Action: "peer_message_status", OriginalID: p.d.ID, From: envelope.Address(p.d.Inbox), Peer: p.peer, Status: "accepted"})
+				accepted = true
+				timer.Reset(time.Until(written.Add(retention)))
+				continue
 			}
 			return
 		case event := <-p.events:
@@ -138,13 +151,24 @@ func (p *pending) run(written time.Time) {
 				rewrites++
 				retried, err := p.e.manager.rewrite(p.e.ctx, p.d, p.peer)
 				if err != nil {
-					if p.e.ctx.Err() == nil {
+					if p.e.ctx.Err() == nil && !accepted {
 						event.DropReason = "session_gone"
 						p.report(event)
 					}
 					return
 				}
-				timer.Reset(time.Until(retried.Add(acceptWindow)))
+				if !accepted && !held {
+					timer.Reset(time.Until(retried.Add(window)))
+				}
+				continue
+			}
+			if accepted {
+				if p.d.lane() || p.d.notice {
+					p.report(event)
+				}
+				if event.Status == "dropped" {
+					return
+				}
 				continue
 			}
 			if event.Status == "held" {
@@ -154,11 +178,6 @@ func (p *pending) run(written time.Time) {
 					timer.Reset(retention)
 				}
 				continue
-			}
-			if event.Status == "dropped" {
-				if err := p.e.manager.store.Forget(p.d.ID); err != nil {
-					slog.Error("could not release dropped native id", "error", err)
-				}
 			}
 			p.report(event)
 			return

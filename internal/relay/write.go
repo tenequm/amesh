@@ -14,6 +14,8 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/google/uuid"
+
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
 )
@@ -37,7 +39,7 @@ type frame struct {
 	Action       string       `json:"action,omitempty"`
 	Message      *wireMessage `json:"message,omitempty"`
 	Priority     string       `json:"priority,omitempty"`
-	From         string       `json:"from"`
+	From         string       `json:"from,omitempty"`
 	Mode         string       `json:"from_mode,omitempty"`
 	Version      int          `json:"msgV"`
 	ID           string       `json:"msg_id"`
@@ -52,7 +54,8 @@ type frame struct {
 }
 
 func (f frame) line() ([]byte, error) {
-	if !uuidRE.MatchString(f.ID) || !validFrom(f.From) {
+	noFromNotice := f.Type == "user" && f.From == ""
+	if !uuidRE.MatchString(f.ID) || (!noFromNotice && !validFrom(f.From)) {
 		return nil, errors.New("invalid native frame id or sender")
 	}
 	b, err := json.Marshal(f)
@@ -201,7 +204,8 @@ func (m *Manager) send(ctx context.Context, path string, line []byte, before fun
 	return n, written, err
 }
 
-// post releases a claim only after definite non-delivery. A partial write is ambiguous.
+var errReplay = errors.New("native frame already claimed")
+
 func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(peercred.Credentials) error) (time.Time, error) {
 	content, err := envelope.Render(d.Message)
 	if err != nil {
@@ -218,38 +222,78 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 	}
 	defer release()
 	if retry {
-		if err = m.store.Forget(d.ID); err != nil {
+		if _, err = m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), true); err != nil {
 			return time.Time{}, err
 		}
-	}
-	claimed, err := m.store.Claim(d.ID, time.Now().Add(retention))
-	if err != nil || !claimed {
-		return time.Time{}, err
+		if err = wait(ctx, refill); err != nil {
+			return time.Time{}, err
+		}
+	} else if known, checkErr := m.store.Contains(d.Log, d.ID); known || checkErr != nil {
+		return time.Time{}, checkErr
 	}
 	body := content[strings.IndexByte(content, '\n')+1:]
 	if err = wait(ctx, pair.pacing.delay(time.Now(), body)); err != nil {
-		return time.Time{}, errors.Join(err, m.store.Forget(d.ID))
+		return time.Time{}, err
 	}
 	_, unlockInbox, err := m.acquire(ctx, d.Inbox)
 	if err != nil {
-		return time.Time{}, errors.Join(err, m.store.Forget(d.ID))
+		return time.Time{}, err
 	}
 	defer unlockInbox()
-	n, written, err := m.send(ctx, d.Inbox, line, before)
+	n, written, err := m.send(ctx, d.Inbox, line, func(peer peercred.Credentials) error {
+		if retry {
+			known, checkErr := m.store.Contains(d.Log, d.ID)
+			if checkErr != nil {
+				return checkErr
+			}
+			if !known {
+				return errors.New("native rewrite claim expired")
+			}
+		} else {
+			claimed, checkErr := m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), false)
+			if checkErr != nil {
+				return checkErr
+			}
+			if !claimed {
+				return errReplay
+			}
+		}
+		if before != nil {
+			return before(peer)
+		}
+		return nil
+	})
 	if err != nil && n == 0 {
-		return time.Time{}, errors.Join(err, m.store.Forget(d.ID))
+		return time.Time{}, err
 	}
 	pair.pacing.sent(written, body)
+	if err == nil {
+		err = m.store.MarkWritten(d.Log, d.ID)
+	}
 	return written, err
 }
 
+func (d Delivery) lane() bool { return strings.HasPrefix(d.Message.FromSession, "ln_") }
+
 func (m *Manager) Write(ctx context.Context, d Delivery) error {
+	if d.Message.From == "" {
+		if d.Message.FromName != "amesh" || d.Message.FromSession != "" || len(d.Message.HopChain) != 0 || d.NotifyWhenIdle {
+			return errors.New("a frame without a relay must be an amesh notice")
+		}
+		d.notice = true
+	}
+	if d.notice || d.lane() {
+		d.Session = ""
+	}
 	d.Message.HopChain = slices.Clone(d.Message.HopChain)
 	watch := m.watch(d, false)
 	written, err := m.post(ctx, d, false, watch.register)
 	watch.finish(written, err)
+	if errors.Is(err, errReplay) {
+		err = nil
+	}
 	if err == nil && d.NotifyWhenIdle {
-		return m.NotifyWhenIdle(ctx, d.Inbox, d.Message.From, d.Message.FromMode, d.ID)
+		return m.NotifyWhenIdle(ctx, d.Inbox, d.Message.From, d.IdleFromMode, d.ID)
 	}
 	return err
 }
@@ -279,18 +323,37 @@ func (m *Manager) NotifyWhenIdle(ctx context.Context, inbox, from, fromMode, id 
 	if err != nil && n == 0 {
 		return errors.Join(err, m.store.Forget(key))
 	}
+	if err == nil {
+		return m.store.MarkWritten("", key)
+	}
 	return err
 }
 
-func (m *Manager) WriteNotice(ctx context.Context, d Delivery, cause, peer, detail string) error {
+type NoticeSource struct{ MachineID, Source, Kind string }
+
+func (n NoticeSource) ID() string {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("amesh-notice\n"+n.MachineID+"\n"+n.Source+"\n"+n.Kind)).String()
+}
+
+func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSource, cause, peer, detail string) error {
+	if source.MachineID == "" || source.Source == "" {
+		return errors.New("missing notice source")
+	}
+	switch source.Kind {
+	case "delivery", "limit", "idle", "outbox":
+	default:
+		return errors.New("invalid notice kind")
+	}
 	var body string
 	switch cause {
-	case "denied", "refused":
+	case "denied", "refused", "start_refused":
 		body = fmt.Sprintf("your message to %s was not delivered: %s", peer, detail)
 	case "expired", "dropped":
 		body = fmt.Sprintf("your message to %s did not arrive: %s", peer, detail)
 	case "outbox_expired":
 		body = fmt.Sprintf("your message to %s was not sent: this machine could not reach the hub for 24 hours.", peer)
+	case "outbox_replaced":
+		body = fmt.Sprintf("your message to %s was not sent: the hub was replaced before it got there.", peer)
 	case "limit":
 		body = detail
 	case "idle":
@@ -298,7 +361,13 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, cause, peer, deta
 	default:
 		return fmt.Errorf("unknown notice cause %q", cause)
 	}
-	d.Message.FromMode, d.Message.HopChain = "", nil
+	d.ID = source.ID()
+	d.notice = true
+	if d.Message.From == "" {
+		d.Message.FromName = "amesh"
+		d.Message.FromSession = ""
+	}
+	d.Message.HopChain = nil
 	d.NotifyWhenIdle = false
 	d.Message.Body = "amesh notice: " + body + " No reply needed."
 	return m.Write(ctx, d)
@@ -307,9 +376,6 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, cause, peer, deta
 const maxRewrites = 3
 
 func (m *Manager) rewrite(ctx context.Context, d Delivery, peer peercred.Credentials) (time.Time, error) {
-	if err := wait(ctx, refill); err != nil {
-		return time.Time{}, err
-	}
 	return m.post(ctx, d, true, func(next peercred.Credentials) error {
 		if next != peer {
 			return errors.New("inbox process changed before retry")

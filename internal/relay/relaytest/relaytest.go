@@ -14,7 +14,7 @@ import (
 // Inbox returns a short Unix socket path and one NDJSON line (without LF) per connection.
 func Inbox(tb testing.TB) (string, <-chan []byte, error) {
 	tb.Helper()
-	dir, err := os.MkdirTemp("/tmp", "amesh-wire-") //nolint:usetesting // macOS limits the whole Unix socket path to 104 bytes.
+	dir, err := os.MkdirTemp("/tmp", "amesh-wire-a1-") //nolint:usetesting // macOS limits the whole Unix socket path to 104 bytes.
 	if err != nil {
 		return "", nil, err
 	}
@@ -23,7 +23,7 @@ func Inbox(tb testing.TB) (string, <-chan []byte, error) {
 			tb.Error(removeErr)
 		}
 	})
-	path := filepath.Join(dir, "amesh-wire.sock")
+	path := filepath.Join(dir, "amesh-wire-a1.sock")
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		return "", nil, err

@@ -3,11 +3,14 @@ package relay
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"go.yaml.in/yaml/v3"
 
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
@@ -48,14 +51,17 @@ func TestInboxWriteReplayAndNotice(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.ID = delivery(path, 2).ID
-	if err = m.WriteNotice(t.Context(), d, "denied", "amesh-wire", "It was denied."); err != nil {
+	source := NoticeSource{MachineID: "machine", Source: "2", Kind: "delivery"}
+	d.ID = source.ID()
+	d.Message.FromMode = "bypass"
+	if err = m.WriteNotice(t.Context(), d, source, "denied", "amesh-wire", "It was denied."); err != nil {
 		t.Fatal(err)
 	}
 	if err = json.Unmarshal(<-lines, &f); err != nil || f.ID != d.ID {
 		t.Fatalf("replayed initial frame: %+v %v", f, err)
 	}
 	msg, err := envelope.Parse(f.Message.Content)
-	if err != nil || msg.Body != "amesh notice: your message to amesh-wire was not delivered: It was denied. No reply needed." || msg.FromMode != "" || msg.FromName != "peer" || len(msg.HopChain) != 0 {
+	if err != nil || msg.Body != "amesh notice: your message to amesh-wire was not delivered: It was denied. No reply needed." || msg.FromMode != "bypass" || msg.FromName != "peer" || len(msg.HopChain) != 0 {
 		t.Fatal(msg, err)
 	}
 }
@@ -181,4 +187,91 @@ func TestDuplicateWaitDoesNotBlockOtherSender(t *testing.T) {
 			t.Fatal("missing delayed frame")
 		}
 	})
+}
+
+func TestNoticeContract(t *testing.T) {
+	raw, err := os.ReadFile("../../api/openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var api struct {
+		Components struct {
+			Examples map[string]yaml.Node `yaml:"examples"`
+		} `yaml:"components"`
+	}
+	if err = yaml.Unmarshal(raw, &api); err != nil {
+		t.Fatal(err)
+	}
+	var vector struct {
+		Value struct {
+			MachineID string `yaml:"machineId"`
+			Source    string `yaml:"source"`
+			Kind      string `yaml:"kind"`
+			ID        string `yaml:"msgId"`
+		} `yaml:"dataValue"`
+	}
+	node := api.Components.Examples["derivationNoticeId"]
+	if err = node.Decode(&vector); err != nil {
+		t.Fatal(err)
+	}
+	if got := (NoticeSource{vector.Value.MachineID, vector.Value.Source, vector.Value.Kind}).ID(); got != vector.Value.ID {
+		t.Fatal(got)
+	}
+	for _, name := range []string{"nativeNoticeFrame", "nativeNoticeNoFromFrame"} {
+		t.Run(name, func(t *testing.T) {
+			node := api.Components.Examples[name]
+			var ex struct {
+				Source struct {
+					Source string `yaml:"source"`
+					Kind   string `yaml:"kind"`
+				} `yaml:"x-amesh-notice"`
+				Envelope struct {
+					From    string `yaml:"from"`
+					Session string `yaml:"fromSession"`
+					Name    string `yaml:"fromName"`
+				} `yaml:"x-amesh-envelope"`
+				Value map[string]any `yaml:"dataValue"`
+			}
+			if err := node.Decode(&ex); err != nil {
+				t.Fatal(err)
+			}
+			m := manager(t)
+			inbox, lines, err := relaytest.Inbox(t)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = m.store.SetLog("log"); err != nil {
+				t.Fatal(err)
+			}
+			d := Delivery{Inbox: inbox, Log: "log", Session: "ignored", Message: envelope.Message{From: ex.Envelope.From, FromName: ex.Envelope.Name, FromSession: ex.Envelope.Session}}
+			n := NoticeSource{vector.Value.MachineID, ex.Source.Source, ex.Source.Kind}
+			cause, peer, detail := "limit", "stan", "This conversation with stan has had 20 messages without the owner taking part, so it is paused until the owner writes in it."
+			if n.Kind == "outbox" {
+				cause, peer, detail = "start_refused", "notes@db-work:air", "notes@db-work:air is offline and already has 100 messages waiting."
+			}
+			if err = m.WriteNotice(t.Context(), d, n, cause, peer, detail); err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err = json.Unmarshal(<-lines, &got); err != nil {
+				t.Fatal(err)
+			}
+			want, _ := json.Marshal(ex.Value)
+			actual, _ := json.Marshal(got)
+			if string(want) != string(actual) {
+				t.Fatalf("got %s, want %s", actual, want)
+			}
+			if err = m.WriteNotice(t.Context(), d, n, cause, peer, detail); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-lines:
+				t.Fatal("duplicate notice")
+			default:
+			}
+			if open, err := m.store.OpenEntries("log"); len(open) != 0 || err != nil {
+				t.Fatal(open, err)
+			}
+		})
+	}
 }

@@ -167,6 +167,16 @@ func (s *Store) Claim(id string, expiresAt time.Time) (bool, error) {
 	return s.BeginWrite("", id, "", expiresAt, false)
 }
 
+func (s *Store) Contains(log, id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.check(log); err != nil {
+		return false, err
+	}
+	entry, ok := s.data.IDs[id]
+	return ok && entry.Expires > time.Now().UnixNano(), nil
+}
+
 // BeginWrite atomically replaces a confirmed drop's claim on retry. A final report survives the rewrite.
 func (s *Store) BeginWrite(log, id, session string, expiresAt time.Time, retry bool) (bool, error) {
 	s.mu.Lock()
