@@ -38,7 +38,7 @@ func cleanName(s string) string {
 		return r
 	}, s))
 	if chars := []rune(s); len(chars) > 64 {
-		return string(chars[:64]) + "…"
+		return string(chars[:64]) + "\u2026"
 	}
 	return s
 }

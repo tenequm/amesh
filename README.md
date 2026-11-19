@@ -2,8 +2,6 @@
 
 `amesh` is the per-machine peer messaging daemon. Opted-in sessions use one MCP server. Mesh mode connects them to peers on the hub. Lane mode connects a child to its parent on the same machine.
 
-This scaffold provides the CLI, configuration, kernel peer credentials and package interfaces. The messaging, enrollment and socket operations currently return `errors.ErrUnsupported`. The hook exits successfully with empty output while its handler is unavailable.
-
 ## Build and check
 
 Install [Go](https://go.dev/) 1.27.4, [just](https://github.com/casey/just), [golangci-lint](https://golangci-lint.run/) 2.15.0 and [Lefthook](https://github.com/evilmartians/lefthook). From the repository root run:

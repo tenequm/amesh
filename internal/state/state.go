@@ -104,7 +104,7 @@ func (s *Store) Lock() error {
 	changed := false
 	for id, e := range next.IDs {
 		if e.Kind == "" {
-			// A1 omitted the kind. Its sessionless claims are dedup-only and its notice IDs used a different namespace input.
+			// Records from before entry kinds omitted the kind. Its sessionless claims are dedup-only and its notice IDs used a different namespace input.
 			e.Kind = "message"
 			next.IDs[id] = e
 			changed = true

@@ -80,8 +80,9 @@ func (b *Backend) directory(ctx context.Context) []contract.Peer {
 	b.mu.RLock()
 	cached := slices.Clone(b.peers)
 	revision := b.directoryVersion
+	synchronized := b.synchronized
 	b.mu.RUnlock()
-	if len(cached) > 0 {
+	if synchronized || len(cached) > 0 {
 		return cached
 	}
 	res, err := b.client.Peers(ctx)

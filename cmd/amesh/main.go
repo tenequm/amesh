@@ -72,7 +72,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 		socket, err := flags.SocketPath()
 		if command == "hook" {
 			if err == nil {
-				_ = control.Hook(ctx, socket, in, out)
+				control.Hook(ctx, socket, in, out)
 			}
 			return nil
 		}

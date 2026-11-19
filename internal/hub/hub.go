@@ -317,26 +317,7 @@ func sessionRPC[T any](ctx context.Context, c *Client, method, key, suffix strin
 }
 
 func (c *Client) Peers(ctx context.Context) (contract.PeersResponse, error) {
-	return c.PeersFiltered(ctx, "", "")
-}
-
-var projectLabel = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,39}$`)
-
-func (c *Client) PeersFiltered(ctx context.Context, project, machine string) (contract.PeersResponse, error) {
-	route := "/peers"
-	if project != "" {
-		if !projectLabel.MatchString(project) {
-			return contract.PeersResponse{}, errors.New("invalid peer project filter")
-		}
-		route += "?project=" + project
-	}
-	if machine != "" {
-		if project == "" || !machineName.MatchString(machine) {
-			return contract.PeersResponse{}, errors.New("invalid peer machine filter")
-		}
-		route += "&machine=" + machine
-	}
-	return rpc[contract.PeersResponse](ctx, c, http.MethodGet, route, nil)
+	return rpc[contract.PeersResponse](ctx, c, http.MethodGet, "/peers", nil)
 }
 
 func retryWrite[T any](ctx context.Context, c *Client, retry bool, send func(epoch int64) (T, error)) (T, error) {

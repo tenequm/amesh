@@ -23,16 +23,16 @@ func localRequest(ctx context.Context, socket, method, path string, body io.Read
 	return (&http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(req)
 }
 
-func Hook(ctx context.Context, socket string, in io.Reader, out io.Writer) error {
+// Hook fails open: a missing or failing daemon must never block Claude Code.
+func Hook(ctx context.Context, socket string, in io.Reader, out io.Writer) {
 	resp, err := localRequest(ctx, socket, http.MethodPost, "/amesh/hooks", in)
 	if err != nil {
-		return nil
+		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
 		_, _ = io.Copy(out, resp.Body)
 	}
-	return nil
 }
 
 func Status(ctx context.Context, socket string, out io.Writer) error {
