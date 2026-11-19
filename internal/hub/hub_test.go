@@ -146,7 +146,7 @@ func TestRequestsAndLostResponses(t *testing.T) {
 		c = enrolled(t, s.URL)
 		freshTransport(t, c)
 		ctx := t.Context()
-		if _, err := c.Info(ctx); err != nil {
+		if _, err := rpc[contract.HelloInfo](ctx, c, http.MethodGet, "/hello", nil); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := c.Hello(ctx, example[contract.HelloRequest](t, "helloRequest")); err != nil {
@@ -164,7 +164,7 @@ func TestRequestsAndLostResponses(t *testing.T) {
 		if _, err := c.Peers(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.Report(ctx, example[contract.ReportsRequest](t, "reportsRequest")); err != nil {
+		if _, err := c.Report(ctx, example[contract.HelloResponse](t, "helloResponse").Log, example[contract.ReportsRequest](t, "reportsRequest")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := c.End(ctx, key, example[contract.SessionEndRequest](t, "sessionEndRequest")); err != nil {
@@ -215,11 +215,12 @@ func TestOutboxRestartAndRetry(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		err := c.RunOutbox(ctx, func(out SendOutcome) {
+		err := c.Drain(ctx, nil, func(out SendOutcome) error {
 			if out.Err != nil || out.Response.Message.ID != req.ID {
 				t.Error("wrong outcome")
 			}
 			cancel()
+			return nil
 		})
 		if !errors.Is(err, context.Canceled) {
 			t.Fatal(err)
@@ -290,7 +291,9 @@ func TestOutboxExpiryWithoutHello(t *testing.T) {
 		defer cancel()
 		outcomes := make(chan SendOutcome, 1)
 		done := make(chan error, 1)
-		go func() { done <- c.RunOutbox(ctx, func(out SendOutcome) { outcomes <- out; cancel() }) }()
+		go func() {
+			done <- c.Drain(ctx, nil, func(out SendOutcome) error { outcomes <- out; cancel(); return nil })
+		}()
 		req := example[contract.SendRequest](t, "sendStartRequest")
 		if _, err := c.Send(ctx, req); !errors.Is(err, ErrQueued) {
 			t.Fatal(err)
@@ -358,7 +361,7 @@ func TestRetryAcrossEpochsAndReplacedLog(t *testing.T) {
 				if _, err := c.Send(ctx, different); !hasCode(err, 409, "id_conflict") {
 					t.Fatal("conflicting contents accepted")
 				}
-				if err := c.RunOutbox(ctx, nil); !errors.Is(err, context.Canceled) {
+				if err := c.Drain(ctx, nil, func(SendOutcome) error { return nil }); !errors.Is(err, context.Canceled) {
 					t.Fatal(err)
 				}
 				restarted := NewWithTransport(c.cfg, s.Client().Transport)
@@ -370,11 +373,12 @@ func TestRetryAcrossEpochsAndReplacedLog(t *testing.T) {
 				}
 				run, stop := context.WithCancel(t.Context())
 				defer stop()
-				err := restarted.RunOutbox(run, func(out SendOutcome) {
+				err := restarted.Drain(run, nil, func(out SendOutcome) error {
 					defer stop()
 					if replace && !hasCode(out.Err, 410, "log_replaced") || !replace && out.Err != nil {
 						t.Errorf("retry outcome %v", out.Err)
 					}
+					return nil
 				})
 				if !errors.Is(err, context.Canceled) {
 					t.Fatal(err)
@@ -434,11 +438,12 @@ func TestOutboxRetryAfter(t *testing.T) {
 		done := make(chan error, 1)
 		start := time.Now()
 		go func() {
-			done <- c.RunOutbox(ctx, func(out SendOutcome) {
+			done <- c.Drain(ctx, nil, func(out SendOutcome) error {
 				if out.Err != nil {
 					t.Error(out.Err)
 				}
 				cancel()
+				return nil
 			})
 		}()
 		if _, err := c.Send(ctx, example[contract.SendRequest](t, "sendStartRequest")); !errors.Is(err, ErrQueued) || !hasCode(err, 429, "rate_limited") {
@@ -672,4 +677,28 @@ func TestOnlyTextLimitAffectsHello(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReportRetryStopsAtLogChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		replacement := example[contract.HelloResponse](t, "helloResponse")
+		replacement.Log = "lg_replaced123"
+		s := hubtest.MemoryScript(t,
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+			hubtest.Step{Method: "POST", Target: "/peer/reports", Reply: hubtest.Reply(t, "errSuperseded")},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(replacement) }},
+		)
+		c := enrolled(t, "http://amesh-fix1.test")
+		c.http.Transport = s.Client().Transport
+		conn, err := c.Hello(t.Context(), contract.HelloRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = c.Report(t.Context(), conn.Log, example[contract.ReportsRequest](t, "reportsRequest")); err == nil {
+			t.Fatal("previous log report retried against replacement hub")
+		}
+		if current, _ := c.Connection(); current.Log != replacement.Log {
+			t.Fatal("log replacement did not run")
+		}
+	})
 }

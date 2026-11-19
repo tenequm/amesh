@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -140,6 +141,11 @@ func TestRecoveryAndLogReplacement(t *testing.T) {
 		t.Fatal(entries)
 	}
 	check(s.SetLog("new"))
+	entries, err = s.OpenEntries("new")
+	check(err)
+	if len(entries) != 0 {
+		t.Fatalf("previous log has reportable entries: %v", entries)
+	}
 	ok, err := s.BeginWrite("new", "partial", member.Key, expiry, "message")
 	if ok || err != nil {
 		t.Fatal(ok, err)
@@ -181,5 +187,56 @@ func TestLegacyClaimsStillSuppressReplay(t *testing.T) {
 	defer s.Close()
 	if ok, err := s.Claim("legacy", expiry); ok || err != nil {
 		t.Fatal(ok, err)
+	}
+}
+
+func TestFailedDirectorySyncLeavesClaimUncommitted(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "amesh-fix1-state")
+	store := New(dir)
+	if err := store.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// Write and rename still succeed, but the directory cannot be opened for fsync.
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+	if _, err := store.Claim("delivery", time.Now().Add(time.Hour)); err == nil {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
+		t.Fatal("directory sync unexpectedly succeeded")
+	}
+	if ok, err := store.Contains("", "delivery"); err != nil || ok {
+		t.Fatalf("failed claim is visible: %t, %v", ok, err)
+	}
+}
+
+func TestUntaggedHubEntriesOnlySuppressReplay(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "amesh-fix1-legacy")
+	s := New(dir)
+	if err := s.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw := fmt.Sprintf(`{"version":1,"log":"current","members":{},"ids":{"open":{"kind":"message","session":"s","phase":"written","expires":%[1]d},"pending":{"kind":"message","session":"s","phase":"written","expires":%[1]d,"rewrite":{}}}}`, time.Now().Add(time.Hour).UnixNano())
+	if err := os.WriteFile(filepath.Join(dir, recordFile), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, id := range []string{"open", "pending"} {
+		if ok, err := s.Contains("current", id); !ok || err != nil {
+			t.Fatal(id, ok, err)
+		}
+	}
+	open, err := s.OpenEntries("current")
+	if len(open) != 0 || err != nil || len(s.PendingRewrites()) != 0 {
+		t.Fatal("untagged hub entries selected for recovery", err)
 	}
 }

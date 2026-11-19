@@ -125,15 +125,15 @@ func (b *Backend) Connect(ctx context.Context, s registry.Session) (io.Closer, e
 	})}, nil
 }
 
-func status(s registry.Session) string {
-	if s.Status == "idle" {
-		return "idle"
+func status(s registry.Session) contract.PeerStatus {
+	if s.Status == string(contract.PeerStatusIdle) {
+		return contract.PeerStatusIdle
 	}
-	return "busy"
+	return contract.PeerStatusBusy
 }
 
 func registration(s registry.Session) (contract.SessionRegisterRequest, error) {
-	req := contract.SessionRegisterRequest{SessionID: s.SessionID, Name: s.Name, Project: s.Project, Status: status(s), ClaudeCode: s.Version}
+	req := contract.SessionRegisterRequest{SessionID: s.SessionID, Name: s.Name, Project: s.Project, Status: string(status(s)), ClaudeCode: s.Version}
 	// These registration attributes are absent from the identity package's process view.
 	if s.ConfigDir != "" {
 		raw, err := os.ReadFile(filepath.Join(s.ConfigDir, "sessions", strconv.Itoa(s.PID)+".json")) // #nosec G304 -- configured registry and numeric PID
@@ -276,7 +276,7 @@ func (b *Backend) reconcile(ctx context.Context) error {
 	b.mu.RLock()
 	req := contract.HeartbeatRequest{}
 	for _, key := range slices.Sorted(maps.Keys(b.members)) {
-		req.Sessions = append(req.Sessions, contract.HeartbeatRequestSessionsItem{Key: key, Status: status(b.members[key].session)})
+		req.Sessions = append(req.Sessions, contract.HeartbeatRequestSessionsItem{Key: key, Status: string(status(b.members[key].session))})
 	}
 	b.mu.RUnlock()
 	res, err := b.client.Heartbeat(ctx, req)
@@ -332,7 +332,7 @@ func (b *Backend) Status(s *contract.DaemonStatus) error {
 	for _, key := range slices.Sorted(maps.Keys(b.members)) {
 		m := b.members[key]
 		if m.hosted {
-			s.Sessions = append(s.Sessions, contract.DaemonStatusSessionsItem{Key: key, Address: m.address, Status: contract.PeerStatus(status(m.session)), Role: "member"})
+			s.Sessions = append(s.Sessions, contract.DaemonStatusSessionsItem{Key: key, Address: m.address, Status: status(m.session), Role: "member"})
 		}
 	}
 	return nil

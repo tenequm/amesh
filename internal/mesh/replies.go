@@ -26,11 +26,11 @@ func (b *Backend) native(ctx context.Context, log, id string, e relay.Event) err
 	}
 	switch e.Action {
 	case "peer_message_status":
-		status := e.Status
-		if status == "expired" && e.StatusDetail == "refused" {
-			status = "refused"
+		status := contract.DeliveryState(e.Status)
+		if status == contract.DeliveryStateExpired && e.StatusDetail == contract.NativeReceiptStatusDetailRefused {
+			status = contract.DeliveryStateRefused
 		}
-		return b.report(ctx, log, e.OriginalID, e.Session, status, e.DropReason)
+		return b.report(ctx, log, e.OriginalID, e.Session, status, contract.DropReason(e.DropReason))
 	case "user":
 	default:
 		return errors.New("unknown relay action")
@@ -74,7 +74,7 @@ func noticeEvent(item contract.EventStreamItem) (notice, error) {
 		}
 		n = notice{seq: e.Seq, session: e.Session, endpoint: e.To.Endpoint, peer: e.To.Address, detail: e.Message}
 		switch e.State {
-		case "refused", "denied", "expired", "dropped":
+		case contract.DeliveryStateRefused, contract.DeliveryStateDenied, contract.DeliveryStateExpired, contract.DeliveryStateDropped:
 			n.cause = string(e.State)
 		}
 	case "limit":
@@ -103,16 +103,22 @@ func (b *Backend) writeNotice(ctx context.Context, conn contract.HelloResponse, 
 	if log == "" {
 		log = conn.Log
 	}
+	var identityErr error
+	if conn.Machine.ID == "" {
+		var raw []byte
+		raw, identityErr = os.ReadFile(filepath.Join(b.cfg.StateDir, "mesh-machine"))
+		conn.Machine.ID = string(raw)
+	}
 	source := relay.NoticeSource{MachineID: conn.Machine.ID, Log: log, Source: n.source, Kind: n.kind}
-	if b.store.NoticeWritten(source.ID()) {
+	if identityErr == nil && b.store.NoticeWritten(source.ID()) {
 		return nil
 	}
 	s, ok, err := b.liveSession(ctx, n.session)
-	if !ok && err == nil && n.kind == "outbox" {
-		return errors.New("outbox notice recipient is unavailable")
-	}
 	if err != nil || !ok {
 		return err
+	}
+	if identityErr != nil {
+		return identityErr
 	}
 	mode := ""
 	if s.FromMode == "bypass" {
@@ -154,7 +160,7 @@ func (b *Backend) writeNotice(ctx context.Context, conn contract.HelloResponse, 
 func (b *Backend) outboxNotice(ctx context.Context, conn contract.HelloResponse, out hub.SendOutcome) error {
 	req, err := out.Request, out.Err
 	if req.To.Endpoint != nil {
-		if h, ok := errors.AsType[*hub.HTTPError](err); ok && h.Status == 409 && h.Body.Error == "hop_limit" {
+		if h, ok := errors.AsType[*hub.HTTPError](err); ok && h.Status == 409 && h.Body.Error == contract.ErrorCodeHopLimit {
 			return nil
 		}
 	}
@@ -163,13 +169,6 @@ func (b *Backend) outboxNotice(ctx context.Context, conn contract.HelloResponse,
 	}
 	if conn.Log == "" {
 		conn.Log = b.store.Log()
-	}
-	if conn.Machine.ID == "" {
-		raw, readErr := os.ReadFile(filepath.Join(b.cfg.StateDir, "mesh-machine"))
-		if readErr != nil {
-			return readErr
-		}
-		conn.Machine.ID = string(raw)
 	}
 	n := notice{log: out.NoticeLog, session: req.From.Session, source: req.ID, kind: "outbox", cause: "start_refused", endpoint: value(req.To.Endpoint), peer: value(req.To.Address), detail: "The send could not be completed."}
 	if n.endpoint != "" {

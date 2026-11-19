@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/registry"
 	"go.yaml.in/yaml/v3"
 )
@@ -23,13 +24,13 @@ func (testMesh) ListPeers(_ context.Context, s registry.Session, filter string) 
 }
 
 func (testMesh) SendMessage(_ context.Context, s registry.Session, args SendArgs) (SendResult, error) {
-	return SendResult{Reason: s.Name + " refused " + args.To, Known: &[]string{}}, nil
+	return SendResult{Reason: new(s.Name + " refused " + args.To), Known: &[]string{}}, nil
 }
 
 type testLane struct{ LaneBackend }
 
 func (testLane) SendToParent(_ context.Context, s registry.Session, parent, message string) (ParentResult, error) {
-	return ParentResult{Reason: s.Name + " refused " + parent + " " + message}, nil
+	return ParentResult{Reason: new(s.Name + " refused " + parent + " " + message)}, nil
 }
 
 type rpc struct {
@@ -207,5 +208,18 @@ func TestResumedSessionAcceptsFirstToolCall(t *testing.T) {
 	got := payload(t, c.call("send_to_parent", `{"message":"after restart"}`))
 	if got["reason"] != "caller1 refused parent after restart" {
 		t.Fatal(got)
+	}
+}
+
+func TestBackendWireTypes(t *testing.T) {
+	for _, pair := range [][2]any{
+		{Directory{}, contract.McpListPeersResult{}},
+		{SendArgs{}, contract.McpSendMessageArguments{}},
+		{SendResult{}, contract.McpSendResult{}},
+		{ParentResult{}, contract.McpSendToParentResult{}},
+	} {
+		if reflect.TypeOf(pair[0]) != reflect.TypeOf(pair[1]) {
+			t.Errorf("%T diverges from %T", pair[0], pair[1])
+		}
 	}
 }

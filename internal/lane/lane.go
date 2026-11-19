@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tenequm/amesh/internal/envelope"
+	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/mcpserver"
 	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/relay"
@@ -83,7 +84,7 @@ type turn struct {
 var _ mcpserver.LaneBackend = (*Backend)(nil)
 
 func New(ctx context.Context, sessions *registry.Registry, relays *relay.Manager, stateDir string) *Backend {
-	return newBackend(ctx, sessions, relays, sync.OnceValues(func() (string, error) { return machineID(stateDir) }))
+	return newBackend(ctx, sessions, relays, sync.OnceValues(func() (string, error) { return hub.MachineID(stateDir) }))
 }
 
 func newBackend(ctx context.Context, sessions sessions, relays native, identity func() (string, error)) *Backend {
@@ -224,22 +225,22 @@ func (c *conversation) close() {
 
 func (b *Backend) SendToParent(ctx context.Context, child registry.Session, parentID, message string) (mcpserver.ParentResult, error) {
 	if len(message) > 32*1024 {
-		return mcpserver.ParentResult{Reason: "Message exceeds 32 KiB."}, nil
+		return mcpserver.ParentResult{Reason: new("Message exceeds 32 KiB.")}, nil
 	}
 	b.mu.Lock()
 	c := b.lanes[pair{parentID, child.SessionID}]
 	b.mu.Unlock()
 	if c == nil {
-		return mcpserver.ParentResult{Reason: notFound}, nil
+		return mcpserver.ParentResult{Reason: new(notFound)}, nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if child.Key != c.child.Key || c.retiring {
-		return mcpserver.ParentResult{Reason: notFound}, nil
+		return mcpserver.ParentResult{Reason: new(notFound)}, nil
 	}
 	parent, err := c.resolveParent(ctx)
 	if why, ok := errors.AsType[refusal](err); ok {
-		return mcpserver.ParentResult{Reason: why.Error()}, nil
+		return mcpserver.ParentResult{Reason: new(why.Error())}, nil
 	}
 	if err != nil {
 		return mcpserver.ParentResult{}, err
@@ -250,7 +251,7 @@ func (b *Backend) SendToParent(ctx context.Context, child registry.Session, pare
 		return mcpserver.ParentResult{}, err
 	}
 	c.noteReply(child)
-	return mcpserver.ParentResult{Accepted: true, To: "parent", ID: id}, nil
+	return mcpserver.ParentResult{Accepted: true, To: new("parent"), ID: &id}, nil
 }
 
 func (c *conversation) write(ctx context.Context, to registry.Session, id string, msg envelope.Message) error {
@@ -327,7 +328,7 @@ func (c *conversation) notice(ctx context.Context, body string) error {
 
 func (c *conversation) noteReply(child registry.Session) {
 	// A fast tool call can deliver before the poll first sees a busy turn.
-	if !c.busy && child.Status == "busy" {
+	if !c.busy && child.Status == string(contract.PeerStatusBusy) {
 		c.replied = true
 		return
 	}
@@ -351,7 +352,7 @@ func (c *conversation) poll(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	c.child = child
-	busy := child.Status == "busy"
+	busy := child.Status == string(contract.PeerStatusBusy)
 	if !c.started && (busy || time.Since(c.since) >= 3*time.Second) {
 		body := fmt.Sprintf("Lane started: %s (a session you launched, working in %s). It can message you, and you can message it by sending to this message's from address. No reply needed.", child.Name, child.CWD)
 		if err = c.notice(ctx, body); err != nil {

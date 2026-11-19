@@ -62,13 +62,21 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	ctx, cancel := context.WithCancel(parent)
 	b.ctx = ctx
 	var workers sync.WaitGroup
-	pending := store.PendingRewrites()
-	workers.Go(func() {
-		b.relays.ResumeRewrites(ctx, pending, func(ctx context.Context, key string, pid int, path string) bool {
-			s, ok, err := b.liveSession(ctx, key)
-			return err == nil && ok && s.PID == pid && s.SocketPath == path
+	pendingByLog := store.PendingRewrites()
+	b.resumeRewrites = func(log string) {
+		pending := pendingByLog[log]
+		if len(pending) == 0 {
+			return
+		}
+		workers.Go(func() {
+			b.relays.ResumeRewrites(ctx, pending, func(ctx context.Context, key string, pid int, path string) bool {
+				s, ok, err := b.liveSession(ctx, key)
+				return err == nil && ok && s.PID == pid && s.SocketPath == path
+			})
 		})
-	})
+	}
+	// Lane rewrites have no hub log and must work offline.
+	b.resumeRewrites("")
 	workers.Go(func() {
 		_, helloErr := b.client.Hello(ctx, hello)
 		b.connectivity(helloErr)

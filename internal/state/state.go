@@ -46,6 +46,7 @@ type Member struct {
 }
 
 type Entry struct {
+	Log     string          `json:"log,omitempty"`
 	Kind    string          `json:"kind,omitempty"`
 	Pending json.RawMessage `json:"rewrite,omitempty"`
 	Session string          `json:"session,omitempty"`
@@ -231,7 +232,7 @@ func (s *Store) BeginWrite(log, id, session string, expiresAt time.Time, kind st
 	if len(next.IDs) >= maxClaims {
 		return false, errors.New("delivered-id record full")
 	}
-	next.IDs[id] = Entry{Kind: kind, Session: session, Phase: Writing, Expires: expiresAt.UnixNano()}
+	next.IDs[id] = Entry{Log: log, Kind: kind, Session: session, Phase: Writing, Expires: expiresAt.UnixNano()}
 	if err := s.persist(next); err != nil {
 		return false, err
 	}
@@ -240,7 +241,7 @@ func (s *Store) BeginWrite(log, id, session string, expiresAt time.Time, kind st
 
 func (s *Store) MarkWritten(log, id string) error { return s.mark(log, id, Written) }
 
-// MarkReported is called only after the hub applies a final report, including an interrupted write.
+// MarkReported closes a delivery when the hub acknowledges a final state or does not know the ID.
 func (s *Store) MarkReported(log, id string) error { return s.mark(log, id, Reported) }
 
 func (s *Store) mark(log, id string, phase Phase) error {
@@ -277,7 +278,7 @@ func (s *Store) OpenEntries(log string) (map[string]Entry, error) {
 	entries := make(map[string]Entry)
 	now := time.Now().UnixNano()
 	for id, entry := range s.data.IDs {
-		if entry.Kind != "notice" && entry.Pending == nil && entry.Session != "" && entry.Phase != Reported && entry.Expires > now {
+		if entry.Log == s.data.Log && entry.Kind != "notice" && entry.Pending == nil && entry.Session != "" && entry.Phase != Reported && entry.Expires > now {
 			entries[id] = entry
 		}
 	}
@@ -301,16 +302,22 @@ func (s *Store) SetRewrite(id string, payload json.RawMessage) error {
 	return s.persist(next)
 }
 
-func (s *Store) PendingRewrites() map[string]Entry {
+func (s *Store) PendingRewrites() map[string]map[string]Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make(map[string]Entry)
-	for id, e := range s.data.IDs {
-		if e.Pending != nil && e.Expires > time.Now().UnixNano() {
-			out[id] = e
+	byLog := make(map[string]map[string]Entry)
+	now := time.Now().UnixNano()
+	for id, entry := range s.data.IDs {
+		// Older hub claims have a session but no provable log. Retain them for deduplication only.
+		if entry.Pending == nil || entry.Expires <= now || (entry.Log == "" && entry.Session != "") {
+			continue
 		}
+		if byLog[entry.Log] == nil {
+			byLog[entry.Log] = make(map[string]Entry)
+		}
+		byLog[entry.Log][id] = entry
 	}
-	return out
+	return byLog
 }
 
 func (s *Store) NoticeWritten(id string) bool {
@@ -404,10 +411,13 @@ func (s *Store) persist(next snapshot) error {
 	if err = s.root.Rename(pending, recordFile); err != nil {
 		return err
 	}
-	s.data = next
 	dir, err := s.root.Open(".")
 	if err != nil {
 		return err
 	}
-	return errors.Join(dir.Sync(), dir.Close())
+	if err = errors.Join(dir.Sync(), dir.Close()); err != nil {
+		return err
+	}
+	s.data = next
+	return nil
 }

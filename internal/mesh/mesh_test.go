@@ -57,16 +57,13 @@ func fixture(t *testing.T, routes map[string]http.HandlerFunc) (*Backend, *testR
 	if routes["POST /peer/hello"] == nil {
 		routes["POST /peer/hello"] = hubtest.Reply(t, "helloResponse")
 	}
-	server, err := hubtest.New(t, routes)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := hubtest.New(t, routes)
 	cfg := config.Config{StateDir: meshDir(t), MachineName: "mac", HubURL: server.URL + "/peer"}
-	if err = hub.Enroll(t.Context(), cfg, io.Discard); err != nil {
+	if err := hub.Enroll(t.Context(), cfg, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	st := state.New(cfg.StateDir)
-	if err = st.Lock(); err != nil {
+	if err := st.Lock(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
@@ -77,7 +74,7 @@ func fixture(t *testing.T, routes map[string]http.HandlerFunc) (*Backend, *testR
 	t.Cleanup(b.closeEndpoints)
 	b.sessions = r
 	b.store = st
-	_, err = b.client.Hello(t.Context(), contract.HelloRequest{})
+	_, err := b.client.Hello(t.Context(), contract.HelloRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,11 +200,11 @@ func TestDirectoryAndSend(t *testing.T) {
 	var expected mcpserver.SendResult
 	_ = json.Unmarshal(hubtest.Example(t, "mcpSendAccepted"), &expected)
 	expected.ID = got.ID
-	if err != nil || got.ID == "" || !reflect.DeepEqual(got, expected) {
+	if err != nil || value(got.ID) == "" || !reflect.DeepEqual(got, expected) {
 		t.Fatalf("send %#v %v", got, err)
 	}
 	req := <-recv
-	if req.ID != got.ID || req.From.Session != key || req.FromMode != nil || req.Origin != "unknown" || req.NotifyWhenIdle {
+	if req.ID != value(got.ID) || req.From.Session != key || req.FromMode != nil || req.Origin != "unknown" || req.NotifyWhenIdle {
 		t.Fatal("incorrect remote send metadata")
 	}
 }
@@ -229,7 +226,7 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	b.members[sessionKey(sender.Key)] = member{session: sender, hosted: true, address: "review@pond:mac"}
 	b.members[sessionKey(target.Key)] = member{session: target, hosted: true, address: "review-2@pond:mac"}
 	got, err := b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond", Message: "hello locally"})
-	if err != nil || !got.Accepted || got.To != "review-2@pond:mac" {
+	if err != nil || !got.Accepted || value(got.To) != "review-2@pond:mac" {
 		t.Fatalf("%#v %v", got, err)
 	}
 	var frame contract.NativeUserFrame
@@ -237,7 +234,7 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg, err := envelope.Parse(frame.Message.Content)
-	if err != nil || msg.Body != "hello locally" || msg.From != envelope.Address(sender.SocketPath) || msg.FromName != sender.Name || msg.FromMode != sender.FromMode || value(frame.From) != msg.From || frame.MsgID != got.ID {
+	if err != nil || msg.Body != "hello locally" || msg.From != envelope.Address(sender.SocketPath) || msg.FromName != sender.Name || msg.FromMode != sender.FromMode || value(frame.From) != msg.From || frame.MsgID != value(got.ID) {
 		t.Fatal("wrong local native frame")
 	}
 	if n, e := b.client.Pending(""); e != nil || n != 0 {
@@ -302,7 +299,7 @@ func TestDaemonLifecycle(t *testing.T) {
 	store := state.New(dir)
 	heartbeat := make(chan struct{}, 1)
 	stream := make(chan struct{})
-	server, err := hubtest.New(t, map[string]http.HandlerFunc{
+	server := hubtest.New(t, map[string]http.HandlerFunc{
 		"POST /peer/hello": func(w http.ResponseWriter, r *http.Request) {
 			var req contract.HelloRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
@@ -326,11 +323,8 @@ func TestDaemonLifecycle(t *testing.T) {
 			}
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	cfg := config.Config{MachineName: "mac", StateDir: dir, HubURL: server.URL + "/peer", ClaudeConfigDirs: []string{dir}}
-	if err = hub.Enroll(t.Context(), cfg, io.Discard); err != nil {
+	if err := hub.Enroll(t.Context(), cfg, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	b := New(cfg, registry.New(cfg.ClaudeConfigDirs), relay.New(dir, store), hub.New(cfg))
@@ -407,7 +401,7 @@ func TestUnknownSessionSendKeepsID(t *testing.T) {
 	go func() { done <- b.client.Drain(ctx, b.reregister, b.completed) }()
 	defer func() { cancel(); <-done }()
 	got, err := b.SendMessage(ctx, s, mcpserver.SendArgs{To: "stan", Message: "retry this id"})
-	if err != nil || !got.Accepted || !slices.Equal(ids, []string{got.ID, got.ID}) {
+	if err != nil || !got.Accepted || !slices.Equal(ids, []string{value(got.ID), value(got.ID)}) {
 		t.Fatalf("retry: %#v %v", got, err)
 	}
 }
@@ -459,7 +453,7 @@ func TestQueuedSendWaitAndDirectoryReplacement(t *testing.T) {
 		var want mcpserver.SendResult
 		_ = json.Unmarshal(hubtest.Example(t, "mcpSendAcceptedHubDown"), &want)
 		want.ID = result.ID
-		if err != nil || result.ID == "" || !reflect.DeepEqual(result, want) || time.Since(start) != 5*time.Second {
+		if err != nil || value(result.ID) == "" || !reflect.DeepEqual(result, want) || time.Since(start) != 5*time.Second {
 			t.Fatalf("queued result %#v: %v", result, err)
 		}
 		if n, e := c.Pending(sessionKey(s.Key)); e != nil || n != 2 {

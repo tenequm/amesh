@@ -14,6 +14,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
 	"github.com/tenequm/amesh/internal/relay/relaytest"
@@ -165,7 +166,7 @@ func TestConfirmedDropRewriteKeepsIDAndPaces(t *testing.T) {
 }
 
 func TestRewriteBudget(t *testing.T) {
-	for _, reason := range []string{"rate-limited", "queue-full", "duplicate", "hop-loop", "hop-runaway"} {
+	for _, reason := range []contract.NativeReceiptDropReason{"rate-limited", "queue-full", "duplicate", "hop-loop", "hop-runaway"} {
 		e := Event{Status: "dropped", DropReason: reason}
 		for rewrites := range 5 {
 			want := (reason == "rate-limited" || reason == "queue-full") && rewrites < 3
@@ -347,16 +348,23 @@ func TestPendingRewriteAcrossRestart(t *testing.T) {
 			t.Fatal("new log replayed the original write")
 		default:
 		}
-		pending := m.store.PendingRewrites()
+		if len(m.store.PendingRewrites()[d.Log]) != 0 {
+			t.Fatal("previous log has a restart rewrite")
+		}
+		if err := m.store.SetLog("log-before"); err != nil {
+			t.Fatal(err)
+		}
+		d.Log = "log-before"
+		pending := m.store.PendingRewrites()[d.Log]
 		if len(pending) != 1 || pending[d.ID].Phase != state.Reported {
 			t.Fatal("missing pending final claim")
 		}
 		fresh.ResumeRewrites(t.Context(), pending, func(context.Context, string, int, string) bool { return false })
-		if len(m.store.PendingRewrites()) != 1 {
+		if len(m.store.PendingRewrites()[d.Log]) != 1 {
 			t.Fatal("excluded rewrite was delivered")
 		}
 		fresh.ResumeRewrites(t.Context(), pending, func(context.Context, string, int, string) bool { return true })
-		if string(<-lines) != first || len(m.store.PendingRewrites()) != 0 {
+		if string(<-lines) != first || len(m.store.PendingRewrites()[d.Log]) != 0 {
 			t.Fatal("recovery did not finish the same frame")
 		}
 		if open, e := m.store.OpenEntries(d.Log); e != nil || len(open) != 0 {

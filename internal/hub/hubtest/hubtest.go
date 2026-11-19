@@ -117,7 +117,7 @@ func Reply(tb testing.TB, name string) http.HandlerFunc {
 func LostResponse(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) }
 
 // New serves method/path patterns. Unexpected requests fail the owning test.
-func New(tb testing.TB, routes map[string]http.HandlerFunc) (*httptest.Server, error) {
+func New(tb testing.TB, routes map[string]http.HandlerFunc) *httptest.Server {
 	tb.Helper()
 	mux := http.NewServeMux()
 	for route, handler := range routes {
@@ -133,7 +133,7 @@ func New(tb testing.TB, routes map[string]http.HandlerFunc) (*httptest.Server, e
 		mux.ServeHTTP(w, r)
 	}))
 	tb.Cleanup(server.Close)
-	return server, nil
+	return server
 }
 
 type Step struct {

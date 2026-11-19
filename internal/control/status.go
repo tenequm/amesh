@@ -25,8 +25,7 @@ type (
 	}
 )
 
-// Populated when the native end-to-end delivery proof passes for a Claude Code release.
-var verifiedNativeVersions []string
+var verifiedNativeVersions = []string{"2.1.325", "2.1.328"}
 
 func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	live, err := d.registry.List(r.Context())

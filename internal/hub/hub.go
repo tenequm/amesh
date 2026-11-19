@@ -90,7 +90,7 @@ func (e *HTTPError) Error() string {
 }
 
 func (e *HTTPError) transient() bool {
-	return e.Body.Error == "" || e.Status >= 500 || e.Status == 429 || e.Status == 408 || (e.Status == 409 && e.Body.Error == "machine_in_use") || (e.Status == 401 && e.Body.Error == "stale_timestamp")
+	return e.Body.Error == "" || e.Status >= 500 || e.Status == 429 || e.Status == 408 || (e.Status == 409 && e.Body.Error == contract.ErrorCodeMachineInUse) || (e.Status == 401 && e.Body.Error == contract.ErrorCodeStaleTimestamp)
 }
 
 func (c *Client) stop(err error) error {
@@ -174,19 +174,19 @@ func (c *Client) open(ctx context.Context, method, route string, payload any, me
 			return nil, e
 		case e.Status < 400:
 			return nil, c.stop(e)
-		case e.Status == 401 && (e.Body.Error == "bad_signature" || e.Body.Error == "replayed"):
+		case e.Status == 401 && (e.Body.Error == contract.ErrorCodeBadSignature || e.Body.Error == contract.ErrorCodeReplayed):
 			if attempt == 0 {
 				continue
 			}
 			return nil, c.stop(e)
-		case e.Status == 401 && e.Body.Error == "stale_timestamp":
+		case e.Status == 401 && e.Body.Error == contract.ErrorCodeStaleTimestamp:
 			if attempt == 0 && e.Body.ServerTime != nil {
 				c.mu.Lock()
 				c.offset = time.Until(time.UnixMilli(*e.Body.ServerTime))
 				c.mu.Unlock()
 				continue
 			}
-		case e.Status == 401 && e.Body.Error == "unknown_machine", e.Status == 403 && e.Body.Error == "machine_revoked", e.Status == 426:
+		case e.Status == 401 && e.Body.Error == contract.ErrorCodeUnknownMachine, e.Status == 403 && e.Body.Error == contract.ErrorCodeMachineRevoked, e.Status == 426:
 			return nil, c.stop(e)
 		}
 		return nil, e
@@ -208,10 +208,6 @@ func rpc[T any](ctx context.Context, c *Client, method, route string, request an
 		err = json.Unmarshal(raw, &result)
 	}
 	return result, err
-}
-
-func (c *Client) Info(ctx context.Context) (contract.HelloInfo, error) {
-	return rpc[contract.HelloInfo](ctx, c, http.MethodGet, "/hello", nil)
 }
 
 func (c *Client) Hello(ctx context.Context, req contract.HelloRequest) (contract.HelloResponse, error) {
@@ -263,8 +259,8 @@ func (c *Client) helloLocked(ctx context.Context, req contract.HelloRequest) (co
 	}
 	wire, err := rpc[response](ctx, c, http.MethodPost, "/hello", req)
 	if err != nil {
-		if c.verifying && hasCode(err, 409, "machine_in_use") {
-			return contract.HelloResponse{}, c.stop(&HTTPError{Status: 409, Body: contract.ErrorBody{Error: "superseded", Message: "Another daemon owns this machine."}})
+		if c.verifying && hasCode(err, 409, contract.ErrorCodeMachineInUse) {
+			return contract.HelloResponse{}, c.stop(&HTTPError{Status: 409, Body: contract.ErrorBody{Error: contract.ErrorCodeSuperseded, Message: "Another daemon owns this machine."}})
 		}
 		return contract.HelloResponse{}, err
 	}
@@ -320,7 +316,7 @@ func (c *Client) Peers(ctx context.Context) (contract.PeersResponse, error) {
 	return rpc[contract.PeersResponse](ctx, c, http.MethodGet, "/peers", nil)
 }
 
-func retryWrite[T any](ctx context.Context, c *Client, retry bool, send func(epoch int64) (T, error)) (T, error) {
+func retryWrite[T any](ctx context.Context, c *Client, log string, retry bool, send func(epoch int64) (T, error)) (T, error) {
 	var backoff time.Duration
 	for {
 		c.helloMu.RLock()
@@ -330,13 +326,18 @@ func retryWrite[T any](ctx context.Context, c *Client, retry bool, send func(epo
 			var zero T
 			return zero, halt
 		}
+		if log != "" && conn.Log != log {
+			c.helloMu.RUnlock()
+			var zero T
+			return zero, errors.New("delivery report belongs to a previous hub log")
+		}
 		rev := c.helloCount
 		value, err := send(conn.Epoch)
 		c.helloMu.RUnlock()
 		if err == nil {
 			return value, nil
 		}
-		if hasCode(err, 409, "superseded") {
+		if hasCode(err, 409, contract.ErrorCodeSuperseded) {
 			if err = c.confirmOwner(ctx, rev); err == nil {
 				continue
 			}
@@ -366,14 +367,14 @@ func (c *Client) Register(ctx context.Context, key string, req contract.SessionR
 	}
 	c.presenceMu.Lock()
 	defer c.presenceMu.Unlock()
-	return retryWrite(ctx, c, true, func(epoch int64) (contract.SessionRegisterResponse, error) {
+	return retryWrite(ctx, c, "", true, func(epoch int64) (contract.SessionRegisterResponse, error) {
 		req.Epoch = epoch
 		return sessionRPC[contract.SessionRegisterResponse](ctx, c, http.MethodPut, key, "", req)
 	})
 }
 
 func (c *Client) HumanTurn(ctx context.Context, key string, req contract.HumanTurnRequest) (contract.HumanTurnResponse, error) {
-	return retryWrite(ctx, c, false, func(epoch int64) (contract.HumanTurnResponse, error) {
+	return retryWrite(ctx, c, "", false, func(epoch int64) (contract.HumanTurnResponse, error) {
 		req.Epoch = epoch
 		return sessionRPC[contract.HumanTurnResponse](ctx, c, http.MethodPost, key, "/human", req)
 	})
@@ -382,12 +383,12 @@ func (c *Client) HumanTurn(ctx context.Context, key string, req contract.HumanTu
 func (c *Client) End(ctx context.Context, key string, req contract.SessionEndRequest) (contract.SessionEndResponse, error) {
 	c.presenceMu.Lock()
 	defer c.presenceMu.Unlock()
-	return retryWrite(ctx, c, false, func(epoch int64) (contract.SessionEndResponse, error) {
+	return retryWrite(ctx, c, "", false, func(epoch int64) (contract.SessionEndResponse, error) {
 		req.Epoch = epoch
 		v, err := sessionRPC[contract.SessionEndResponse](ctx, c, http.MethodPost, key, "/end", req)
-		if hasCode(err, 404, "unknown_session") {
+		if hasCode(err, 404, contract.ErrorCodeUnknownSession) {
 			v.Session.Key = key
-			v.Session.Status = "ended"
+			v.Session.Status = string(contract.SessionInfoStatusEnded)
 			return v, nil
 		}
 		return v, err
@@ -397,7 +398,7 @@ func (c *Client) End(ctx context.Context, key string, req contract.SessionEndReq
 func (c *Client) Heartbeat(ctx context.Context, req contract.HeartbeatRequest) (contract.HeartbeatResponse, error) {
 	c.presenceMu.Lock()
 	defer c.presenceMu.Unlock()
-	return retryWrite(ctx, c, false, func(epoch int64) (contract.HeartbeatResponse, error) {
+	return retryWrite(ctx, c, "", false, func(epoch int64) (contract.HeartbeatResponse, error) {
 		req.Epoch = epoch
 		c.mu.Lock()
 		req.Cursor = c.cursor
@@ -409,8 +410,8 @@ func (c *Client) Heartbeat(ctx context.Context, req contract.HeartbeatRequest) (
 	})
 }
 
-func (c *Client) Report(ctx context.Context, req contract.ReportsRequest) (contract.ReportsResponse, error) {
-	return retryWrite(ctx, c, true, func(epoch int64) (contract.ReportsResponse, error) {
+func (c *Client) Report(ctx context.Context, log string, req contract.ReportsRequest) (contract.ReportsResponse, error) {
+	return retryWrite(ctx, c, log, true, func(epoch int64) (contract.ReportsResponse, error) {
 		req.Epoch = epoch
 		return rpc[contract.ReportsResponse](ctx, c, http.MethodPost, "/reports", req)
 	})
@@ -419,24 +420,24 @@ func (c *Client) Report(ctx context.Context, req contract.ReportsRequest) (contr
 func (c *Client) Status(s *contract.DaemonStatus) error {
 	c.mu.Lock()
 	conn := c.current
-	s.Hub = contract.DaemonStatusHub{State: "connecting", Since: c.statusSince.UnixMilli(), Cursor: c.cursor}
+	s.Hub = contract.DaemonStatusHub{State: contract.DaemonStatusHubStateConnecting, Since: c.statusSince.UnixMilli(), Cursor: c.cursor}
 	if conn.Machine.ID != "" {
 		s.Machine = &contract.DaemonStatusMachine{ID: conn.Machine.ID, Name: conn.Machine.Name}
 	}
 	if c.halt != nil {
-		s.Hub.State = "halted"
+		s.Hub.State = contract.DaemonStatusHubStateHalted
 		h, ok := errors.AsType[*HTTPError](c.halt)
 		if ok {
 			body := h.Body
 			s.Hub.Halt = &body
 		} else {
-			s.Hub.Halt = &contract.ErrorBody{Error: "internal", Message: c.halt.Error()}
+			s.Hub.Halt = &contract.ErrorBody{Error: contract.ErrorCodeInternal, Message: c.halt.Error()}
 			if errors.Is(c.halt, os.ErrNotExist) {
-				s.Hub.Halt = &contract.ErrorBody{Error: "unknown_machine", Message: "This machine has no enrollment key."}
+				s.Hub.Halt = &contract.ErrorBody{Error: contract.ErrorCodeUnknownMachine, Message: "This machine has no enrollment key."}
 			}
 		}
 	} else if c.streamConnected {
-		s.Hub.State = "connected"
+		s.Hub.State = contract.DaemonStatusHubStateConnected
 		s.Hub.Epoch = &conn.Epoch
 	}
 	c.mu.Unlock()

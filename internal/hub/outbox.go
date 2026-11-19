@@ -18,7 +18,7 @@ import (
 	"github.com/tenequm/amesh/internal/contract"
 )
 
-var ErrIDConflict = &HTTPError{Status: 409, Body: contract.ErrorBody{Error: "id_conflict", Message: "Message id already queued with different contents."}}
+var ErrIDConflict = &HTTPError{Status: 409, Body: contract.ErrorBody{Error: contract.ErrorCodeIDConflict, Message: "Message id already queued with different contents."}}
 
 // ErrQueued means the send is durable and still pending. A paced send also carries its HTTPError.
 var ErrQueued = errors.New("message queued in the local outbox")
@@ -166,11 +166,11 @@ func (c *Client) send(ctx context.Context, req contract.SendRequest, peer, name 
 	switch {
 	case req.To.Endpoint != nil: // Native replies receive their definitive result through the durable outbox.
 	case trimmed == "":
-		return empty, &HTTPError{400, contract.ErrorBody{Error: "empty_text", Message: "Enter a message."}, 0}
+		return empty, &HTTPError{400, contract.ErrorBody{Error: contract.ErrorCodeEmptyText, Message: "Enter a message."}, 0}
 	case strings.HasPrefix(trimmed, "/"):
-		return empty, &HTTPError{400, contract.ErrorBody{Error: "slash_command", Message: "Slash commands cannot be sent."}, 0}
+		return empty, &HTTPError{400, contract.ErrorBody{Error: contract.ErrorCodeSlashCommand, Message: "Slash commands cannot be sent."}, 0}
 	case int64(len(req.Text)) > conn.Limits.MaxTextBytes:
-		return empty, &HTTPError{413, contract.ErrorBody{Error: "too_large", Message: "Message exceeds the hub text limit."}, 0}
+		return empty, &HTTPError{413, contract.ErrorBody{Error: contract.ErrorCodeTooLarge, Message: "Message exceeds the hub text limit."}, 0}
 	}
 	if req.ID == "" || !sessionKey.MatchString(req.From.Session) {
 		return empty, errors.New("send requires a message id and session key")
@@ -312,17 +312,6 @@ func (c *Client) waitForOutbox(ctx context.Context, remaining time.Duration) err
 	}
 }
 
-// RunOutbox owns the uploader for the lifetime of the daemon. completed receives every
-// definitive outcome, including refusals and expiry for callers that have already returned.
-func (c *Client) RunOutbox(ctx context.Context, completed func(SendOutcome)) error {
-	return c.Drain(ctx, nil, func(out SendOutcome) error {
-		if completed != nil {
-			completed(out)
-		}
-		return nil
-	})
-}
-
 func (c *Client) Drain(ctx context.Context, register func(context.Context, string) error, completed func(SendOutcome) error) error {
 	select {
 	case c.draining <- struct{}{}:
@@ -405,7 +394,7 @@ func (c *Client) Drain(ctx context.Context, register func(context.Context, strin
 		if _, err = c.Connection(); err != nil && head.Failure == nil && !errors.Is(out.Err, err) {
 			return err
 		}
-		if head.Failure == nil && !head.Retried && register != nil && hasCode(out.Err, 404, "unknown_session") {
+		if head.Failure == nil && !head.Retried && register != nil && hasCode(out.Err, 404, contract.ErrorCodeUnknownSession) {
 			if err = register(ctx, req.From.Session); err == nil {
 				c.queueMu.Lock()
 				var entries []entry
@@ -424,7 +413,7 @@ func (c *Client) Drain(ctx context.Context, register func(context.Context, strin
 				return ctx.Err()
 			}
 		}
-		if hasCode(out.Err, 409, "superseded") {
+		if hasCode(out.Err, 409, contract.ErrorCodeSuperseded) {
 			if out.Err = c.confirmOwner(ctx, rev); out.Err == nil {
 				continue
 			}
@@ -432,7 +421,7 @@ func (c *Client) Drain(ctx context.Context, register func(context.Context, strin
 				return halt
 			}
 		}
-		if hasCode(out.Err, 429, "rate_limited") {
+		if hasCode(out.Err, 429, contract.ErrorCodeRateLimited) {
 			c.queueMu.Lock()
 			c.notify(head.Ticket, SendOutcome{Request: req, Err: errors.Join(ErrQueued, out.Err)})
 			c.queueMu.Unlock()
@@ -449,16 +438,19 @@ func (c *Client) Drain(ctx context.Context, register func(context.Context, strin
 			continue
 		}
 		delay = 0
-		if h != nil && h.Body.Error == "id_conflict" {
+		if h != nil && h.Body.Error == contract.ErrorCodeIDConflict {
 			slog.Error("hub message id conflict", "id", req.ID)
 		}
-		settled, err := c.settle(index, head.Ticket, out, false)
-		if err != nil {
-			return fmt.Errorf("settle outbox: %w", err)
+		settled := false
+		if out.Err != nil {
+			settled, err = c.settle(index, head.Ticket, out, false)
+			if err != nil {
+				return fmt.Errorf("settle outbox: %w", err)
+			}
+			out.NoticeRequired = !settled
 		}
-		out.NoticeRequired = !settled
 		if err = completed(out); err != nil {
-			if settled || ctx.Err() != nil {
+			if !out.NoticeRequired || ctx.Err() != nil {
 				return err
 			}
 			retryNotice[req.From.Session] = time.Now().Add(time.Second)

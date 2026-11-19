@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tenequm/amesh/internal/contract"
+
 	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/state"
 
@@ -84,7 +86,7 @@ func (p *pending) finish(written time.Time, err error) {
 
 func (e *endpoint) route(event Event) error {
 	ids := []string{event.OriginalID}
-	if event.Status == "dropped" {
+	if event.Status == contract.NativeReceiptStatusDropped {
 		ids = append(ids, event.DroppedIDs...)
 	}
 	seen := make(map[string]bool)
@@ -114,7 +116,7 @@ func (e *endpoint) route(event Event) error {
 func (p *pending) report(event Event) {
 	event.Log, event.Session = p.d.Log, p.d.Session
 	if event.Action == "peer_message_status" && (p.d.Notice || p.d.lane()) {
-		if event.Status != "accepted" {
+		if event.Status != contract.NativeReceiptStatus(contract.DeliveryStateAccepted) {
 			slog.Info("local native delivery receipt", "id", p.d.ID, "status", event.Status, "drop_reason", event.DropReason)
 		}
 		return
@@ -146,7 +148,7 @@ func (p *pending) run(written time.Time) {
 			return
 		case <-timer.C:
 			if !p.key.idle && !held && !accepted {
-				p.report(Event{Action: "peer_message_status", OriginalID: p.d.ID, From: envelope.Address(p.d.Inbox), Peer: p.peer, Status: "accepted"})
+				p.report(Event{Action: "peer_message_status", OriginalID: p.d.ID, From: envelope.Address(p.d.Inbox), Peer: p.peer, Status: contract.NativeReceiptStatus(contract.DeliveryStateAccepted)})
 				accepted = true
 				timer.Reset(time.Until(written.Add(retention)))
 				continue
@@ -158,7 +160,7 @@ func (p *pending) run(written time.Time) {
 			}
 			if !p.key.idle {
 				switch event.Status {
-				case "held", "delivered", "denied", "expired", "dropped":
+				case contract.NativeReceiptStatusHeld, contract.NativeReceiptStatusDelivered, contract.NativeReceiptStatusDenied, contract.NativeReceiptStatusExpired, contract.NativeReceiptStatusDropped:
 				default:
 					continue
 				}
@@ -173,7 +175,7 @@ func (p *pending) run(written time.Time) {
 						if clearErr := p.e.manager.store.SetRewrite(p.d.ID, nil); clearErr != nil {
 							slog.Error("clear pending rewrite", "id", p.d.ID, "err", clearErr)
 						}
-						event.DropReason = "session_gone"
+						event.DropReason = contract.NativeReceiptDropReason(contract.DropReasonSessionGone)
 						p.report(event)
 					}
 					return
@@ -187,12 +189,12 @@ func (p *pending) run(written time.Time) {
 				if p.d.lane() || p.d.Notice {
 					p.report(event)
 				}
-				if event.Status == "dropped" {
+				if event.Status == contract.NativeReceiptStatusDropped {
 					return
 				}
 				continue
 			}
-			if event.Status == "held" {
+			if event.Status == contract.NativeReceiptStatusHeld {
 				if !held {
 					p.report(event)
 					held = true
@@ -257,10 +259,7 @@ func (m *Manager) ResumeRewrites(ctx context.Context, pending map[string]state.E
 				slog.Error("invalid pending rewrite envelope", "id", id)
 				return
 			}
-			d := Delivery{Inbox: record.Inbox, ID: id, Message: msg, Session: entry.Session, AcceptWindow: record.Window, Notice: entry.Kind == "notice"}
-			if d.Session != "" {
-				d.Log = m.store.Log()
-			}
+			d := Delivery{Inbox: record.Inbox, ID: id, Message: msg, Session: entry.Session, Log: entry.Log, AcceptWindow: record.Window, Notice: entry.Kind == "notice"}
 			if entry.Session != "" && !hosted(ctx, entry.Session, record.PID, record.Inbox) {
 				return
 			}

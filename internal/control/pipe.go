@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/tenequm/amesh/internal/contract"
 )
 
 func dialPipe(ctx context.Context, socket string, args []string, reconnect bool) (*bufferedConn, error) {
@@ -40,9 +42,9 @@ func dialPipe(ctx context.Context, socket string, args []string, reconnect bool)
 			if resp.StatusCode == http.StatusSwitchingProtocols && strings.EqualFold(resp.Header.Get("Upgrade"), "mcp-stdio") && headerToken(resp.Header.Values("Connection"), "upgrade") {
 				return &bufferedConn{conn, reader}, nil
 			}
-			var refusal localError
+			var refusal contract.LocalError
 			if e := json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&refusal); e == nil && refusal.Message != "" {
-				err = &refusal
+				err = localError(refusal.Message)
 			} else {
 				err = fmt.Errorf("daemon refused upgrade (%s)", resp.Status)
 			}
@@ -68,7 +70,7 @@ func redial(ctx context.Context, dial func(context.Context) (*bufferedConn, erro
 			if err == nil {
 				return conn, nil
 			}
-			if _, refused := errors.AsType[*localError](err); refused {
+			if _, refused := errors.AsType[localError](err); refused {
 				return nil, err
 			}
 			last = err

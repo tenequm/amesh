@@ -14,6 +14,8 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/tenequm/amesh/internal/contract"
+
 	"github.com/google/uuid"
 
 	"github.com/tenequm/amesh/internal/envelope"
@@ -356,11 +358,11 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSour
 	}
 	var body string
 	switch cause {
-	case "denied", "refused", "start_refused":
+	case string(contract.DeliveryStateDenied), string(contract.DeliveryStateRefused), "start_refused":
 		body = fmt.Sprintf("your message to %s was not delivered: %s", peer, detail)
 	case "reply_refused":
 		body = fmt.Sprintf("your reply to %s was not delivered: %s", peer, detail)
-	case "expired", "dropped":
+	case string(contract.DeliveryStateExpired), string(contract.DeliveryStateDropped):
 		body = fmt.Sprintf("your message to %s did not arrive: %s", peer, detail)
 	case "outbox_expired":
 		body = fmt.Sprintf("your message to %s was not sent: this machine could not reach the hub for 24 hours.", peer)
@@ -406,5 +408,5 @@ func (m *Manager) rewrite(ctx context.Context, d Delivery, peer peercred.Credent
 }
 
 func (e Event) retryable(rewrites int) bool {
-	return rewrites < maxRewrites && e.Status == "dropped" && (e.DropReason == "rate-limited" || e.DropReason == "queue-full")
+	return rewrites < maxRewrites && e.Status == contract.NativeReceiptStatusDropped && (e.DropReason == contract.NativeReceiptDropReasonRateLimited || e.DropReason == contract.NativeReceiptDropReasonQueueFull)
 }

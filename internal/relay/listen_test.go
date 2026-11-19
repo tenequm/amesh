@@ -89,7 +89,7 @@ func TestListenReplyHeldAndIdle(t *testing.T) {
 	assert := func(action, status string) Event {
 		t.Helper()
 		ev := <-events
-		if ev.Action != action || ev.Status != status || ev.Peer.PID != os.Getpid() || int(ev.Peer.UID) != os.Geteuid() {
+		if ev.Action != action || string(ev.Status) != status || ev.Peer.PID != os.Getpid() || int(ev.Peer.UID) != os.Geteuid() {
 			t.Fatal(ev)
 		}
 		return ev
@@ -176,7 +176,7 @@ func TestContractControls(t *testing.T) {
 			if err != nil || ev.OriginalID != data["orig_msg_id"] || ev.Action != data["action"] || ev.From != data["from"] {
 				t.Fatal(ev, err)
 			}
-			if data["status"] != nil && ev.Status != data["status"] {
+			if data["status"] != nil && string(ev.Status) != data["status"] {
 				t.Fatal(ev.Status)
 			}
 		})
@@ -414,7 +414,7 @@ func TestOpenNativeReceipts(t *testing.T) {
 			t.Fatal(err)
 		}
 		e, err := decode(raw)
-		if err != nil || e.Status != f.Status || e.DropReason != f.DropReason || e.StatusDetail != f.StatusDetail {
+		if err != nil || string(e.Status) != f.Status || string(e.DropReason) != f.DropReason || string(e.StatusDetail) != f.StatusDetail {
 			t.Fatal(e, err)
 		}
 	}

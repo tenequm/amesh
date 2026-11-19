@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tenequm/amesh/internal/contract"
+
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
 	"github.com/tenequm/amesh/internal/state"
@@ -32,12 +34,15 @@ type (
 )
 
 type Event struct {
-	Peer                                                     peercred.Credentials
-	Action, ID, OriginalID, Log, Session                     string
-	From, FromMode, Status, StatusDetail, DropReason, Reason string
-	FinishedAt                                               int64
-	DroppedIDs                                               []string
-	Message                                                  envelope.Message
+	Peer                                 peercred.Credentials
+	Action, ID, OriginalID, Log, Session string
+	From, FromMode, Reason               string
+	Status                               contract.NativeReceiptStatus
+	StatusDetail                         contract.NativeReceiptStatusDetail
+	DropReason                           contract.NativeReceiptDropReason
+	FinishedAt                           int64
+	DroppedIDs                           []string
+	Message                              envelope.Message
 }
 type Handler func(context.Context, Event) error
 

@@ -86,19 +86,12 @@ func (b *Backend) closeEndpoints() {
 	}
 }
 
-func (b *Backend) report(ctx context.Context, log, id, key, status, reason string) error {
-	conn, err := b.client.Connection()
+func (b *Backend) report(ctx context.Context, log, id, key string, status contract.DeliveryState, reason contract.DropReason) error {
+	raw, err := json.Marshal(contract.StateReport{Kind: "state", ID: id, Session: key, State: string(status), Reason: optional(reason), At: time.Now().UnixMilli()})
 	if err != nil {
 		return err
 	}
-	if conn.Log != log {
-		return errors.New("delivery report belongs to a previous hub log")
-	}
-	raw, err := json.Marshal(contract.StateReport{Kind: "state", ID: id, Session: key, State: status, Reason: optional(contract.DropReason(reason)), At: time.Now().UnixMilli()})
-	if err != nil {
-		return err
-	}
-	res, err := b.client.Report(ctx, contract.ReportsRequest{Reports: []contract.Report{raw}})
+	res, err := b.client.Report(ctx, log, contract.ReportsRequest{Reports: []contract.Report{raw}})
 	if err != nil {
 		return err
 	}
@@ -107,7 +100,7 @@ func (b *Backend) report(ctx context.Context, log, id, key, status, reason strin
 	}
 	current := value(res.Results[0].State)
 	switch current {
-	case "accepted", "delivered", "denied", "expired", "refused", "dropped", "unknown":
+	case contract.DeliveryStateAccepted, contract.DeliveryStateDelivered, contract.DeliveryStateDenied, contract.DeliveryStateExpired, contract.DeliveryStateRefused, contract.DeliveryStateDropped, contract.DeliveryStateUnknown:
 	case "":
 		if res.Results[0].Applied {
 			return errors.New("applied report has no state")
@@ -145,15 +138,17 @@ func (b *Backend) prepareLog(ctx context.Context, conn contract.HelloResponse) e
 		b.peers = nil
 		b.directoryVersion++
 		b.mu.Unlock()
+		b.log = conn.Log
+		return nil
 	}
 	entries, err := b.store.OpenEntries(conn.Log)
 	if err != nil {
 		return err
 	}
 	for id, e := range entries {
-		status, reason := "unknown", ""
+		status, reason := contract.DeliveryStateUnknown, contract.DropReason("")
 		if e.Phase == state.Writing {
-			status, reason = "dropped", "interrupted"
+			status, reason = contract.DeliveryStateDropped, contract.DropReasonInterrupted
 		}
 		if err = b.report(ctx, conn.Log, id, e.Session, status, reason); err != nil {
 			return err
@@ -173,7 +168,7 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 		return err
 	}
 	if !live {
-		if err = b.report(ctx, conn.Log, msg.ID, key, "dropped", "unknown_session"); err != nil {
+		if err = b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateDropped, contract.DropReasonUnknownSession); err != nil {
 			return err
 		}
 		b.presence.Lock()
@@ -182,11 +177,10 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 			b.changed()
 			return nil
 		}
-		_, err = b.client.End(ctx, key, contract.SessionEndRequest{Reason: contract.SessionEndRequestReasonNotHosted})
-		return err
+		return b.end(ctx, key, contract.SessionEndRequestReasonNotHosted)
 	}
 	if time.Now().UnixMilli() >= msg.ExpiresAt {
-		return b.report(ctx, conn.Log, msg.ID, key, "dropped", "queue_expired")
+		return b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateDropped, contract.DropReasonQueueExpired)
 	}
 	ep, ok := b.endpoint(msg.Endpoint.ID)
 	if !ok {
@@ -199,10 +193,10 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 	}
 	var netErr *net.OpError
 	if errors.As(err, &netErr) || errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrNotExist) {
-		return b.report(ctx, conn.Log, msg.ID, key, "dropped", "session_gone")
+		return b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateDropped, contract.DropReasonSessionGone)
 	}
 	if errors.Is(err, relay.ErrOversized) {
-		return b.report(ctx, conn.Log, msg.ID, key, "dropped", "oversized")
+		return b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateDropped, contract.DropReasonOversized)
 	}
 	return err
 }
@@ -291,6 +285,11 @@ func (r *streamRun) handle(ctx context.Context, item contract.EventStreamItem) e
 			return err
 		}
 	}
+	// Snapshot endpoints precede the replay. Their relays must be listening for rewrite receipts.
+	if b.resumeRewrites != nil && (item.Event != "endpoint" || item.ID != nil) {
+		b.resumeRewrites(conn.Log)
+		b.resumeRewrites = nil
+	}
 	data := []byte(item.Data)
 	switch item.Event {
 	case "endpoint":
@@ -299,10 +298,10 @@ func (r *streamRun) handle(ctx context.Context, item contract.EventStreamItem) e
 			return err
 		}
 		switch e.State {
-		case "closed":
+		case contract.EndpointEventStateClosed:
 			r.wg.Wait()
 			err = b.unbind(e.ID)
-		case "open":
+		case contract.EndpointEventStateOpen:
 			_, err = b.bind(conn, contract.EndpointRef{ID: e.ID, Name: e.Name, Peer: e.Peer.Address}, e.Sessions, true)
 		default:
 			// Unknown endpoint states carry no v1 action.

@@ -19,6 +19,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tenequm/amesh/internal/contract"
+
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
 )
@@ -178,7 +180,7 @@ func decode(line []byte) (Event, error) {
 	if f.Version != 1 || !uuidRE.MatchString(f.ID) || !validFrom(f.From) {
 		return Event{}, errors.New("invalid native frame header")
 	}
-	event := Event{Action: f.Action, ID: f.ID, From: f.From, OriginalID: f.OriginalID, Status: f.Status, StatusDetail: f.StatusDetail, DropReason: f.DropReason, DroppedIDs: f.DroppedIDs, Reason: f.Reason, FromMode: f.Mode, FinishedAt: f.FinishedAt}
+	event := Event{Action: f.Action, ID: f.ID, From: f.From, OriginalID: f.OriginalID, Status: contract.NativeReceiptStatus(f.Status), StatusDetail: contract.NativeReceiptStatusDetail(f.StatusDetail), DropReason: contract.NativeReceiptDropReason(f.DropReason), DroppedIDs: f.DroppedIDs, Reason: f.Reason, FromMode: f.Mode, FinishedAt: f.FinishedAt}
 	switch {
 	case f.Type == "user" && f.Message != nil && f.Priority == "next" && f.Message.Role == "user":
 		msg, err := envelope.Parse(f.Message.Content)

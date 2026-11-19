@@ -100,7 +100,7 @@ func haltReason(err error) string {
 	reason := err.Error()
 	if h, ok := errors.AsType[*hub.HTTPError](err); ok && h.Body.Message != "" {
 		reason = h.Body.Message
-		if h.Body.Error == "machine_revoked" {
+		if h.Body.Error == contract.ErrorCodeMachineRevoked {
 			reason = "this machine was removed from the mesh."
 		}
 	}
@@ -121,10 +121,10 @@ func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter stri
 	out := mcpserver.Directory{You: mcpserver.Identity{Name: name, Project: s.Project, Machine: machine}, Peers: []mcpserver.Peer{}}
 	project, host, _ := strings.Cut(strings.TrimPrefix(filter, "@"), ":")
 	for _, p := range b.directory(ctx) {
-		if p.Kind == "session" && value(p.Machine) == machine || filter != "" && (value(p.Project) != project || host != "" && value(p.Machine) != host) {
+		if p.Kind == contract.KindSession && value(p.Machine) == machine || filter != "" && (value(p.Project) != project || host != "" && value(p.Machine) != host) {
 			continue
 		}
-		row := mcpserver.Peer{Name: p.Address, Kind: string(p.Kind), Machine: p.Machine, Project: p.Project, Status: string(p.Status)}
+		row := mcpserver.Peer{Name: p.Address, Kind: p.Kind, Machine: p.Machine, Project: p.Project, Status: p.Status}
 		if p.LastSeen != nil {
 			stamp := time.UnixMilli(*p.LastSeen).UTC().Format(time.RFC3339)
 			row.LastSeen = &stamp
@@ -135,9 +135,9 @@ func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter stri
 	since := b.offlineSince
 	b.mu.RUnlock()
 	if halt != nil {
-		out.Stale = haltReason(halt)
+		out.Stale = new(haltReason(halt))
 	} else if !since.IsZero() {
-		out.Stale = "The hub has been unreachable since " + since.UTC().Format("15:04") + " UTC; statuses may be old."
+		out.Stale = new("The hub has been unreachable since " + since.UTC().Format("15:04") + " UTC; statuses may be old.")
 	}
 	return out, nil
 }
@@ -146,7 +146,7 @@ func refused(reason string, known []string) mcpserver.SendResult {
 	if known == nil {
 		known = []string{}
 	}
-	return mcpserver.SendResult{Reason: reason, Known: &known}
+	return mcpserver.SendResult{Reason: &reason, Known: &known}
 }
 
 func matches(input, full string) bool {
@@ -165,7 +165,7 @@ func (b *Backend) reregister(ctx context.Context, key string) error {
 
 func unknownSession(err error) bool {
 	h, ok := errors.AsType[*hub.HTTPError](err)
-	return ok && h.Status == 404 && h.Body.Error == "unknown_session"
+	return ok && h.Status == 404 && h.Body.Error == contract.ErrorCodeUnknownSession
 }
 
 func (b *Backend) localTarget(to string) (member, bool) {
@@ -207,7 +207,7 @@ func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target memb
 	if err != nil {
 		return refused("The message could not be written to "+target.address+".", nil), nil //nolint:nilerr // MCP delivery refusals are ordinary tool results.
 	}
-	return mcpserver.SendResult{Accepted: true, ID: id, To: target.address, Note: "Sent. A reply, if any, arrives later as a message from " + target.address + "."}, nil
+	return mcpserver.SendResult{Accepted: true, ID: &id, To: &target.address, Note: new("Sent. A reply, if any, arrives later as a message from " + target.address + ".")}, nil
 }
 
 func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcpserver.SendArgs) (mcpserver.SendResult, error) {
@@ -254,11 +254,11 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 	id := uuid.NewString()
 	req := contract.SendRequest{ID: id, From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &to}, Text: args.Message, FromMode: optional(s.FromMode), Origin: contract.SendRequestOriginUnknown}
 	res, err := b.client.Send(ctx, req)
-	out := mcpserver.SendResult{Accepted: true, ID: id, To: to}
+	out := mcpserver.SendResult{Accepted: true, ID: &id, To: &to}
 	if errors.Is(err, hub.ErrQueued) {
-		out.Note = "Sent from this machine. It reaches the hub as soon as the connection is back, within 24 hours."
+		out.Note = new("Sent from this machine. It reaches the hub as soon as the connection is back, within 24 hours.")
 		if h, ok := errors.AsType[*hub.HTTPError](err); ok && h.Status == 429 {
-			out.Note = "Sending is paced. This machine will retry automatically."
+			out.Note = new("Sending is paced. This machine will retry automatically.")
 		}
 		return out, nil
 	}
@@ -268,7 +268,7 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 		}
 		if h, ok := errors.AsType[*hub.HTTPError](err); ok {
 			var options []string
-			if h.Body.Error == "not_found" {
+			if h.Body.Error == contract.ErrorCodeNotFound {
 				options = known
 			} else if h.Body.Candidates != nil {
 				options = *h.Body.Candidates
@@ -277,10 +277,10 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 		}
 		return refused("The message could not be queued on this machine.", nil), nil
 	}
-	out.To = res.Message.To.Address
-	out.Note = "Sent. A reply, if any, arrives later as a message from " + out.To + "."
-	if res.Message.To.Status == "offline" {
-		out.Note = out.To + " is offline. The message waits up to 24 hours and is delivered when it is back."
+	out.To = &res.Message.To.Address
+	out.Note = new("Sent. A reply, if any, arrives later as a message from " + res.Message.To.Address + ".")
+	if res.Message.To.Status == contract.PeerStatusOffline {
+		out.Note = new(res.Message.To.Address + " is offline. The message waits up to 24 hours and is delivered when it is back.")
 	}
 	return out, nil
 }

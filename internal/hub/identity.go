@@ -96,6 +96,31 @@ func saveFile(path string, data []byte, exclusive bool) error {
 	return d.Sync()
 }
 
+func MachineID(dir string) (string, error) {
+	id, err := loadOrCreateKey(dir)
+	return id.id, err
+}
+
+func loadOrCreateKey(dir string) (identity, error) {
+	path := filepath.Join(dir, "machine.key")
+	id, err := loadKey(path)
+	if errors.Is(err, os.ErrNotExist) {
+		key, genErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if genErr != nil {
+			return identity{}, genErr
+		}
+		data, marshalErr := x509.MarshalECPrivateKey(key)
+		if marshalErr != nil {
+			return identity{}, marshalErr
+		}
+		if err = saveFile(path, data, true); err != nil && !errors.Is(err, os.ErrExist) {
+			return identity{}, err
+		}
+		id, err = loadKey(path)
+	}
+	return id, err
+}
+
 func Enroll(ctx context.Context, cfg config.Config, out io.Writer) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -103,22 +128,7 @@ func Enroll(ctx context.Context, cfg config.Config, out io.Writer) error {
 	if !machineName.MatchString(cfg.MachineName) {
 		return errors.New("enroll requires a valid machine-name")
 	}
-	path := filepath.Join(cfg.StateDir, "machine.key")
-	id, err := loadKey(path)
-	if errors.Is(err, os.ErrNotExist) {
-		key, genErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if genErr != nil {
-			return genErr
-		}
-		data, marshalErr := x509.MarshalECPrivateKey(key)
-		if marshalErr != nil {
-			return marshalErr
-		}
-		if err = saveFile(path, data, true); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
-		}
-		id, err = loadKey(path)
-	}
+	id, err := loadOrCreateKey(cfg.StateDir)
 	if err != nil {
 		return err
 	}

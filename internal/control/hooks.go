@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tenequm/amesh/internal/contract"
+
 	"github.com/tenequm/amesh/internal/registry"
 )
 
@@ -30,7 +32,7 @@ func (d *daemon) hook(w http.ResponseWriter, r *http.Request) {
 	pid, _ := r.Context().Value(peerPID{}).(int)
 	session, err := d.registry.Resolve(r.Context(), pid)
 	if err != nil {
-		reject(w, 403, "not_in_session", "This only works inside a Claude Code session.")
+		reject(w, 403, contract.LocalErrorErrorNotInSession, "This only works inside a Claude Code session.")
 		return
 	}
 	d.applyHook(w, r, session)
@@ -41,7 +43,7 @@ func (d *daemon) applyHook(w http.ResponseWriter, r *http.Request, s registry.Se
 	var h hookInput
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
 	if err != nil || json.Unmarshal(b, &h) != nil || h.SessionID == nil {
-		reject(w, 400, "bad_request", "Invalid hook input.")
+		reject(w, 400, contract.LocalErrorErrorBadRequest, "Invalid hook input.")
 		return
 	}
 	switch {
@@ -64,7 +66,7 @@ func (d *daemon) applyHook(w http.ResponseWriter, r *http.Request, s registry.Se
 			return
 		}
 	default:
-		reject(w, 400, "bad_request", "Unknown or malformed hook event.")
+		reject(w, 400, contract.LocalErrorErrorBadRequest, "Unknown or malformed hook event.")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

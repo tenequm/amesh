@@ -125,9 +125,9 @@ func (c *Client) event(ctx context.Context, item contract.EventStreamItem, handl
 	}
 	switch item.Event {
 	case "revoked":
-		return c.stop(&HTTPError{Status: 403, Body: contract.ErrorBody{Error: "machine_revoked", Message: "Machine enrollment was revoked."}})
+		return c.stop(&HTTPError{Status: 403, Body: contract.ErrorBody{Error: contract.ErrorCodeMachineRevoked, Message: "Machine enrollment was revoked."}})
 	case "superseded":
-		return &HTTPError{Status: 409, Body: contract.ErrorBody{Error: "superseded", Message: "Another daemon owns this machine."}}
+		return &HTTPError{Status: 409, Body: contract.ErrorBody{Error: contract.ErrorCodeSuperseded, Message: "Another daemon owns this machine."}}
 	case "synchronized":
 		if json.Unmarshal(meta.Seq, &dataSeq) != nil || dataSeq == nil || *dataSeq < 0 {
 			return errors.New("missing or invalid synchronization sequence")
@@ -296,14 +296,14 @@ func (c *Client) Stream(ctx context.Context, handle func(context.Context, contra
 			conn, _ = c.Connection()
 			c.helloMu.RUnlock()
 			connected, err = c.readStream(ctx, conn, handle)
-			if h, ok := errors.AsType[*HTTPError](err); ok && h.Status == 400 && h.Body.Error == "bad_cursor" && h.Body.Seq != nil {
+			if h, ok := errors.AsType[*HTTPError](err); ok && h.Status == 400 && h.Body.Error == contract.ErrorCodeBadCursor && h.Body.Seq != nil {
 				slog.Warn("resetting peer cursor to hub head", "seq", *h.Body.Seq)
 				if resetErr := c.resetCursor(conn.Log, *h.Body.Seq); resetErr != nil {
 					return resetErr
 				}
 				continue
 			}
-			if hasCode(err, 409, "superseded") {
+			if hasCode(err, 409, contract.ErrorCodeSuperseded) {
 				err = c.confirmOwner(ctx, revision)
 				if err == nil {
 					needHello = false

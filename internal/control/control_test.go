@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -58,14 +59,14 @@ func TestUpgradeArgumentsAndRefusals(t *testing.T) {
 	if !(registry.Session{CWD: "/tmp/amesh-identity/sub"}).MeshExcluded(nil, []string{"/tmp/amesh-identity"}) || (registry.Session{CWD: "/tmp/amesh-identity-other"}).MeshExcluded(nil, []string{"/tmp/amesh-identity"}) {
 		t.Fatal("directory boundary")
 	}
-	dir, key := liveEntry(t)
+	dir, key := liveEntry(t, "2.1.330")
 	d.cfg.ClaudeConfigDirs = []string{filepath.Join(dir, "primary"), dir}
 	d.registry = registry.New(d.cfg.ClaudeConfigDirs)
 	r := request(t, "")
 	w = httptest.NewRecorder()
 	d.upgrade(w, r.WithContext(context.WithValue(r.Context(), peerPID{}, key.PID)))
-	var refusal localError
-	if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != http.StatusForbidden || refusal.Code != "excluded" {
+	var refusal contract.LocalError
+	if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != http.StatusForbidden || refusal.Error != "excluded" {
 		t.Fatal(w.Code, refusal, err)
 	}
 }
@@ -147,7 +148,7 @@ func (b humanBackend) HumanTurn(_ context.Context, s registry.Session) error {
 }
 
 func TestHookGuardAndHumanTurns(t *testing.T) {
-	dir, key := liveEntry(t)
+	dir, key := liveEntry(t, "2.1.330")
 	sessions := registry.New([]string{dir})
 	s, err := sessions.Resolve(t.Context(), key.PID)
 	if err != nil {
@@ -226,7 +227,7 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	call("{}", 400)
 }
 
-func liveEntry(t *testing.T) (string, registry.Key) {
+func liveEntry(t *testing.T, version string) (string, registry.Key) {
 	t.Helper()
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -251,7 +252,7 @@ func liveEntry(t *testing.T) (string, registry.Key) {
 	if err := os.Mkdir(filepath.Join(dir, "sessions"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	entry := map[string]any{"pid": pid, "procStart": start, "sessionId": "id", "name": "amesh-identity", "cwd": dir, "messagingSocketPath": "/tmp/amesh-identity.sock", "peerProtocol": 1, "status": "idle", "version": "2.1.330"}
+	entry := map[string]any{"pid": pid, "procStart": start, "sessionId": "id", "name": "amesh-identity", "cwd": dir, "messagingSocketPath": "/tmp/amesh-identity.sock", "peerProtocol": 1, "status": "idle", "version": version}
 	b, _ := json.Marshal(entry)
 	if err := os.WriteFile(filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
 		t.Fatal(err)
@@ -260,7 +261,7 @@ func liveEntry(t *testing.T) (string, registry.Key) {
 }
 
 func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
-	dir, key := liveEntry(t)
+	dir, key := liveEntry(t, "2.1.330")
 	dirs := []string{dir, filepath.Join(dir, "empty")}
 	d := daemon{mesh: humanBackend{member: key}, registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs, MachineName: "mac"}, started: time.Now(), pipes: map[*registration]struct{}{{key: key}: {}, {key: key, parent: "parent"}: {}}}
 	w := httptest.NewRecorder()
@@ -284,6 +285,20 @@ func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 	d.status(w, request(t, ""))
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || len(got.Pipes) != 0 || len(got.Members) != 1 || len(got.Warnings) != 1 || !strings.Contains(got.Warnings[0], "2.1.330") {
 		t.Fatal(got, err)
+	}
+}
+
+func TestVerifiedNativeVersions(t *testing.T) {
+	for _, version := range []string{"2.1.325", "2.1.328"} {
+		dir, key := liveEntry(t, version)
+		dirs := []string{dir}
+		d := daemon{mesh: humanBackend{member: key}, registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs}}
+		w := httptest.NewRecorder()
+		d.status(w, request(t, ""))
+		var got contract.DaemonStatus
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || got.Warnings != nil {
+			t.Errorf("verified %s: warnings %v, error %v", version, got.Warnings, err)
+		}
 	}
 }
 
@@ -319,7 +334,7 @@ func TestTranscriptRequiresMatchingCompleteRow(t *testing.T) {
 }
 
 func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
-	dir, key := liveEntry(t)
+	dir, key := liveEntry(t, "2.1.330")
 	r := registry.New([]string{dir})
 	s, err := r.Resolve(t.Context(), key.PID)
 	if err != nil {
@@ -399,9 +414,9 @@ func TestReconnectedPipeReturnsRefusal(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		start := time.Now()
 		_, err := redial(t.Context(), func(context.Context) (*bufferedConn, error) {
-			return nil, &localError{"excluded", "amesh is turned off for this directory."}
+			return nil, localError("amesh is turned off for this directory.")
 		})
-		if _, ok := errors.AsType[*localError](err); !ok || time.Since(start) != 250*time.Millisecond {
+		if _, ok := errors.AsType[localError](err); !ok || time.Since(start) != 250*time.Millisecond {
 			t.Fatal(err)
 		}
 	})
@@ -415,4 +430,46 @@ func TestHumanHookTranscriptExample(t *testing.T) {
 	if h.SessionID == nil || h.Transcript != "/Users/tenequm/.claude/projects/-Users-tenequm-pj-pond/"+*h.SessionID+".jsonl" {
 		t.Fatal("hook transcript path")
 	}
+}
+
+func TestStaleSocketReclaimRequiresOwnerAndSameFile(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "amesh-fix1-control-") //nolint:usetesting // Unix socket paths must stay short.
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "amesh-fix1.sock")
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.SetUnlinkOnClose(false)
+	if err = ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.Sys().(*syscall.Stat_t).Uid++
+	if err = removeStaleSocket(t.Context(), path, info); err == nil {
+		t.Fatal("removed another owner's socket")
+	}
+	otherSocket, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, "amesh-fix1-other.sock"), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherSocket.Close()
+	other, err := os.Lstat(otherSocket.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = removeStaleSocket(t.Context(), path, other); err == nil {
+		t.Fatal("removed a different file")
+	}
+	listener, err := listen(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = listener.Close()
 }

@@ -408,11 +408,9 @@ func TestOfflineRestartWritesExpiryNotice(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		if runErr := b.client.RunOutbox(ctx, func(out hub.SendOutcome) {
-			if e := b.completed(out); e != nil {
-				t.Error(e)
-			}
-			cancel()
+		if runErr := b.client.Drain(ctx, nil, func(out hub.SendOutcome) error {
+			defer cancel()
+			return b.completed(out)
 		}); !errors.Is(runErr, context.Canceled) {
 			t.Fatal(runErr)
 		}
@@ -568,5 +566,239 @@ func TestAgentDeliveryAndEndpointClosure(t *testing.T) {
 		if err != nil || n.cause != "" {
 			t.Fatal("agent acceptance produced a notice", err)
 		}
+	}
+}
+
+func TestStartupRewriteWaitsForHubLog(t *testing.T) {
+	inbox, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testSession()
+	s.SocketPath = inbox
+	s.ProcStart, err = registry.ProcessStart(s.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := sessionKey(s.Key)
+	const id = "54ad69a0-b410-4a59-9fb1-90ff72440102"
+	hello := hubtest.Reply(t, "helloResponse")
+	helloFinished := make(chan struct{})
+	var hellos atomic.Int32
+	reports := make(chan contract.StateReport, 2)
+	ep := contract.EndpointEvent{Kind: "endpoint", ID: "pe_test", Name: "stan", Sessions: []string{key}, State: contract.EndpointEventStateOpen, Peer: contract.EndpointEventPeer{Address: "stan", Kind: contract.KindAgent}}
+	b, r := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/hello": func(w http.ResponseWriter, r *http.Request) {
+			if hellos.Add(1) == 2 {
+				defer close(helloFinished)
+				select {
+				case <-lines:
+					t.Error("rewrite reached inbox before hello")
+				case <-time.After(3 * time.Second):
+				case <-r.Context().Done():
+					return
+				}
+			}
+			hello(w, r)
+		},
+		"POST /peer/reports": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.ReportsRequest
+			var report contract.StateReport
+			if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil || len(req.Reports) != 1 || json.Unmarshal(req.Reports[0], &report) != nil {
+				t.Error("invalid report")
+				return
+			}
+			reports <- report
+			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: id}}})
+		},
+		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+		},
+		"POST /peer/heartbeat": func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{}") },
+		"GET /peer/events": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			data, _ := json.Marshal(ep)
+			fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", data)
+			fmt.Fprint(w, "event: synchronized\ndata: {\"kind\":\"synchronized\",\"seq\":0}\n\n")
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		},
+	})
+	*r = append(*r, s)
+	if _, err = b.Connect(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := b.client.Connection()
+	if err = b.store.SetLog(conn.Log); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = b.store.BeginWrite(conn.Log, id, key, time.Now().Add(time.Hour), "message"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := relay.Path(b.socketDir, "amesh-relay\n"+conn.Machine.ID, ep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := envelope.Render(envelope.Message{From: envelope.Address(path), FromName: ep.Name, FromSession: ep.ID, Body: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(map[string]any{"inbox": inbox, "content": content, "pid": s.PID, "uid": os.Geteuid(), "procStart": s.ProcStart, "rewrites": 1, "acceptWindow": time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = b.store.SetRewrite(id, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = b.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b.client = hub.New(b.cfg)
+	stop, err := b.Start(t.Context(), b.store, b.cfg.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	<-helloFinished
+	select {
+	case <-lines:
+	case <-time.After(8 * time.Second):
+		t.Error("missing rewrite after log preparation")
+	}
+	select {
+	case report := <-reports:
+		if report.State != "accepted" || report.ID != id {
+			t.Fatalf("rewritten delivery reported as %q", report.State)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rewritten delivery had no receipt subscription")
+	}
+}
+
+func TestNullReportAcknowledgementClosesEntry(t *testing.T) {
+	const id = "unknown-id"
+	b, _ := fixture(t, map[string]http.HandlerFunc{"POST /peer/reports": func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: id}}})
+	}})
+	conn, _ := b.client.Connection()
+	if err := b.store.SetLog(conn.Log); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.store.BeginWrite(conn.Log, id, "session", time.Now().Add(time.Hour), "message"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.prepareLog(t.Context(), conn); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := b.store.OpenEntries(conn.Log); err != nil || len(open) != 0 {
+		t.Fatal(open, err)
+	}
+}
+
+func TestNotHostedEndWaitsForGoneRecipientsNotice(t *testing.T) {
+	var ends atomic.Int32
+	var hello contract.HelloResponse
+	if err := json.Unmarshal(hubtest.Example(t, "helloResponse"), &hello); err != nil {
+		t.Fatal(err)
+	}
+	hello.Settings.SendWaitMs = 0
+	key := sessionKey(testSession().Key)
+	b, reg := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/hello": func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(hello) },
+		"POST /peer/reports": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: "incoming"}}})
+		},
+		"POST /peer/heartbeat": func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{}") },
+		"POST /peer/messages":  hubtest.Reply(t, "errNotFound"),
+		"POST /peer/sessions/{key}/end": func(w http.ResponseWriter, r *http.Request) {
+			ends.Add(1)
+			hubtest.Reply(t, "sessionEndResponse")(w, r)
+		},
+	})
+	to := "stan"
+	req := contract.SendRequest{From: contract.SendRequestFrom{Session: key}, ID: "outgoing", To: contract.SendRequestTo{Address: &to}, Text: "queued"}
+	if _, err := b.client.Send(t.Context(), req); !errors.Is(err, hub.ErrQueued) {
+		t.Fatal(err)
+	}
+	msg := contract.MessageEvent{ID: "incoming", Session: key}
+	if err := b.store.SetLog(hello.Log); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.receive(t.Context(), hello, msg); err != nil {
+		t.Errorf("orphan delivery ended before drain: %v", err)
+	}
+	if n := ends.Load(); n != 0 {
+		t.Errorf("not-hosted end passed pending outbox: %d", n)
+	}
+	s := testSession()
+	*reg = append(*reg, s)
+	pipe, err := b.Connect(t.Context(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pipe.Close()
+	*reg = nil
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	err = b.client.Drain(ctx, nil, func(out hub.SendOutcome) error { defer cancel(); return b.completed(out) })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("gone recipient retained notice: %v", err)
+	}
+	if n, pendingErr := b.client.Pending(key); n != 0 || pendingErr != nil {
+		t.Fatal(n, pendingErr)
+	}
+	if err = b.reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if n := ends.Load(); n != 1 {
+		t.Fatalf("expected one end, got %d", n)
+	}
+}
+
+func TestFailedBindKeepsAcceptedOutboxEntry(t *testing.T) {
+	var hello contract.HelloResponse
+	if err := json.Unmarshal(hubtest.Example(t, "helloResponse"), &hello); err != nil {
+		t.Fatal(err)
+	}
+	hello.Settings.SendWaitMs = 0
+	var res contract.SendResponse
+	if err := json.Unmarshal(hubtest.Example(t, "sendResponse"), &res); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/hello":    func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(hello) },
+		"POST /peer/messages": hubtest.Reply(t, "sendResponse"),
+	})
+	req := contract.SendRequest{ID: res.Message.ID, From: contract.SendRequestFrom{Session: sessionKey(testSession().Key)}, To: contract.SendRequestTo{Address: &res.Message.To.Address}, Text: "queued"}
+	if _, err := b.client.Send(t.Context(), req); !errors.Is(err, hub.ErrQueued) {
+		t.Fatal(err)
+	}
+	path, err := relay.Path(b.socketDir, "amesh-relay\n"+hello.Machine.ID, res.Message.Endpoint.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = b.client.Drain(t.Context(), nil, b.completed); err == nil {
+		t.Fatal("expected bind failure")
+	}
+	if n, pendingErr := b.client.Pending(""); n != 1 || pendingErr != nil {
+		t.Fatalf("pending after bind failure: %d, %v", n, pendingErr)
+	}
+	if err = os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	err = b.client.Drain(ctx, nil, func(out hub.SendOutcome) error { defer cancel(); return b.completed(out) })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if _, ok := b.endpoint(res.Message.Endpoint.ID); !ok {
+		t.Fatal("missing bound relay")
+	}
+	if n, pendingErr := b.client.Pending(""); n != 0 || pendingErr != nil {
+		t.Fatal(n, pendingErr)
 	}
 }

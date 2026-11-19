@@ -122,7 +122,7 @@ func TestLaneRouting(t *testing.T) {
 		}
 		got, e := b.SendToParent(ctx, child, parentID, "reply")
 		d = r.writes[len(r.writes)-1]
-		if e != nil || !got.Accepted || got.ID != d.ID || got.To != "parent" || d.Inbox != p.SocketPath || d.Message.From != "uds:"+r.path || d.Message.FromSession != "ln_0d049992f294f2a2" || d.Message.FromMode != "" || len(d.Message.HopChain) != len(hops) {
+		if e != nil || !got.Accepted || got.ID == nil || *got.ID != d.ID || got.To == nil || *got.To != "parent" || d.Inbox != p.SocketPath || d.Message.From != "uds:"+r.path || d.Message.FromSession != "ln_0d049992f294f2a2" || d.Message.FromMode != "" || len(d.Message.HopChain) != len(hops) {
 			t.Fatalf("%+v %+v %v", got, d, e)
 		}
 	}
@@ -133,7 +133,7 @@ func TestLaneRouting(t *testing.T) {
 	}
 	s.remove(p.PID)
 	got, err := b.SendToParent(ctx, child, parentID, "gone")
-	if err != nil || got.Reason != gone {
+	if err != nil || got.Reason == nil || *got.Reason != gone {
 		t.Fatal(got, err)
 	}
 	copyParent.Name = "resumed"
@@ -237,19 +237,20 @@ func TestLaneNotices(t *testing.T) {
 }
 
 func TestLocalMachineIdentity(t *testing.T) {
-	d := t.TempDir()
-	first, err := machineID(d)
+	d := filepath.Join(t.TempDir(), "amesh-fix1-identity")
+	identity := func() (string, error) { return New(t.Context(), nil, nil, d).identity() }
+	first, err := identity()
 	if err != nil || !strings.HasPrefix(first, "pm_") {
 		t.Fatal(first, err)
 	}
-	again, err := machineID(d)
+	again, err := identity()
 	if err != nil || again != first {
 		t.Fatal(again, err)
 	}
 	if err = os.Chmod(filepath.Join(d, "machine.key"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = machineID(d); err == nil {
+	if _, err = identity(); err == nil {
 		t.Fatal("accepted group-readable key")
 	}
 }

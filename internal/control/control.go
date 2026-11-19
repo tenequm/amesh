@@ -75,16 +75,12 @@ func listen(ctx context.Context, path string) (net.Listener, error) {
 	l, err := lc.Listen(ctx, "unix", path)
 	if errors.Is(err, syscall.EADDRINUSE) {
 		// The daemon lock serializes startup. Reclaim only a dead socket.
-		if fi, e := os.Lstat(path); e == nil && fi.Mode()&os.ModeSocket != 0 {
-			conn, e := (&net.Dialer{}).DialContext(ctx, "unix", path)
-			if e == nil {
-				_ = conn.Close()
-			} else if errors.Is(e, syscall.ECONNREFUSED) {
-				if e = os.Remove(path); e != nil {
-					return nil, e
-				}
-				l, err = lc.Listen(ctx, "unix", path)
+		fi, statErr := os.Lstat(path)
+		if statErr == nil {
+			if reclaimErr := removeStaleSocket(ctx, path, fi); reclaimErr != nil {
+				return nil, reclaimErr
 			}
+			l, err = lc.Listen(ctx, "unix", path)
 		}
 	}
 	if err != nil {
@@ -95,6 +91,28 @@ func listen(ctx context.Context, path string) (net.Listener, error) {
 		return nil, err
 	}
 	return l, nil
+}
+
+func removeStaleSocket(ctx context.Context, path string, observed os.FileInfo) error {
+	if observed.Mode()&os.ModeSocket == 0 || int(observed.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() {
+		return syscall.EADDRINUSE
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
+	if err == nil {
+		_ = conn.Close()
+		return syscall.EADDRINUSE
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return syscall.EADDRINUSE
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(observed, current) || int(current.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() {
+		return syscall.EADDRINUSE
+	}
+	return os.Remove(path)
 }
 
 func Serve(ctx context.Context, cfg config.Config, sessions *registry.Registry, lane laneService, mesh meshService, ownsRelay func(string) bool) error {
@@ -125,17 +143,14 @@ func Serve(ctx context.Context, cfg config.Config, sessions *registry.Registry, 
 	return err
 }
 
-type localError struct {
-	Code    string `json:"error"`
-	Message string `json:"message"`
-}
+type localError string
 
-func (e *localError) Error() string { return e.Message }
+func (e localError) Error() string { return string(e) }
 
-func reject(w http.ResponseWriter, status int, code, message string) {
+func reject(w http.ResponseWriter, status int, code contract.LocalErrorError, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(localError{code, message})
+	_ = json.NewEncoder(w).Encode(contract.LocalError{Error: code, Message: message})
 }
 
 func (d *daemon) meshExcluded(s registry.Session) bool {
@@ -189,17 +204,17 @@ func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
 func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 	parent, reconnect, err := mode(r)
 	if err != nil {
-		reject(w, 400, "bad_request", err.Error())
+		reject(w, 400, contract.LocalErrorErrorBadRequest, err.Error())
 		return
 	}
 	pid, _ := r.Context().Value(peerPID{}).(int)
 	s, err := d.registry.Resolve(r.Context(), pid)
 	if err != nil {
-		reject(w, 403, "not_in_session", "This only works inside a Claude Code session.")
+		reject(w, 403, contract.LocalErrorErrorNotInSession, "This only works inside a Claude Code session.")
 		return
 	}
 	if parent == "" && d.meshExcluded(s) {
-		reject(w, 403, "excluded", "amesh is turned off for this directory.")
+		reject(w, 403, contract.LocalErrorErrorExcluded, "amesh is turned off for this directory.")
 		return
 	}
 	var handle io.Closer

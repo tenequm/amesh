@@ -20,6 +20,7 @@ type Backend struct {
 	endpointMu       sync.Mutex
 	endpoints        map[string]endpoint
 	logMu            sync.Mutex
+	resumeRewrites   func(string)
 	log              string
 	ack              func(context.Context, int64) error
 	cfg              config.Config
