@@ -3,6 +3,7 @@ package mesh
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/tenequm/amesh/internal/config"
@@ -373,5 +375,51 @@ func TestRelayReplyReceiptAndNotice(t *testing.T) {
 	note, err = envelope.Parse(frame.Message.Content)
 	if err != nil || frame.From != nil || note.FromName != "amesh" || !strings.Contains(note.Body, "the hub was replaced") {
 		t.Fatal("missing no-from notice")
+	}
+}
+
+func TestOfflineRestartWritesExpiryNotice(t *testing.T) {
+	s := testSession()
+	key := sessionKey(s.Key)
+	inbox, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SocketPath = inbox
+	b, r := fixture(t, map[string]http.HandlerFunc{})
+	*r = append(*r, s)
+	if _, err = b.Connect(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := b.client.Connection()
+	if err = b.prepareLog(t.Context(), conn); err != nil {
+		t.Fatal(err)
+	}
+	to := "stan"
+	req := contract.SendRequest{ID: "c8ce54bb-1dc0-4aa0-9d60-f131492a685e", From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &to}, Text: "queued"}
+	// Use virtual time for the full TTL. The fake inbox lives outside the bubble.
+	synctest.Test(t, func(t *testing.T) {
+		b.client = hub.New(b.cfg)
+		if _, sendErr := b.client.Send(t.Context(), req); !errors.Is(sendErr, hub.ErrQueued) {
+			t.Fatal(sendErr)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		if runErr := b.client.RunOutbox(ctx, func(out hub.SendOutcome) { b.completed(out); cancel() }); !errors.Is(runErr, context.Canceled) {
+			t.Fatal(runErr)
+		}
+	})
+	var frame contract.NativeUserFrame
+	select {
+	case line := <-lines:
+		if err = json.Unmarshal(line, &frame); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("expired send did not notify the offline session")
+	}
+	want := (relay.NoticeSource{MachineID: conn.Machine.ID, Kind: "outbox", Source: req.ID}).ID()
+	if frame.MsgID != want || frame.From != nil || !strings.Contains(frame.Message.Content, "could not reach the hub for 24 hours") {
+		t.Fatal("incorrect offline expiry notice")
 	}
 }

@@ -126,6 +126,9 @@ func (b *Backend) prepareLog(ctx context.Context, conn contract.HelloResponse) e
 	if current.Log != conn.Log {
 		return errors.New("hub log changed during recovery")
 	}
+	if err := b.rememberMachine(conn.Machine.ID); err != nil {
+		return err
+	}
 	if err := b.store.SetLog(conn.Log); err != nil {
 		return err
 	}

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"time"
@@ -143,6 +145,13 @@ func (b *Backend) writeNotice(ctx context.Context, conn contract.HelloResponse, 
 }
 
 func (b *Backend) outboxNotice(ctx context.Context, conn contract.HelloResponse, req contract.SendRequest, err error) error {
+	if conn.Machine.ID == "" {
+		raw, readErr := os.ReadFile(filepath.Join(b.cfg.StateDir, "mesh-machine"))
+		if readErr != nil {
+			return readErr
+		}
+		conn.Machine.ID = string(raw)
+	}
 	n := notice{session: req.From.Session, source: req.ID, kind: "outbox", cause: "start_refused", endpoint: value(req.To.Endpoint), peer: value(req.To.Address), detail: "The send could not be completed."}
 	if n.endpoint != "" {
 		if ep, ok := b.endpoint(n.endpoint); ok {
@@ -235,6 +244,12 @@ func (b *Backend) completed(out hub.SendOutcome) {
 		retry = retry && a.retry
 	}
 	conn, _ := b.client.Connection()
+	if conn.Log != "" {
+		if err := b.prepareLog(b.ctx, conn); err != nil {
+			slog.Error("preparing hub log for outbox completion", "error", err)
+			return
+		}
+	}
 	if out.Err == nil {
 		if _, err := b.bind(conn, out.Response.Message.Endpoint, []string{req.From.Session}, false); err != nil {
 			slog.Error("binding queued send relay", "error", err)

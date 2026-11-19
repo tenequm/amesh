@@ -75,27 +75,59 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	return sync.OnceValue(func() error { cancel(); workers.Wait(); b.closeEndpoints(); b.retries.Wait(); return store.Close() }), nil
 }
 
+// Expiry notices still need the public machine id when a restarted daemon
+// cannot complete hello. The outbox and the delivered-id store own their log ids.
+func (b *Backend) rememberMachine(id string) error {
+	if id == "" {
+		return errors.New("missing hub machine id")
+	}
+	root, err := os.OpenRoot(b.cfg.StateDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	const path = "mesh-machine"
+	const pending = "mesh-machine.pending"
+	prior, err := root.ReadFile(path)
+	if err == nil && string(prior) == id {
+		return nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	f, err := root.OpenFile(pending, os.O_RDWR|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Remove(pending) }()
+	_, err = f.WriteString(id)
+	if err == nil {
+		err = f.Sync()
+	}
+	err = errors.Join(err, f.Close())
+	if err != nil {
+		return err
+	}
+	return root.Rename(pending, path)
+}
+
 func (b *Backend) runUploader(ctx context.Context) {
 	for ctx.Err() == nil {
 		conn, halt := b.client.Connection()
 		if halt != nil {
 			return
 		}
+		var err error
 		if conn.Log != "" {
-			if err := b.prepareLog(ctx, conn); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				slog.Warn("mesh outbox awaits delivery recovery", "error", err)
-			} else {
-				if err = b.client.RunOutbox(ctx, b.completed); err != nil && ctx.Err() == nil {
-					slog.Warn("mesh outbox stopped", "error", err)
-				}
-				if ctx.Err() != nil {
-					return
-				}
-			}
+			err = b.prepareLog(ctx, conn)
 		}
+		if err == nil {
+			err = b.client.RunOutbox(ctx, b.completed)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Warn("mesh outbox stopped", "error", err)
 		select {
 		case <-ctx.Done():
 			return
