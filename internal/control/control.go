@@ -242,10 +242,6 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 	_ = mcpserver.Serve(r.Context(), &bufferedConn{conn, rw.Reader}, caller, parent, reconnect, d.lane, d.mesh)
 }
 
-func (d *daemon) hook(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusNotImplemented)
-}
-
 func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
 }

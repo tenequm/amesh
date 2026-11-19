@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/tenequm/amesh/internal/mcpserver"
 
 	"github.com/tenequm/amesh/internal/registry"
 )
@@ -102,4 +105,51 @@ func TestPipeForwardsArgvAndBytes(t *testing.T) {
 	if err = <-done; err != nil {
 		t.Fatal(err)
 	}
+}
+
+type humanBackend struct {
+	mcpserver.MeshBackend
+	human chan registry.Session
+}
+
+func (b humanBackend) HumanTurn(_ context.Context, s registry.Session) error {
+	b.human <- s
+	return nil
+}
+
+func TestHookGuardAndHumanTurns(t *testing.T) {
+	key := registry.Key{PID: 123, ProcStart: "start"}
+	s := registry.Session{Key: key, SessionID: "resolved"}
+	backend := humanBackend{human: make(chan registry.Session, 1)}
+	reg := &registration{key: s.Key}
+	d := daemon{ctx: t.Context(), mesh: backend, pipes: map[*registration]struct{}{reg: {}}}
+	call := func(input string, code int) {
+		t.Helper()
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/amesh/hooks", strings.NewReader(input))
+		w := httptest.NewRecorder()
+		d.applyHook(w, r, s)
+		if w.Code != code || (code == 200 && w.Body.String() != denySubagent) || ((code == 204 || code == 202) && w.Body.Len() != 0) {
+			t.Fatal(w.Code, w.Body.String())
+		}
+	}
+	for _, tool := range []string{"list_peers", "send_message", "send_to_parent"} {
+		call(fmt.Sprintf(`{"hook_event_name":"PreToolUse","session_id":"claimed","tool_name":"mcp__amesh__%s","agent_id":""}`, tool), 200)
+	}
+	call(`{"hook_event_name":"PreToolUse","session_id":"claimed","tool_name":"mcp__amesh__list_peers"}`, 204)
+	prompt := func(p string) string {
+		return fmt.Sprintf(`{"hook_event_name":"UserPromptSubmit","session_id":"claimed","prompt":%q}`, p)
+	}
+	for _, p := range []string{"<task-notification>", "<agent-message from", "<cross-session-message from"} {
+		call(prompt(p), 204)
+	}
+	call(prompt("hello"), 202)
+	d.work.Wait()
+	if got := <-backend.human; got.SessionID != "resolved" {
+		t.Fatal(got)
+	}
+	reg.parent = "parent"
+	call(prompt("hello"), 204)
+	delete(d.pipes, reg)
+	call(prompt("hello"), 204)
+	call("{}", 400)
 }
