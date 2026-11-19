@@ -632,3 +632,24 @@ func TestStaleSocketReclaimRequiresOwnerAndSameFile(t *testing.T) {
 	}
 	_ = listener.Close()
 }
+
+func TestPipeReportsLostFinalInput(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := os.NewFile(uintptr(fds[0]), "pipe")
+	conn, err := net.FileConn(local)
+	_ = local.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = syscall.Close(fds[1])
+	blocks := make(chan inputBlock, 1)
+	blocks <- inputBlock{data: []byte("last request\n"), err: io.EOF}
+	needInput := false
+	stop, err := forward(t.Context(), &bufferedConn{conn, bufio.NewReader(conn)}, nil, blocks, io.Discard, &needInput)
+	if !stop || !errors.Is(err, syscall.EPIPE) {
+		t.Fatalf("forward returned stop=%t err=%v, want stop=true err=EPIPE", stop, err)
+	}
+}
