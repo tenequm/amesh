@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,11 +12,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/tenequm/amesh/internal/config"
 
 	"github.com/tenequm/amesh/internal/mcpserver"
 
@@ -152,4 +159,50 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	delete(d.pipes, reg)
 	call(prompt("hello"), 204)
 	call("{}", 400)
+}
+
+func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	pid := os.Getpid()
+	var start string
+	if runtime.GOOS == "darwin" {
+		cmd := exec.CommandContext(ctx, "ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+		cmd.Env = append(os.Environ(), "LC_ALL=C", "TZ=UTC")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		start = strings.TrimSpace(string(out))
+	} else {
+		b, err := os.ReadFile("/proc/self/stat")
+		if err != nil {
+			t.Fatal(err)
+		}
+		start = strings.Fields(string(b[strings.LastIndexByte(string(b), ')')+1:]))[19]
+	}
+	dirs := []string{dir, filepath.Join(dir, "empty")}
+	if err := os.Mkdir(filepath.Join(dir, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entry := map[string]any{"pid": pid, "procStart": start, "sessionId": "id", "name": "amesh-identity", "cwd": dir, "messagingSocketPath": "/tmp/amesh-identity.sock", "peerProtocol": 1, "status": "idle"}
+	b, _ := json.Marshal(entry)
+	if err := os.WriteFile(filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := registry.Key{PID: pid, ProcStart: start}
+	d := daemon{registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs, MachineName: "mac"}, started: time.Now(), pipes: map[*registration]struct{}{{key: key}: {}, {key: key, parent: "parent"}: {}}}
+	w := httptest.NewRecorder()
+	d.status(w, request(t, ""))
+	var got struct {
+		Dirs    []configDir    `json:"configDirs"`
+		Pipes   []pipeStatus   `json:"pipes"`
+		Members []memberStatus `json:"sessions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Dirs) != 2 || got.Dirs[0].Sessions != 1 || got.Dirs[1].Sessions != 0 || len(got.Pipes) != 2 || got.Pipes[1].Parent != "parent" || len(got.Members) != 1 {
+		t.Fatal(got)
+	}
 }

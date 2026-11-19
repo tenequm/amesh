@@ -2,7 +2,7 @@ package control
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -35,4 +35,15 @@ func Hook(ctx context.Context, socket string, in io.Reader, out io.Writer) error
 	return nil
 }
 
-func Status(ctx context.Context, socket string, out io.Writer) error { return errors.ErrUnsupported }
+func Status(ctx context.Context, socket string, out io.Writer) error {
+	resp, err := localRequest(ctx, socket, http.MethodGet, "/amesh/status", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("daemon status: %s", resp.Status)
+	}
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
