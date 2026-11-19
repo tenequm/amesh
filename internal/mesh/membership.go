@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/tenequm/amesh/internal/contract"
-
 	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/state"
 )
@@ -128,7 +127,10 @@ func (b *Backend) Connect(ctx context.Context, s registry.Session) (io.Closer, e
 	return pipe{sync.OnceFunc(func() {
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		v := b.members[key]
+		v, ok := b.members[key]
+		if !ok || v.pipes == 0 {
+			return
+		}
 		v.pipes--
 		b.members[key] = v
 		b.changed()
@@ -198,12 +200,12 @@ func (b *Backend) register(ctx context.Context, key string) error {
 	return nil
 }
 
-func (b *Backend) end(ctx context.Context, key string) error {
+func (b *Backend) end(ctx context.Context, key, reason string) error {
 	n, err := b.client.Pending(key)
 	if err != nil || n > 0 {
 		return err
 	}
-	_, err = b.client.End(ctx, key, contract.SessionEndRequest{Reason: "exited"})
+	_, err = b.client.End(ctx, key, contract.SessionEndRequest{Reason: reason})
 	if err != nil {
 		return err
 	}
@@ -249,13 +251,24 @@ func (b *Backend) reconcile(ctx context.Context) error {
 		b.members[key] = m
 		b.mu.Unlock()
 		if !m.hosted {
-			if err = b.end(ctx, key); err != nil {
+			reason := "exited"
+			if found {
+				reason = "excluded"
+			}
+			if err = b.end(ctx, key, reason); err != nil {
 				return err
 			}
 			changed = true
 			continue
 		}
-		if found && (m.dirty || b.presenceLog != conn.Log) {
+		if !found {
+			continue
+		}
+		req, readErr := registration(s)
+		if readErr != nil {
+			return readErr
+		}
+		if m.dirty || req != m.last || b.presenceLog != conn.Log {
 			if err = b.register(ctx, key); err != nil {
 				return err
 			}

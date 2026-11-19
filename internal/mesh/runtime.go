@@ -29,7 +29,7 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	if err := envelope.SelfCheck(); err != nil {
 		return nil, errors.Join(fmt.Errorf("native envelope startup check: %w", err), store.Close())
 	}
-	info, err := os.Lstat(socketDir)
+	info, err := os.Lstat(socketDir) // #nosec G703 -- the daemon supplies its native socket directory before accepting requests.
 	if err != nil {
 		return nil, errors.Join(err, store.Close())
 	}

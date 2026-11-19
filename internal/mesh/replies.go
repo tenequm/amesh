@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"slices"
 	"strconv"
@@ -174,18 +173,26 @@ func (b *Backend) outboxNotice(ctx context.Context, conn contract.HelloResponse,
 // Send and the outbox callback can finish in either order. Only a caller that
 // already returned a queued result (or disappeared on restart) needs a later notice.
 type attempt struct {
-	done          chan struct{}
-	queued, retry bool
+	done, captured chan struct{}
+	queued, retry  bool
 }
 
 func (b *Backend) sendOnce(ctx context.Context, req contract.SendRequest, retry bool) (contract.SendResponse, error) {
-	a := &attempt{done: make(chan struct{}), retry: retry}
+	a := &attempt{done: make(chan struct{}), captured: make(chan struct{}), retry: retry}
 	b.attemptMu.Lock()
 	b.attempts[req.ID] = append(b.attempts[req.ID], a)
 	b.attemptMu.Unlock()
 	res, err := b.client.Send(ctx, req)
 	a.queued = errors.Is(err, hub.ErrQueued)
 	close(a.done)
+	if unknownSession(err) {
+		// The retry has the same id. Let the uploader detach this attempt first.
+		select {
+		case <-a.captured:
+		case <-ctx.Done():
+			return res, ctx.Err()
+		}
+	}
 	if err != nil && !a.queued {
 		h, remote := errors.AsType[*hub.HTTPError](err)
 		if !remote || h.Body.Error == "empty_text" || h.Body.Error == "slash_command" || h.Body.Error == "too_large" || h.Body.Error == "id_conflict" {
@@ -216,6 +223,9 @@ func (b *Backend) completed(out hub.SendOutcome) {
 	attempts := b.attempts[req.ID]
 	delete(b.attempts, req.ID)
 	b.attemptMu.Unlock()
+	for _, a := range attempts {
+		close(a.captured)
+	}
 	retry := true
 	for _, a := range attempts {
 		<-a.done
@@ -247,6 +257,6 @@ func (b *Backend) completed(out hub.SendOutcome) {
 		return
 	}
 	if err := b.outboxNotice(b.ctx, conn, req, out.Err); err != nil && b.ctx.Err() == nil {
-		slog.Error("writing outbox notice", "error", fmt.Errorf("outbox completion: %w", err))
+		slog.Error("writing outbox notice", "error", err)
 	}
 }

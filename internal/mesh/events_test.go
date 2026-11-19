@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,35 +19,61 @@ import (
 
 	"github.com/tenequm/amesh/internal/config"
 	"github.com/tenequm/amesh/internal/contract"
+	"github.com/tenequm/amesh/internal/control"
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/hub/hubtest"
+	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/relay"
 	"github.com/tenequm/amesh/internal/relay/relaytest"
 	"github.com/tenequm/amesh/internal/state"
 )
 
+func processSession(t *testing.T, inbox, dir string) registry.Session {
+	t.Helper()
+	pid := os.Getpid()
+	var start string
+	if runtime.GOOS == "darwin" {
+		cmd := exec.CommandContext(t.Context(), "ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+		cmd.Env = append(os.Environ(), "LC_ALL=C", "TZ=UTC")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		start = strings.TrimSpace(string(out))
+	} else {
+		raw, err := os.ReadFile("/proc/self/stat")
+		if err != nil {
+			t.Fatal(err)
+		}
+		start = strings.Fields(string(raw[strings.LastIndexByte(string(raw), ')')+1:]))[19]
+	}
+	path := filepath.Join(dir, strconv.Itoa(pid)+".sock")
+	if err := os.Link(inbox, path); err != nil {
+		t.Fatal(err)
+	}
+	entries := filepath.Join(dir, "sessions")
+	if err := os.Mkdir(entries, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{"pid": pid, "procStart": start, "sessionId": "amesh-mesh-test", "name": "review", "cwd": dir, "messagingSocketPath": path, "status": "idle", "version": "2.1.328", "peerProtocol": 1, "nameSource": "user", "entrypoint": "cli", "startedAt": time.Now().UnixMilli()})
+	if err := os.WriteFile(filepath.Join(entries, strconv.Itoa(pid)+".json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := registry.New([]string{dir}).Resolve(t.Context(), pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
 func TestCrashBeforeAcknowledgement(t *testing.T) {
 	if dir := os.Getenv("AMESH_MESH_CRASH_TEST_DIR"); dir != "" {
-		cfg := config.Config{StateDir: dir, MachineName: "mac", HubURL: os.Getenv("AMESH_MESH_CRASH_TEST_URL")}
+		cfg := config.Config{StateDir: dir, MachineName: "mac", HubURL: os.Getenv("AMESH_MESH_CRASH_TEST_URL"), ClaudeConfigDirs: []string{os.Getenv("AMESH_MESH_TEST_SEAT")}, SocketPath: filepath.Join(dir, "amesh-mesh-control.sock")}
 		st := state.New(dir)
-		if err := st.Lock(); err != nil {
-			t.Fatal(err)
-		}
-		b := New(cfg, nil, relay.New(dir, st), hub.New(cfg))
-		s := testSession()
-		s.PID, _ = strconv.Atoi(os.Getenv("AMESH_MESH_CRASH_TEST_PID"))
-		s.SocketPath = os.Getenv("AMESH_MESH_CRASH_TEST_INBOX")
-		b.sessions = &testRegistry{s}
-		b.store = st
-		b.socketDir = dir
-		b.ctx = t.Context()
-		if err := b.restore(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := b.client.Hello(t.Context(), contract.HelloRequest{}); err != nil {
-			t.Fatal(err)
-		}
+		sessions := registry.New(cfg.ClaudeConfigDirs)
+		relays := relay.New(dir, st)
+		b := New(cfg, sessions, relays, hub.New(cfg))
 		b.ack = func(ctx context.Context, _ int64) error {
 			f := os.NewFile(3, "amesh-mesh-before-ack")
 			_, _ = f.Write([]byte{1})
@@ -53,7 +81,12 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		}
-		t.Fatal(b.stream(t.Context()))
+		stop, err := b.Start(t.Context(), st, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stop()
+		t.Fatal(control.Serve(t.Context(), cfg, sessions, nil, b, relays.OwnsRelay))
 		return
 	}
 
@@ -61,8 +94,8 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := testSession()
-	s.SocketPath = inbox
+	seat := meshDir(t)
+	s := processSession(t, inbox, seat)
 	key := sessionKey(s.Key)
 	reports := make(chan contract.StateReport, 4)
 	var msg contract.MessageEvent
@@ -72,7 +105,11 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 	end := contract.EndpointEvent{Kind: "endpoint", ID: msg.Endpoint.ID, Name: msg.Endpoint.Name, State: "open", Sessions: []string{key}, Peer: contract.EndpointEventPeer{Address: "stan", Kind: "agent"}}
 	endpointData, _ := json.Marshal(end)
 	messageData, _ := json.Marshal(msg)
-	b, r := fixture(t, map[string]http.HandlerFunc{
+	b, _ := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/heartbeat": func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{}") },
+		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+		},
 		"GET /peer/events": func(w http.ResponseWriter, r *http.Request) {
 			if after, e := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64); e != nil || after >= msg.Seq {
 				t.Error("cursor advanced before the process was killed")
@@ -91,7 +128,8 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: report.ID, State: &report.State, Applied: true}}})
 		},
 	})
-	*r = append(*r, s)
+	b.cfg.ClaudeConfigDirs = []string{seat}
+	b.sessions = registry.New(b.cfg.ClaudeConfigDirs)
 	if _, err = b.Connect(t.Context(), s); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +146,7 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 	cmd.ExtraFiles = []*os.File{wr}
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stderr
-	cmd.Env = append(os.Environ(), "AMESH_MESH_CRASH_TEST_DIR="+b.cfg.StateDir, "AMESH_MESH_CRASH_TEST_URL="+b.cfg.HubURL, "AMESH_MESH_CRASH_TEST_INBOX="+inbox, "AMESH_MESH_CRASH_TEST_PID="+strconv.Itoa(s.PID))
+	cmd.Env = append(os.Environ(), "AMESH_MESH_CRASH_TEST_DIR="+b.cfg.StateDir, "AMESH_MESH_CRASH_TEST_URL="+b.cfg.HubURL, "AMESH_MESH_TEST_SEAT="+seat)
 	if err = cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +160,9 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 	_ = rd.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var marker [1]byte
 	if _, err = io.ReadFull(rd, marker[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err = control.Status(t.Context(), filepath.Join(b.cfg.StateDir, "amesh-mesh-control.sock"), io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if err = cmd.Process.Kill(); err != nil {
@@ -138,25 +179,16 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 	if err != nil || parsed.FromSession != end.ID || parsed.Body != msg.Text || frame.MsgID != msg.ID || !slices.Equal(parsed.HopChain, msg.HopChain) {
 		t.Fatal("incorrect inbound native frame")
 	}
-	if err = b.store.Lock(); err != nil {
-		t.Fatal(err)
-	}
 	b.client = hub.New(b.cfg)
-	if _, err = b.client.Hello(t.Context(), contract.HelloRequest{}); err != nil {
-		t.Fatal(err)
-	}
-	if err = b.restore(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	b.socketDir = b.cfg.StateDir
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	b.ctx = ctx
 	ack := make(chan int64, 1)
 	b.ack = func(ctx context.Context, seq int64) error { e := b.client.Ack(ctx, seq); ack <- seq; return e }
-	done := make(chan error, 1)
-	go func() { done <- b.stream(ctx) }()
-	defer func() { cancel(); <-done; b.closeEndpoints() }()
+	stop, err := b.Start(ctx, b.store, b.cfg.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
 	select {
 	case seq := <-ack:
 		if seq != msg.Seq {

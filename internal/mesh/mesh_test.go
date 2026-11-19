@@ -13,19 +13,18 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
-
-	"github.com/tenequm/amesh/internal/envelope"
-	"github.com/tenequm/amesh/internal/relay/relaytest"
-
-	"github.com/tenequm/amesh/internal/mcpserver"
 
 	"github.com/tenequm/amesh/internal/config"
 	"github.com/tenequm/amesh/internal/contract"
+	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/hub/hubtest"
+	"github.com/tenequm/amesh/internal/mcpserver"
 	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/relay"
+	"github.com/tenequm/amesh/internal/relay/relaytest"
 	"github.com/tenequm/amesh/internal/state"
 )
 
@@ -358,4 +357,85 @@ func TestDaemonLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = lock.Close()
+}
+
+func TestUnknownSessionSendKeepsID(t *testing.T) {
+	s := testSession()
+	key := sessionKey(s.Key)
+	var ids []string
+	b, _ := fixture(t, map[string]http.HandlerFunc{
+		"GET /peer/peers": hubtest.Reply(t, "peersResponse"),
+		"POST /peer/messages": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.SendRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			ids = append(ids, req.ID)
+			if len(ids) == 1 {
+				hubtest.Reply(t, "errUnknownSession")(w, r)
+				return
+			}
+			var res contract.SendResponse
+			_ = json.Unmarshal(hubtest.Example(t, "sendResponse"), &res)
+			res.Message.ID = req.ID
+			_ = json.NewEncoder(w).Encode(res)
+		},
+		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+		},
+	})
+	if _, err := b.Connect(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- b.client.RunOutbox(ctx, b.completed) }()
+	defer func() { cancel(); <-done }()
+	got, err := b.SendMessage(ctx, s, mcpserver.SendArgs{To: "stan", Message: "retry this id"})
+	if err != nil || !got.Accepted || !slices.Equal(ids, []string{got.ID, got.ID}) {
+		t.Fatalf("retry: %#v %v", got, err)
+	}
+}
+
+func TestQueuedSendWaitAndDirectoryReplacement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server := hubtest.MemoryScript(t, hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")})
+		cfg := config.Config{MachineName: "mac", StateDir: meshDir(t), HubURL: "http://amesh-mesh.test/peer"}
+		if err := hub.Enroll(t.Context(), cfg, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		c := hub.NewWithTransport(cfg, server.Client().Transport)
+		b := New(cfg, nil, nil, c)
+		if _, err := c.Hello(t.Context(), contract.HelloRequest{}); err != nil {
+			t.Fatal(err)
+		}
+		b.store = state.New(cfg.StateDir)
+		if err := b.store.Lock(); err != nil {
+			t.Fatal(err)
+		}
+		defer b.store.Close()
+		s := testSession()
+		b.members[sessionKey(s.Key)] = member{session: s, hosted: true, address: "review@pond:mac"}
+		b.peers = []contract.Peer{{Address: "gone", Kind: "agent"}}
+		r := streamRun{b: b}
+		item := contract.EventStreamItem{Event: "status", Data: `{"kind":"status","listed":true,"peer":{"address":"stan","kind":"agent","status":"idle"}}`}
+		if err := r.handle(t.Context(), item); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.handle(t.Context(), contract.EventStreamItem{Event: "synchronized", Data: `{"kind":"synchronized","seq":0}`}); err != nil {
+			t.Fatal(err)
+		}
+		if len(b.peers) != 1 || b.peers[0].Address != "stan" {
+			t.Fatal("stale directory entry survived synchronization")
+		}
+		start := time.Now()
+		result, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "stan", Message: "durably queued"})
+		var want mcpserver.SendResult
+		_ = json.Unmarshal(hubtest.Example(t, "mcpSendAcceptedHubDown"), &want)
+		want.ID = result.ID
+		if err != nil || result.ID == "" || !reflect.DeepEqual(result, want) || time.Since(start) != 5*time.Second {
+			t.Fatalf("queued result %#v: %v", result, err)
+		}
+		if n, e := c.Pending(sessionKey(s.Key)); e != nil || n != 1 {
+			t.Fatal("queued send was not durable")
+		}
+	})
 }
