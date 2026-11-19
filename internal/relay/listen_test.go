@@ -286,8 +286,6 @@ func TestCoalescedDropsRetryToBudget(t *testing.T) {
 func TestListenerRejectsBadFrames(t *testing.T) {
 	id := delivery("", 1).ID
 	for _, f := range []frame{
-		{Type: "control", Action: "peer_message_status", OriginalID: id, Status: "invented"},
-		{Type: "control", Action: "peer_message_status", OriginalID: id, Status: "dropped", DropReason: "other"},
 		{Type: "user", Message: &wireMessage{"user", "raw text"}, Priority: "next"},
 		{Type: "user", Message: &wireMessage{"user", "<cross-session-message>\nbody\n</cross-session-message>"}, Priority: "next"},
 	} {
@@ -401,5 +399,23 @@ func TestAcceptedAndLaneDrops(t *testing.T) {
 				e.wg.Wait()
 			})
 		})
+	}
+}
+
+func TestOpenNativeReceipts(t *testing.T) {
+	id := delivery("", 1).ID
+	for _, f := range []frame{
+		{Type: "control", Action: "peer_message_status", OriginalID: id, Status: "invented"},
+		{Type: "control", Action: "peer_message_status", OriginalID: id, Status: "dropped", DropReason: "other"},
+	} {
+		f.ID, f.From, f.Version, f.StatusDetail = id, "uds:/tmp/amesh-a2.sock", 1, "new-detail"
+		raw, err := json.Marshal(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e, err := decode(raw)
+		if err != nil || e.Status != f.Status || e.DropReason != f.DropReason || e.StatusDetail != f.StatusDetail {
+			t.Fatal(e, err)
+		}
 	}
 }

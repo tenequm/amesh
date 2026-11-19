@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -39,15 +40,17 @@ type Client struct {
 	wake     chan struct{}
 	waiters  map[string][]chan SendOutcome
 	progress
-	streamRunning bool
-	usedHello     uint64
-	logChanged    chan struct{}
-	instance      string
-	helloCount    uint64
-	lastHelloErr  error
-	verifying     bool
-	presenceMu    sync.Mutex
-	bindingMu     sync.Mutex
+	streamConnected bool
+	statusSince     time.Time
+	streamRunning   bool
+	usedHello       uint64
+	logChanged      chan struct{}
+	instance        string
+	helloCount      uint64
+	lastHelloErr    error
+	verifying       bool
+	presenceMu      sync.Mutex
+	bindingMu       sync.Mutex
 }
 
 func New(cfg config.Config) *Client { return NewWithTransport(cfg, nil) }
@@ -56,16 +59,17 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) *Client {
 	var n [16]byte
 	rand.Read(n[:])
 	return &Client{
-		instance:   encoding.EncodeToString(n[:]),
-		logChanged: make(chan struct{}),
-		cfg:        cfg,
-		http:       &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		key:        sync.OnceValues(func() (identity, error) { return loadKey(filepath.Join(cfg.StateDir, "machine.key")) }),
-		current:    contract.HelloResponse{Settings: contract.DefaultSettings(), Limits: contract.Limits{MaxTextBytes: 32768, QueueTTLMs: 86400000}},
-		stopped:    make(chan struct{}),
-		draining:   make(chan struct{}, 1),
-		wake:       make(chan struct{}, 1),
-		waiters:    make(map[string][]chan SendOutcome),
+		statusSince: time.Now(),
+		instance:    encoding.EncodeToString(n[:]),
+		logChanged:  make(chan struct{}),
+		cfg:         cfg,
+		http:        &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		key:         sync.OnceValues(func() (identity, error) { return loadKey(filepath.Join(cfg.StateDir, "machine.key")) }),
+		current:     contract.HelloResponse{Settings: contract.DefaultSettings(), Limits: contract.Limits{MaxTextBytes: 32768}},
+		stopped:     make(chan struct{}),
+		draining:    make(chan struct{}, 1),
+		wake:        make(chan struct{}, 1),
+		waiters:     make(map[string][]chan SendOutcome),
 	}
 }
 
@@ -76,9 +80,9 @@ func (c *Client) Connection() (contract.HelloResponse, error) {
 }
 
 type HTTPError struct {
-	Status     int
-	Body       contract.ErrorBody
-	RetryAfter time.Duration
+	Status     int                `json:"status"`
+	Body       contract.ErrorBody `json:"body"`
+	RetryAfter time.Duration      `json:"retryAfter,omitempty"`
 }
 
 func (e *HTTPError) Error() string {
@@ -94,6 +98,7 @@ func (c *Client) stop(err error) error {
 	defer c.mu.Unlock()
 	if c.halt == nil {
 		c.halt = err
+		c.statusSince = time.Now()
 		close(c.stopped)
 	}
 	return c.halt
@@ -217,7 +222,7 @@ func (c *Client) Hello(ctx context.Context, req contract.HelloRequest) (contract
 	return v, err
 }
 
-func hasCode(err error, status int, code string) bool {
+func hasCode(err error, status int, code contract.ErrorCode) bool {
 	h, ok := errors.AsType[*HTTPError](err)
 	return ok && h.Status == status && h.Body.Error == code
 }
@@ -253,6 +258,7 @@ func (c *Client) helloLocked(ctx context.Context, req contract.HelloRequest) (co
 	// Decode settings independently: even a wrong JSON type falls back as one object.
 	type response struct {
 		contract.HelloResponse
+		Limits   json.RawMessage `json:"limits"`
 		Settings json.RawMessage `json:"settings"`
 	}
 	wire, err := rpc[response](ctx, c, http.MethodPost, "/hello", req)
@@ -263,9 +269,13 @@ func (c *Client) helloLocked(ctx context.Context, req contract.HelloRequest) (co
 		return contract.HelloResponse{}, err
 	}
 	v := wire.HelloResponse
-	if v.Limits.MaxTextBytes <= 0 || v.Limits.QueueTTLMs <= 0 || v.Limits.QueueTTLMs > int64((1<<63-1)/time.Millisecond) {
-		return v, errors.New("invalid hub send limits")
+	var limits struct {
+		MaxTextBytes int64 `json:"maxTextBytes"`
 	}
+	if json.Unmarshal(wire.Limits, &limits) != nil || limits.MaxTextBytes <= 0 {
+		limits.MaxTextBytes = 32768
+	}
+	v.Limits.MaxTextBytes = limits.MaxTextBytes
 	if v.Epoch < 1 {
 		return v, errors.New("hub hello returned an invalid epoch")
 	}
@@ -423,4 +433,41 @@ func (c *Client) Report(ctx context.Context, req contract.ReportsRequest) (contr
 		req.Epoch = epoch
 		return rpc[contract.ReportsResponse](ctx, c, http.MethodPost, "/reports", req)
 	})
+}
+
+func (c *Client) Status(s *contract.DaemonStatus) error {
+	c.mu.Lock()
+	conn := c.current
+	s.Hub = contract.DaemonStatusHub{State: "connecting", Since: c.statusSince.UnixMilli(), Cursor: c.cursor}
+	if conn.Machine.ID != "" {
+		s.Machine = &contract.DaemonStatusMachine{ID: conn.Machine.ID, Name: conn.Machine.Name}
+	}
+	if c.halt != nil {
+		s.Hub.State = "halted"
+		h, ok := errors.AsType[*HTTPError](c.halt)
+		if ok {
+			body := h.Body
+			s.Hub.Halt = &body
+		} else {
+			s.Hub.Halt = &contract.ErrorBody{Error: "internal", Message: c.halt.Error()}
+			if errors.Is(c.halt, os.ErrNotExist) {
+				s.Hub.Halt = &contract.ErrorBody{Error: "unknown_machine", Message: "This machine has no enrollment key."}
+			}
+		}
+	} else if c.streamConnected {
+		s.Hub.State = "connected"
+		s.Hub.Epoch = &conn.Epoch
+	}
+	c.mu.Unlock()
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	q, err := c.readQueue()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	s.Outbox.Count = int64(len(q))
+	if len(q) > 0 {
+		s.Outbox.OldestAt = &q[0].At
+	}
+	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -199,6 +200,10 @@ func TestOutboxRestartAndRetry(t *testing.T) {
 		}
 		if time.Since(begin) != 5*time.Second {
 			t.Fatal("incorrect send wait")
+		}
+		var status contract.DaemonStatus
+		if err := c.Status(&status); err != nil || status.Outbox.Count != 1 || status.Outbox.OldestAt == nil {
+			t.Fatal(status, err)
 		}
 		if count, err := c.Pending(req.From.Session); err != nil || count != 1 {
 			t.Fatal("entry was not durable")
@@ -582,4 +587,89 @@ func TestTwoDaemonsWithOneEnrollment(t *testing.T) {
 			checkSignature(t, first, call)
 		}
 	})
+}
+
+func TestEpochLapseRefusalAndFutureEpoch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		refused := false
+		script := http.NewServeMux()
+		script.HandleFunc("POST /peer/hello", func(w http.ResponseWriter, r *http.Request) {
+			if refused {
+				hubtest.Reply(t, "errUpgradeRequired")(w, r)
+				return
+			}
+			hubtest.Reply(t, "helloResponse")(w, r)
+		})
+		script.HandleFunc("POST /peer/heartbeat", hubtest.Reply(t, "heartbeatResponse"))
+		server := httptest.NewTestServer(t, &hubtest.EpochHub{Next: script})
+		defer server.Close()
+		first := enrolled(t, "http://amesh-a2.test")
+		first.http.Transport = server.Client().Transport
+		hello := example[contract.HelloRequest](t, "helloRequest")
+		one, err := first.Hello(t.Context(), hello)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, route := range []string{"/events?epoch=9000", "/heartbeat"} {
+			method := http.MethodGet
+			var payload any
+			if route == "/heartbeat" {
+				method = http.MethodPost
+				payload = contract.HeartbeatRequest{Epoch: 9000}
+			}
+			if _, err = rpc[contract.ErrorBody](t.Context(), first, method, route, payload); !hasCode(err, 409, "superseded") {
+				t.Fatal(route, err)
+			}
+		}
+		second := New(first.cfg)
+		second.http.Transport = server.Client().Transport
+		refused = true
+		if _, err = second.Hello(t.Context(), hello); !hasCode(err, 426, "upgrade_required") {
+			t.Fatal(err)
+		}
+		refused = false
+		if _, err = first.Heartbeat(t.Context(), contract.HeartbeatRequest{}); err != nil || first.helloCount != 1 {
+			t.Fatal(err, first.helloCount)
+		}
+		time.Sleep(time.Minute)
+		_, err = rpc[contract.ErrorBody](t.Context(), first, http.MethodPost, "/heartbeat", contract.HeartbeatRequest{Epoch: one.Epoch})
+		if h, ok := errors.AsType[*HTTPError](err); !ok || h.Body.Epoch != nil || !hasCode(err, 409, "superseded") {
+			t.Fatal(err)
+		}
+		if _, err = first.Heartbeat(t.Context(), contract.HeartbeatRequest{}); err != nil || first.helloCount != 2 {
+			t.Fatal(err, first.helloCount)
+		}
+		again, _ := first.Connection()
+		if again.Epoch != one.Epoch {
+			t.Fatal("same instance advanced epoch")
+		}
+		time.Sleep(time.Minute)
+		next := New(first.cfg)
+		next.http.Transport = server.Client().Transport
+		two, err := next.Hello(t.Context(), hello)
+		if err != nil || two.Epoch != one.Epoch+1 {
+			t.Fatal(two.Epoch, err)
+		}
+	})
+}
+
+func TestOnlyTextLimitAffectsHello(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		limit any
+		want  int64
+	}{
+		{"missing", nil, 32768}, {"zero", 0, 32768}, {"negative", -2, 32768}, {"fraction", 2.1, 32768}, {"string", "8", 32768}, {"valid", 735, 735},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := example[map[string]any](t, "helloResponse")
+			body["limits"] = map[string]any{"queueTtlMs": "future", "maxTextBytes": tc.limit}
+			s := hubtest.Script(t, hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(body) }})
+			c := enrolled(t, s.URL)
+			v, err := c.Hello(t.Context(), contract.HelloRequest{})
+			if err != nil || v.Limits.MaxTextBytes != tc.want {
+				t.Fatal(v.Limits, err)
+			}
+		})
+	}
 }

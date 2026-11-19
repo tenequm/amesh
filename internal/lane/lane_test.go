@@ -2,6 +2,7 @@ package lane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -11,6 +12,9 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/tenequm/amesh/internal/contract"
+	"github.com/tenequm/amesh/internal/hub/hubtest"
 
 	"github.com/google/uuid"
 	"github.com/tenequm/amesh/internal/envelope"
@@ -47,10 +51,10 @@ func (s *seat) Live(ctx context.Context, k registry.Key) (bool, error) {
 }
 
 type recorder struct {
-	idleID, idleMode string
-	path             string
-	handler          relay.Handler
-	writes           []relay.Delivery
+	idleID, idleMode, idleInbox, idleFrom string
+	path                                  string
+	handler                               relay.Handler
+	writes                                []relay.Delivery
 }
 
 func (r *recorder) Listen(_ context.Context, p string, h relay.Handler) (io.Closer, error) {
@@ -64,8 +68,8 @@ func (r *recorder) Write(_ context.Context, d relay.Delivery) error {
 	return nil
 }
 
-func (r *recorder) NotifyWhenIdle(_ context.Context, _, _, mode, id string) error {
-	r.idleID, r.idleMode = id, mode
+func (r *recorder) NotifyWhenIdle(_ context.Context, inbox, from, mode, id string) error {
+	r.idleID, r.idleMode, r.idleInbox, r.idleFrom = id, mode, inbox, from
 	return nil
 }
 
@@ -248,4 +252,42 @@ func TestLocalMachineIdentity(t *testing.T) {
 	if _, err = machineID(d); err == nil {
 		t.Fatal("accepted group-readable key")
 	}
+}
+
+func TestLaneIdleContract(t *testing.T) {
+	var sub contract.NativeNotifyWhenIdle
+	var idle contract.NativeIdleNotice
+	var turn contract.NativeUserFrame
+	var vector contract.LaneSocketVector
+	for name, target := range map[string]any{"nativeNotifyWhenIdle": &sub, "nativePeerIdleNotice": &idle, "laneTurnEndFrame": &turn, "derivationLaneSocket": &vector} {
+		if err := json.Unmarshal(hubtest.Example(t, name), target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		p := registry.Session{PID: 11, ProcStart: "parent", SessionID: vector.ParentArgument, Name: "parent", SocketPath: "/tmp/cc-socks/11.sock"}
+		child := registry.Session{PID: 61844, ProcStart: "child", SessionID: vector.ChildSessionID, Name: "c-claude-e6", SocketPath: strings.TrimPrefix(idle.From, "uds:"), FromMode: idle.FromMode, Status: "busy"}
+		s := &seat{rows: map[int]registry.Session{p.PID: p, child.PID: child}}
+		r := new(recorder)
+		b := newBackend(ctx, s, r, func() (string, error) { return vector.MachineID, nil })
+		defer func() { cancel(); b.Wait() }()
+		if _, err := b.Connect(ctx, child, p.SessionID); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		time.Sleep(250 * time.Millisecond)
+		synctest.Wait()
+		if sub.FromMode != nil || r.idleMode != "" || r.idleFrom != sub.From || r.idleInbox != child.SocketPath || r.idleID == "" || idle.OrigMsgID != sub.MsgID {
+			t.Fatal("wrong lane subscription")
+		}
+		if err := r.handler(ctx, relay.Event{Peer: peercred.Credentials{PID: child.PID}, Action: idle.Action, OriginalID: r.idleID, FromMode: idle.FromMode, FinishedAt: idle.FinishedAt}); err != nil {
+			t.Fatal(err)
+		}
+		d := r.writes[len(r.writes)-1]
+		content, err := envelope.Render(d.Message)
+		if err != nil || content != turn.Message.Content || !d.Notice || d.Inbox != p.SocketPath {
+			t.Fatal("wrong turn-end frame", err)
+		}
+	})
 }

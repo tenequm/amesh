@@ -31,6 +31,11 @@ type Registry struct {
 	modes  map[int]permissionClass
 }
 
+func ProcessStart(pid int) (string, error) {
+	_, start, err := process(pid)
+	return start, err
+}
+
 func New(configDirs []string) *Registry {
 	return &Registry{dirs: slices.Clone(configDirs), lookup: process, modes: make(map[int]permissionClass)}
 }
@@ -243,4 +248,22 @@ func (r *Registry) Live(ctx context.Context, key Key) (bool, error) {
 		return err == nil, err
 	}
 	return false, nil
+}
+
+func (s Session) MeshExcluded(dirs, roots []string) bool {
+	return (len(dirs) > 0 && s.ConfigDir != dirs[0]) || excluded(s.CWD, roots)
+}
+
+func excluded(cwd string, roots []string) bool {
+	for _, root := range roots {
+		if cwd == root || strings.HasPrefix(cwd, strings.TrimRight(root, "/")+"/") {
+			return true
+		}
+		resolved, err := filepath.EvalSymlinks(cwd)
+		base, e := filepath.EvalSymlinks(root)
+		if err == nil && e == nil && (resolved == base || strings.HasPrefix(resolved, strings.TrimRight(base, "/")+"/")) {
+			return true
+		}
+	}
+	return false
 }

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/tenequm/amesh/internal/contract"
@@ -23,14 +24,42 @@ const label = "[a-z0-9][a-z0-9._-]{0,39}"
 
 var address = regexp.MustCompile("^" + label + "(@" + label + "(:[a-z0-9][a-z0-9-]{0,15})?)?$")
 
-func value(s *string) string {
+var nonLabel = regexp.MustCompile("[^a-z0-9._-]+")
+
+func normalizeAddress(input string) string {
+	if utf8.RuneCountInString(input) > 100 {
+		return ""
+	}
+	name, session, qualified := strings.Cut(strings.ToLower(input), "@")
+	project, machine, hasMachine := strings.Cut(session, ":")
+	if name == "" || strings.Contains(name, ":") || strings.Contains(session, "@") || qualified && project == "" {
+		return ""
+	}
+	label := func(part string) string {
+		part = strings.Trim(nonLabel.ReplaceAllString(part, "-"), "._-")
+		if part == "" {
+			return "session"
+		}
+		return part[:min(40, len(part))]
+	}
+	to := label(name)
+	if qualified {
+		to += "@" + label(project)
+	}
+	if hasMachine {
+		to += ":" + machine
+	}
+	return to
+}
+
+func value[T ~string](s *T) T {
 	if s == nil {
 		return ""
 	}
 	return *s
 }
 
-func optional(s string) *string {
+func optional[T ~string](s T) *T {
 	if s == "" {
 		return nil
 	}
@@ -94,7 +123,7 @@ func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter stri
 		if p.Kind == "session" && value(p.Machine) == machine || filter != "" && (value(p.Project) != project || host != "" && value(p.Machine) != host) {
 			continue
 		}
-		row := mcpserver.Peer{Name: p.Address, Kind: p.Kind, Machine: p.Machine, Project: p.Project, Status: p.Status}
+		row := mcpserver.Peer{Name: p.Address, Kind: string(p.Kind), Machine: p.Machine, Project: p.Project, Status: string(p.Status)}
 		if p.LastSeen != nil {
 			stamp := time.UnixMilli(*p.LastSeen).UTC().Format(time.RFC3339)
 			row.LastSeen = &stamp
@@ -136,16 +165,6 @@ func (b *Backend) reregister(ctx context.Context, key string) error {
 func unknownSession(err error) bool {
 	h, ok := errors.AsType[*hub.HTTPError](err)
 	return ok && h.Status == 404 && h.Body.Error == "unknown_session"
-}
-
-func (b *Backend) send(ctx context.Context, req contract.SendRequest) (contract.SendResponse, error) {
-	response, err := b.sendOnce(ctx, req, true)
-	if unknownSession(err) {
-		if err = b.reregister(ctx, req.From.Session); err == nil {
-			return b.sendOnce(ctx, req, false)
-		}
-	}
-	return response, err
 }
 
 func (b *Backend) localTarget(to string) (member, bool) {
@@ -200,7 +219,7 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 	if !ok {
 		return refused("This session is not a mesh member.", nil), nil
 	}
-	to := args.To
+	to := normalizeAddress(args.To)
 	text := strings.TrimSpace(args.Message)
 	switch {
 	case !address.MatchString(to) || matches(to, m.address):
@@ -219,28 +238,22 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 	if target, found := b.localTarget(to); found {
 		return b.sendLocal(ctx, s, target, args.Message)
 	}
-	peers, err := b.ListPeers(ctx, s, "")
-	if err != nil {
-		return mcpserver.SendResult{}, err
-	}
-	var known, candidates []string
-	for _, p := range peers.Peers {
-		known = append(known, p.Name)
-		if matches(to, p.Name) {
-			candidates = append(candidates, p.Name)
+	b.mu.RLock()
+	check := b.synchronized
+	var known []string
+	for _, p := range b.peers {
+		if p.Kind != contract.KindSession || value(p.Machine) != conn.Machine.Name {
+			known = append(known, p.Address)
 		}
 	}
-	switch len(candidates) {
-	case 0:
+	b.mu.RUnlock()
+	if check && !slices.Contains(known, to) {
 		return refused(fmt.Sprintf("No peer named %q.", to), known), nil
-	case 1:
-	default:
-		return refused(fmt.Sprintf("%q matches more than one session. Use the full address.", to), candidates), nil
 	}
 	id := uuid.NewString()
-	req := contract.SendRequest{ID: id, From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &to}, Text: args.Message, FromMode: optional(s.FromMode), Origin: "unknown"}
-	res, err := b.send(ctx, req)
-	out := mcpserver.SendResult{Accepted: true, ID: id, To: candidates[0]}
+	req := contract.SendRequest{ID: id, From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &to}, Text: args.Message, FromMode: optional(s.FromMode), Origin: contract.SendRequestOriginUnknown}
+	res, err := b.client.Send(ctx, req)
+	out := mcpserver.SendResult{Accepted: true, ID: id, To: to}
 	if errors.Is(err, hub.ErrQueued) {
 		out.Note = "Sent from this machine. It reaches the hub as soon as the connection is back, within 24 hours."
 		if h, ok := errors.AsType[*hub.HTTPError](err); ok && h.Status == 429 {

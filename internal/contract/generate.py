@@ -3,6 +3,7 @@
 # ///
 """Generate wire DTOs from the JSON Schema components, independent of OpenAPI tooling."""
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -11,6 +12,7 @@ import yaml
 
 schemas = yaml.safe_load(Path("../../api/openapi.yaml").read_bytes())["components"]["schemas"]
 declarations = {}
+constants = {}
 initialisms = {"id": "ID", "ids": "IDs", "pid": "PID", "os": "OS", "uuid": "UUID",
                "spki": "SPKI", "pem": "PEM", "pkcs8": "PKCS8", "ttl": "TTL"}
 
@@ -37,6 +39,16 @@ def go_type(name, schema):
         # Discriminated unions keep the original bytes for decoding by kind.
         assert "discriminator" in schema, name
         return "json.RawMessage"
+    if "anyOf" in schema:
+        choices = schema["anyOf"]
+        assert choices[-1] == {"type": "null"} and all(
+            schemas[c["$ref"].split("/")[-1]]["type"] == "string" for c in choices[:-1])
+        return "*string"
+    if schema.get("x-amesh-open") or name in ("SessionEndRequestReason", "SendRequestOrigin"):
+        declarations[name] = "string"
+        for value in schema["enum"]:
+            constants[name + ident(value.replace("-", "_"))] = (name, value)
+        return name
     if kind == "array":
         return "[]" + go_type(name + "Item", schema["items"])
     if kind != "object":
@@ -65,6 +77,7 @@ for wire, schema in schemas.items():
         declarations[name] = "= " + typ
 
 types = "\n".join(f"type {name} {body}" for name, body in declarations.items())
+types += "\nconst (\n" + "\n".join(f"{key} {typ} = {json.dumps(value)}" for key, (typ, value) in constants.items()) + "\n)\n"
 defaults = []
 bounds = []
 for field, rule in schemas["Settings"]["properties"].items():

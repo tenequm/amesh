@@ -7,9 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/tenequm/amesh/internal/contract"
 
 	"github.com/google/uuid"
 	"github.com/tenequm/amesh/internal/envelope"
@@ -316,7 +321,8 @@ func (c *conversation) notice(ctx context.Context, body string) error {
 	if err != nil {
 		return err
 	}
-	return c.write(ctx, parent, uuid.NewString(), envelope.Message{FromName: c.child.Name, FromMode: noticeMode(parent), Body: body})
+	msg := envelope.Message{From: c.address, FromSession: c.id, FromName: c.child.Name, FromMode: noticeMode(parent), Body: body}
+	return c.backend.relays.Write(ctx, relay.Delivery{ID: uuid.NewString(), Inbox: parent.SocketPath, Message: msg, Notice: true})
 }
 
 func (c *conversation) noteReply(child registry.Session) {
@@ -403,3 +409,24 @@ func (c *conversation) watch() {
 }
 
 func (b *Backend) Wait() { b.work.Wait() }
+
+func (b *Backend) LaneStatus(ctx context.Context) []contract.DaemonStatusLanesItem {
+	b.mu.Lock()
+	conversations := slices.Collect(maps.Values(b.lanes))
+	b.mu.Unlock()
+	rows := make([]contract.DaemonStatusLanesItem, 0, len(conversations))
+	for _, c := range conversations {
+		c.mu.Lock()
+		if !c.retiring {
+			parent, _, _ := b.current(ctx, c.parent)
+			rows = append(rows, contract.DaemonStatusLanesItem{
+				ID: c.id, Relay: c.address,
+				Parent: contract.DaemonStatusLanesItemParent{Name: parent.Name, SessionID: c.key.parent},
+				Child:  contract.DaemonStatusLanesItemChild{Name: c.child.Name, SessionID: c.key.child, ConfigDir: c.child.ConfigDir},
+			})
+		}
+		c.mu.Unlock()
+	}
+	slices.SortFunc(rows, func(a, b contract.DaemonStatusLanesItem) int { return strings.Compare(a.ID, b.ID) })
+	return rows
+}

@@ -94,7 +94,7 @@ func (b *Backend) report(ctx context.Context, log, id, key, status, reason strin
 	if conn.Log != log {
 		return errors.New("delivery report belongs to a previous hub log")
 	}
-	raw, err := json.Marshal(contract.StateReport{Kind: "state", ID: id, Session: key, State: status, Reason: optional(reason), At: time.Now().UnixMilli()})
+	raw, err := json.Marshal(contract.StateReport{Kind: "state", ID: id, Session: key, State: status, Reason: optional(contract.DropReason(reason)), At: time.Now().UnixMilli()})
 	if err != nil {
 		return err
 	}
@@ -106,7 +106,13 @@ func (b *Backend) report(ctx context.Context, log, id, key, status, reason strin
 		return errors.New("invalid hub report acknowledgement")
 	}
 	current := value(res.Results[0].State)
-	if current == "held" || current == "sent" || current == "queued" {
+	switch current {
+	case "accepted", "delivered", "denied", "expired", "refused", "dropped", "unknown":
+	case "":
+		if res.Results[0].Applied {
+			return errors.New("applied report has no state")
+		}
+	default:
 		return nil
 	}
 	known, err := b.store.Contains(log, id)
@@ -135,6 +141,7 @@ func (b *Backend) prepareLog(ctx context.Context, conn contract.HelloResponse) e
 	if b.log != "" {
 		b.closeEndpoints()
 		b.mu.Lock()
+		b.synchronized = false
 		b.peers = nil
 		b.directoryVersion++
 		b.mu.Unlock()
@@ -175,7 +182,7 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 			b.changed()
 			return nil
 		}
-		_, err = b.client.End(ctx, key, contract.SessionEndRequest{Reason: "not_hosted"})
+		_, err = b.client.End(ctx, key, contract.SessionEndRequest{Reason: contract.SessionEndRequestReasonNotHosted})
 		return err
 	}
 	if time.Now().UnixMilli() >= msg.ExpiresAt {
@@ -185,11 +192,7 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 	if !ok {
 		return errors.New("message endpoint has no bound relay")
 	}
-	mode := ""
-	if s.FromMode == "bypass" {
-		mode = s.FromMode
-	}
-	d := relay.Delivery{Inbox: s.SocketPath, ID: msg.ID, Session: key, Log: conn.Log, AcceptWindow: time.Duration(conn.Settings.AcceptWindowMs) * time.Millisecond, NotifyWhenIdle: msg.NotifyWhenIdle, IdleFromMode: mode, Message: envelope.Message{From: ep.from, FromSession: msg.Endpoint.ID, FromName: msg.Endpoint.Name, FromMode: value(msg.FromMode), HopChain: msg.HopChain, Body: msg.Text}}
+	d := relay.Delivery{Inbox: s.SocketPath, ID: msg.ID, Session: key, Log: conn.Log, AcceptWindow: time.Duration(conn.Settings.AcceptWindowMs) * time.Millisecond, Message: envelope.Message{From: ep.from, FromSession: msg.Endpoint.ID, FromName: msg.Endpoint.Name, FromMode: value(msg.FromMode), HopChain: msg.HopChain, Body: msg.Text}}
 	err = b.relays.Write(ctx, d)
 	if err == nil || ctx.Err() != nil {
 		return err
@@ -302,7 +305,7 @@ func (r *streamRun) handle(ctx context.Context, item contract.EventStreamItem) e
 		case "open":
 			_, err = b.bind(conn, contract.EndpointRef{ID: e.ID, Name: e.Name, Peer: e.Peer.Address}, e.Sessions, true)
 		default:
-			return errors.New("invalid endpoint state")
+			// Unknown endpoint states carry no v1 action.
 		}
 		if err == nil && item.ID != nil {
 			err = b.ack(ctx, e.Seq)
@@ -322,6 +325,7 @@ func (r *streamRun) handle(ctx context.Context, item contract.EventStreamItem) e
 		b.mu.Unlock()
 	case "synchronized":
 		b.mu.Lock()
+		b.synchronized = true
 		b.peers = r.snapshot
 		b.directoryVersion++
 		b.mu.Unlock()

@@ -224,6 +224,8 @@ func (c *Client) readStream(ctx context.Context, conn contract.HelloResponse, ha
 	if media != "text/event-stream" {
 		return 0, errors.New("invalid peer stream content type")
 	}
+	c.setStreamConnected(true)
+	defer c.setStreamConnected(false)
 	start := time.Now()
 	last.Store(start.UnixNano())
 	eventCtx := context.WithValue(ctx, generationKey{}, gen)
@@ -340,4 +342,13 @@ func (c *Client) Stream(ctx context.Context, handle func(context.Context, contra
 			delay = min(2*delay, time.Duration(conn.Settings.BackoffMaxMs)*time.Millisecond)
 		}
 	}
+}
+
+func (c *Client) setStreamConnected(connected bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.streamConnected != connected && c.halt == nil {
+		c.statusSince = time.Now()
+	}
+	c.streamConnected = connected
 }

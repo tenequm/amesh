@@ -3,6 +3,7 @@ package hubtest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,6 +15,9 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/tenequm/amesh/internal/contract"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -202,4 +206,107 @@ func (r *Recorder) Calls() []Call {
 		calls[i].Body = bytes.Clone(calls[i].Body)
 	}
 	return calls
+}
+
+// EpochHub fences scripted routes for one machine. A hello script supplies the negotiated limits or a refusal.
+type EpochHub struct {
+	Next     http.Handler
+	mu       sync.Mutex
+	instance string
+	epoch    int64
+	last     time.Time
+	offline  time.Duration
+	stream   context.CancelFunc
+	streamID uint64
+}
+
+func (h *EpochHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path != "/peer/events" {
+		h.Next.ServeHTTP(w, r)
+		return
+	}
+	var body struct {
+		contract.HelloRequest
+		Epoch int64 `json:"epoch"`
+	}
+	if r.Method != http.MethodGet {
+		data, err := io.ReadAll(r.Body)
+		if err != nil || json.Unmarshal(data, &body) != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(data))
+	} else {
+		body.Epoch, _ = strconv.ParseInt(r.URL.Query().Get("epoch"), 10, 64)
+	}
+	h.mu.Lock()
+	live := h.epoch != 0 && (h.stream != nil || time.Since(h.last) < h.offline)
+	refuse := func(code contract.ErrorCode) {
+		result := contract.ErrorBody{Error: code, Message: string(code)}
+		if live {
+			epoch := h.epoch
+			result.Epoch = &epoch
+		}
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(result)
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/peer/hello" {
+		defer h.mu.Unlock()
+		result := httptest.NewRecorder()
+		h.Next.ServeHTTP(result, r)
+		if result.Code != http.StatusOK {
+			w.WriteHeader(result.Code)
+			_, _ = w.Write(result.Body.Bytes())
+			return
+		}
+		var hello contract.HelloResponse
+		if json.Unmarshal(result.Body.Bytes(), &hello) != nil {
+			http.Error(w, "invalid scripted hello", http.StatusInternalServerError)
+			return
+		}
+		if live && body.Instance != h.instance && !body.Takeover {
+			refuse("machine_in_use")
+			return
+		}
+		if h.epoch == 0 || body.Instance != h.instance {
+			h.epoch++
+			h.instance = body.Instance
+		}
+		if h.stream != nil {
+			h.stream()
+			h.stream = nil
+		}
+		h.last = time.Now()
+		h.offline = time.Duration(hello.Limits.OfflineAfterMs) * time.Millisecond
+		hello.Epoch = h.epoch
+		_ = json.NewEncoder(w).Encode(hello)
+		return
+	}
+	if !live || body.Epoch != h.epoch {
+		refuse("superseded")
+		h.mu.Unlock()
+		return
+	}
+	h.last = time.Now()
+	if r.Method != http.MethodGet {
+		h.mu.Unlock()
+		h.Next.ServeHTTP(w, r)
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	if h.stream != nil {
+		h.stream()
+	}
+	h.stream = cancel
+	h.streamID++
+	id := h.streamID
+	h.mu.Unlock()
+	h.Next.ServeHTTP(w, r.WithContext(ctx))
+	h.mu.Lock()
+	if id == h.streamID && h.stream != nil {
+		h.stream = nil
+		h.last = time.Now()
+	}
+	h.mu.Unlock()
+	cancel()
 }

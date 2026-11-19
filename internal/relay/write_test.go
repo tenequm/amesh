@@ -1,7 +1,9 @@
 package relay
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -51,7 +53,7 @@ func TestInboxWriteReplayAndNotice(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.ID = delivery(path, 2).ID
-	source := NoticeSource{MachineID: "machine", Source: "2", Kind: "delivery"}
+	source := NoticeSource{MachineID: "machine", Log: "log", Source: "2", Kind: "delivery"}
 	d.ID = source.ID()
 	d.Message.FromMode = "bypass"
 	if err = m.WriteNotice(t.Context(), d, source, "denied", "amesh-wire", "It was denied."); err != nil {
@@ -204,6 +206,7 @@ func TestNoticeContract(t *testing.T) {
 	}
 	var vector struct {
 		Value struct {
+			Log       string `yaml:"log"`
 			MachineID string `yaml:"machineId"`
 			Source    string `yaml:"source"`
 			Kind      string `yaml:"kind"`
@@ -214,7 +217,7 @@ func TestNoticeContract(t *testing.T) {
 	if err = node.Decode(&vector); err != nil {
 		t.Fatal(err)
 	}
-	if got := (NoticeSource{vector.Value.MachineID, vector.Value.Source, vector.Value.Kind}).ID(); got != vector.Value.ID {
+	if got := (NoticeSource{vector.Value.MachineID, vector.Value.Log, vector.Value.Source, vector.Value.Kind}).ID(); got != vector.Value.ID {
 		t.Fatal(got)
 	}
 	for _, name := range []string{"nativeNoticeFrame", "nativeNoticeNoFromFrame"} {
@@ -229,6 +232,7 @@ func TestNoticeContract(t *testing.T) {
 					From    string `yaml:"from"`
 					Session string `yaml:"fromSession"`
 					Name    string `yaml:"fromName"`
+					Mode    string `yaml:"fromMode"`
 				} `yaml:"x-amesh-envelope"`
 				Value map[string]any `yaml:"dataValue"`
 			}
@@ -243,8 +247,8 @@ func TestNoticeContract(t *testing.T) {
 			if err = m.store.SetLog("log"); err != nil {
 				t.Fatal(err)
 			}
-			d := Delivery{Inbox: inbox, Log: "log", Session: "ignored", Message: envelope.Message{From: ex.Envelope.From, FromName: ex.Envelope.Name, FromSession: ex.Envelope.Session}}
-			n := NoticeSource{vector.Value.MachineID, ex.Source.Source, ex.Source.Kind}
+			d := Delivery{Inbox: inbox, Log: "log", Session: "ignored", Message: envelope.Message{From: ex.Envelope.From, FromMode: ex.Envelope.Mode, FromName: ex.Envelope.Name, FromSession: ex.Envelope.Session}}
+			n := NoticeSource{vector.Value.MachineID, vector.Value.Log, ex.Source.Source, ex.Source.Kind}
 			cause, peer, detail := "limit", "stan", "This conversation with stan has had 20 messages without the owner taking part, so it is paused until the owner writes in it."
 			if n.Kind == "outbox" {
 				cause, peer, detail = "start_refused", "notes@db-work:air", "notes@db-work:air is offline and already has 100 messages waiting."
@@ -274,4 +278,69 @@ func TestNoticeContract(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPendingRewriteAcrossRestart(t *testing.T) {
+	m := manager(t)
+	inbox, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		d := delivery(inbox, 17)
+		d.Log, d.Session = "log-before", "receiver"
+		if err := m.store.SetLog(d.Log); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Write(t.Context(), d); err != nil {
+			t.Fatal(err)
+		}
+		first := string(<-lines)
+		if err := m.store.MarkReported(d.Log, d.ID); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		p := pending{e: &endpoint{manager: m, ctx: ctx}, d: d, peer: peercred.Credentials{PID: os.Getpid(), UID: uint32(os.Geteuid())}}
+		done := make(chan error, 1)
+		go func() { _, e := p.rewrite(1, true); done <- e }()
+		synctest.Wait()
+		cancel()
+		if e := <-done; !errors.Is(e, context.Canceled) {
+			t.Fatal(e)
+		}
+		if e := m.store.Close(); e != nil {
+			t.Fatal(e)
+		}
+		if e := m.store.Lock(); e != nil {
+			t.Fatal(e)
+		}
+		if e := m.store.SetLog("log-after"); e != nil {
+			t.Fatal(e)
+		}
+		d.Log = "log-after"
+		fresh := New(m.socketDir, m.store)
+		if err := fresh.Write(t.Context(), d); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-lines:
+			t.Fatal("new log replayed the original write")
+		default:
+		}
+		pending := m.store.PendingRewrites()
+		if len(pending) != 1 || pending[d.ID].Phase != state.Reported {
+			t.Fatal("missing pending final claim")
+		}
+		fresh.ResumeRewrites(t.Context(), pending, func(context.Context, string, int, string) bool { return false })
+		if len(m.store.PendingRewrites()) != 1 {
+			t.Fatal("excluded rewrite was delivered")
+		}
+		fresh.ResumeRewrites(t.Context(), pending, func(context.Context, string, int, string) bool { return true })
+		if string(<-lines) != first || len(m.store.PendingRewrites()) != 0 {
+			t.Fatal("recovery did not finish the same frame")
+		}
+		if open, e := m.store.OpenEntries(d.Log); e != nil || len(open) != 0 {
+			t.Fatal("final report lost", e)
+		}
+	})
 }

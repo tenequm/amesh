@@ -10,15 +10,12 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/version"
 )
 
 type (
-	configDir struct {
-		Path     string `json:"path"`
-		Sessions int    `json:"sessions"`
-	}
 	pipeStatus struct {
 		Key       string `json:"key"`
 		Name      string `json:"name"`
@@ -27,13 +24,6 @@ type (
 		Parent    string `json:"parent,omitempty"`
 	}
 )
-
-type memberStatus struct {
-	Key     string `json:"key"`
-	Address string `json:"address"`
-	Status  string `json:"status"`
-	Role    string `json:"role"`
-}
 
 // Populated when the native end-to-end delivery proof passes for a Claude Code release.
 var verifiedNativeVersions []string
@@ -50,12 +40,26 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 		counts[s.ConfigDir]++
 		byKey[s.Key] = s
 	}
-	dirs := make([]configDir, 0, len(d.cfg.ClaudeConfigDirs))
+	dirs := make([]contract.DaemonStatusConfigDirsItem, 0, len(d.cfg.ClaudeConfigDirs))
 	for _, dir := range d.cfg.ClaudeConfigDirs {
-		dirs = append(dirs, configDir{dir, counts[dir]})
+		dirs = append(dirs, contract.DaemonStatusConfigDirsItem{Path: dir, Sessions: int64(counts[dir])})
 	}
 	pipes := []pipeStatus{}
-	members := []memberStatus{}
+	var result struct {
+		contract.DaemonStatus
+		Pipes []pipeStatus `json:"pipes"`
+	}
+	result.DaemonStatus = contract.DaemonStatus{
+		ConfigDirs: dirs, Sessions: []contract.DaemonStatusSessionsItem{}, Lanes: []contract.DaemonStatusLanesItem{},
+		Daemon: contract.DaemonStatusDaemon{Version: version.Value, PID: int64(os.Getpid()), StartedAt: d.started.UnixMilli()},
+	}
+	if err := d.mesh.Status(&result.DaemonStatus); err != nil {
+		http.Error(w, "cannot read mesh status", http.StatusServiceUnavailable)
+		return
+	}
+	if d.lane != nil {
+		result.Lanes = d.lane.LaneStatus(r.Context())
+	}
 	warnings := map[string]bool{}
 	lanePipes := map[registry.Key]bool{}
 	d.mu.Lock()
@@ -81,9 +85,6 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 		} else if !slices.Contains(verifiedNativeVersions, s.Version) {
 			warnings[fmt.Sprintf("%s runs Claude Code %s without a recorded native delivery check.", address, s.Version)] = true
 		}
-		if member {
-			members = append(members, memberStatus{sessionKey(key), address, s.Status, "member"})
-		}
 	}
 	slices.SortFunc(pipes, func(a, b pipeStatus) int {
 		if a.Key == b.Key {
@@ -91,19 +92,13 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 		}
 		return strings.Compare(a.Key, b.Key)
 	})
-	slices.SortFunc(members, func(a, b memberStatus) int { return strings.Compare(a.Key, b.Key) })
-	started := d.started.UnixMilli()
-	status := map[string]any{
-		"daemon":  map[string]any{"version": version.Value, "pid": os.Getpid(), "startedAt": started},
-		"machine": nil, "hub": map[string]any{"state": "connecting", "since": started, "epoch": nil, "cursor": 0, "halt": nil},
-		"configDirs": dirs, "pipes": pipes, "sessions": members, "lanes": []any{},
-		"outbox": map[string]any{"count": 0, "oldestAt": nil}, "open": map[string]int{"count": 0},
-	}
+	result.Pipes = pipes
 	if len(warnings) > 0 {
-		status["warnings"] = slices.Sorted(maps.Keys(warnings))
+		list := slices.Sorted(maps.Keys(warnings))
+		result.Warnings = &list
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 func sessionKey(key registry.Key) string {

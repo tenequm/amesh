@@ -18,21 +18,31 @@ import (
 	"github.com/tenequm/amesh/internal/contract"
 )
 
+var ErrIDConflict = &HTTPError{Status: 409, Body: contract.ErrorBody{Error: "id_conflict", Message: "Message id already queued with different contents."}}
+
 // ErrQueued means the send is durable and still pending. A paced send also carries its HTTPError.
 var ErrQueued = errors.New("message queued in the local outbox")
 
 type SendOutcome struct {
-	Request  contract.SendRequest
-	Response contract.SendResponse
-	Err      error
+	Request        contract.SendRequest
+	NoticeLog      string
+	NoticeRequired bool
+	Peer, Name     string
+	Response       contract.SendResponse
+	Err            error
 }
 
 type entry struct {
-	Ticket  string               `json:"ticket"`
-	Log     string               `json:"log"`
-	Base    string               `json:"base"`
-	At      int64                `json:"at"`
-	Request contract.SendRequest `json:"request"`
+	NoticeLog string               `json:"noticeLog,omitempty"`
+	Failure   *HTTPError           `json:"failure,omitempty"`
+	Retried   bool                 `json:"retried,omitempty"`
+	Peer      string               `json:"peer,omitempty"`
+	Name      string               `json:"name,omitempty"`
+	Ticket    string               `json:"ticket"`
+	Log       string               `json:"log"`
+	Base      string               `json:"base"`
+	At        int64                `json:"at"`
+	Request   contract.SendRequest `json:"request"`
 }
 
 func (c *Client) statePath(name string) (string, error) {
@@ -101,7 +111,7 @@ func (c *Client) bindOutbox(log string) error {
 
 func sameTarget(a, b *string) bool { return a == b || (a != nil && b != nil && *a == *b) }
 
-func (c *Client) enqueue(req contract.SendRequest, reply chan SendOutcome) (string, error) {
+func (c *Client) enqueue(req contract.SendRequest, peer, name string, reply chan SendOutcome) (string, error) {
 	c.bindingMu.Lock()
 	defer c.bindingMu.Unlock()
 	if err := c.loadCursor(); err != nil {
@@ -122,12 +132,12 @@ func (c *Client) enqueue(req contract.SendRequest, reply chan SendOutcome) (stri
 		}
 		old := v.Request
 		if old.From != req.From || old.Text != req.Text || !sameTarget(old.To.Address, req.To.Address) || !sameTarget(old.To.Endpoint, req.To.Endpoint) {
-			return "", &HTTPError{Status: 409, Body: contract.ErrorBody{Error: "id_conflict", Message: "Message id already queued with different contents."}}
+			return "", ErrIDConflict
 		}
 		c.waiters[v.Ticket] = append(c.waiters[v.Ticket], reply)
 		return v.Ticket, nil
 	}
-	e := entry{Ticket: crand.Text(), Base: c.cfg.HubURL, Log: log, At: time.Now().UnixMilli(), Request: req}
+	e := entry{Peer: peer, Name: name, Ticket: crand.Text(), Base: c.cfg.HubURL, Log: log, At: time.Now().UnixMilli(), Request: req}
 	if err = c.writeQueue(append(q, e)); err != nil {
 		return "", err
 	}
@@ -136,6 +146,14 @@ func (c *Client) enqueue(req contract.SendRequest, reply chan SendOutcome) (stri
 }
 
 func (c *Client) Send(ctx context.Context, req contract.SendRequest) (contract.SendResponse, error) {
+	return c.send(ctx, req, "", "")
+}
+
+func (c *Client) SendReply(ctx context.Context, req contract.SendRequest, ep contract.EndpointRef) (contract.SendResponse, error) {
+	return c.send(ctx, req, ep.Peer, ep.Name)
+}
+
+func (c *Client) send(ctx context.Context, req contract.SendRequest, peer, name string) (contract.SendResponse, error) {
 	var empty contract.SendResponse
 	conn, err := c.Connection()
 	if err != nil {
@@ -146,6 +164,7 @@ func (c *Client) Send(ctx context.Context, req contract.SendRequest) (contract.S
 	}
 	trimmed := strings.TrimSpace(req.Text)
 	switch {
+	case req.To.Endpoint != nil: // Native replies receive their definitive result through the durable outbox.
 	case trimmed == "":
 		return empty, &HTTPError{400, contract.ErrorBody{Error: "empty_text", Message: "Enter a message."}, 0}
 	case strings.HasPrefix(trimmed, "/"):
@@ -161,34 +180,37 @@ func (c *Client) Send(ctx context.Context, req contract.SendRequest) (contract.S
 		req.HopChain = []string{}
 	}
 	reply := make(chan SendOutcome, 1)
-	ticket, err := c.enqueue(req, reply)
+	ticket, err := c.enqueue(req, peer, name, reply)
 	if err != nil {
 		return empty, err
 	}
-	defer func() {
-		c.queueMu.Lock()
-		defer c.queueMu.Unlock()
-		ws := slices.DeleteFunc(c.waiters[ticket], func(w chan SendOutcome) bool { return w == reply })
-		if len(ws) == 0 {
-			delete(c.waiters, ticket)
-		} else {
-			c.waiters[ticket] = ws
-		}
-	}()
 	c.signalOutbox()
 	timer := time.NewTimer(time.Duration(conn.Settings.SendWaitMs) * time.Millisecond)
 	defer timer.Stop()
+	var result SendOutcome
 	select {
-	case result := <-reply:
-		return result.Response, result.Err
+	case result = <-reply:
 	case <-timer.C:
-		return empty, ErrQueued
+		result.Err = ErrQueued
 	case <-ctx.Done():
-		return empty, errors.Join(ErrQueued, ctx.Err())
+		result.Err = errors.Join(ErrQueued, ctx.Err())
 	case <-c.stopped:
-		_, err = c.Connection()
-		return empty, err
+		result.Err = ErrQueued
 	}
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	// A simultaneous settlement takes precedence over the deadline.
+	select {
+	case result = <-reply:
+	default:
+	}
+	ws := slices.DeleteFunc(c.waiters[ticket], func(w chan SendOutcome) bool { return w == reply })
+	if len(ws) == 0 {
+		delete(c.waiters, ticket)
+	} else {
+		c.waiters[ticket] = ws
+	}
+	return result.Response, result.Err
 }
 
 // Pending reports how many durable sends remain for a session, or for all sessions if key is empty.
@@ -205,21 +227,35 @@ func (c *Client) Pending(key string) (int, error) {
 	return n, err
 }
 
-func (c *Client) finish(ticket string, out SendOutcome) error {
+func (c *Client) settle(index int, ticket string, out SendOutcome, noticeDone bool) (bool, error) {
 	c.queueMu.Lock()
 	defer c.queueMu.Unlock()
 	q, err := c.readQueue()
 	if err != nil {
-		return err
+		return false, err
 	}
-	if len(q) == 0 || q[0].Ticket != ticket {
-		return errors.New("outbox head changed during send")
+	if index >= len(q) || q[index].Ticket != ticket {
+		return false, errors.New("outbox head changed during send")
 	}
-	if err = c.writeQueue(q[1:]); err != nil {
-		return err
+	if !noticeDone && out.Err != nil && (out.Request.To.Endpoint != nil || len(c.waiters[ticket]) == 0 || q[index].Failure != nil) {
+		if q[index].Failure == nil {
+			var failure *HTTPError
+			if !errors.As(out.Err, &failure) {
+				return false, out.Err
+			}
+			q[index].Failure = failure
+			q[index].NoticeLog = out.NoticeLog
+			if err = c.writeQueue(q); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
+	}
+	if err = c.writeQueue(slices.Delete(q, index, index+1)); err != nil {
+		return false, err
 	}
 	c.notify(ticket, out)
-	return nil
+	return true, nil
 }
 
 func (c *Client) notify(ticket string, out SendOutcome) {
@@ -279,43 +315,76 @@ func (c *Client) waitForOutbox(ctx context.Context, remaining time.Duration) err
 // RunOutbox owns the uploader for the lifetime of the daemon. completed receives every
 // definitive outcome, including refusals and expiry for callers that have already returned.
 func (c *Client) RunOutbox(ctx context.Context, completed func(SendOutcome)) error {
+	return c.Drain(ctx, nil, func(out SendOutcome) error {
+		if completed != nil {
+			completed(out)
+		}
+		return nil
+	})
+}
+
+func (c *Client) Drain(ctx context.Context, register func(context.Context, string) error, completed func(SendOutcome) error) error {
 	select {
 	case c.draining <- struct{}{}:
 		defer func() { <-c.draining }()
 	default:
 		return errors.New("outbox already running")
 	}
+	retryNotice := map[string]time.Time{}
 	var delay time.Duration
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		conn, err := c.Connection()
-		if err != nil {
-			return err
-		}
+		conn, halt := c.Connection()
 		c.queueMu.Lock()
 		q, err := c.readQueue()
 		c.queueMu.Unlock()
 		if err != nil {
 			return err
 		}
-		var remaining time.Duration
-		if len(q) > 0 {
-			remaining = time.Duration(conn.Limits.QueueTTLMs)*time.Millisecond - time.Since(time.UnixMilli(q[0].At))
+		index := -1
+		var next time.Time
+		for i, e := range q {
+			if halt != nil && e.Failure == nil {
+				continue
+			}
+			ready := retryNotice[e.Request.From.Session]
+			if e.Failure == nil && conn.Epoch == 0 {
+				ready = time.UnixMilli(e.At).Add(24 * time.Hour)
+			}
+			if !ready.After(time.Now()) {
+				index = i
+				break
+			}
+			if next.IsZero() || ready.Before(next) {
+				next = ready
+			}
 		}
-		if len(q) == 0 || conn.Epoch == 0 && remaining > 0 {
-			if err = c.waitForOutbox(ctx, remaining); err != nil {
+		if index < 0 {
+			if halt != nil {
+				return halt
+			}
+			if err = c.waitForOutbox(ctx, time.Until(next)); err != nil {
 				return err
 			}
 			continue
 		}
-		head := q[0]
+		head := q[index]
+		remaining := 24*time.Hour - time.Since(time.UnixMilli(head.At))
 		req := head.Request
 		req.Epoch = conn.Epoch
-		out := SendOutcome{Request: req}
+		out := SendOutcome{Request: req, NoticeLog: head.NoticeLog, Peer: head.Peer, Name: head.Name}
+		if out.NoticeLog == "" {
+			out.NoticeLog = conn.Log
+		}
+		if out.NoticeLog == "" {
+			out.NoticeLog = head.Log
+		}
 		var rev uint64
-		if remaining <= 0 {
+		if head.Failure != nil {
+			out.Err = head.Failure
+		} else if remaining <= 0 {
 			out.Err = &HTTPError{Status: 410, Body: contract.ErrorBody{Error: "queue_expired", Message: "Message expired in the local outbox."}}
 		} else {
 			c.helloMu.RLock()
@@ -333,8 +402,27 @@ func (c *Client) RunOutbox(ctx context.Context, completed func(SendOutcome)) err
 				out.Err = errors.New("hub returned another message id")
 			}
 		}
-		if _, err = c.Connection(); err != nil {
+		if _, err = c.Connection(); err != nil && head.Failure == nil && !errors.Is(out.Err, err) {
 			return err
+		}
+		if head.Failure == nil && !head.Retried && register != nil && hasCode(out.Err, 404, "unknown_session") {
+			if err = register(ctx, req.From.Session); err == nil {
+				c.queueMu.Lock()
+				var entries []entry
+				entries, err = c.readQueue()
+				if err == nil {
+					entries[index].Retried = true
+					err = c.writeQueue(entries)
+				}
+				c.queueMu.Unlock()
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 		}
 		if hasCode(out.Err, 409, "superseded") {
 			if out.Err = c.confirmOwner(ctx, rev); out.Err == nil {
@@ -364,11 +452,24 @@ func (c *Client) RunOutbox(ctx context.Context, completed func(SendOutcome)) err
 		if h != nil && h.Body.Error == "id_conflict" {
 			slog.Error("hub message id conflict", "id", req.ID)
 		}
-		if err = c.finish(head.Ticket, out); err != nil {
+		settled, err := c.settle(index, head.Ticket, out, false)
+		if err != nil {
 			return fmt.Errorf("settle outbox: %w", err)
 		}
-		if completed != nil {
-			completed(out)
+		out.NoticeRequired = !settled
+		if err = completed(out); err != nil {
+			if settled || ctx.Err() != nil {
+				return err
+			}
+			retryNotice[req.From.Session] = time.Now().Add(time.Second)
+			slog.Warn("outbox notice pending", "id", req.ID, "error", err)
+			continue
+		}
+		delete(retryNotice, req.From.Session)
+		if !settled {
+			if _, err = c.settle(index, head.Ticket, out, true); err != nil {
+				return err
+			}
 		}
 	}
 }

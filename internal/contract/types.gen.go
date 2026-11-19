@@ -13,8 +13,8 @@ type MachineName = string
 type Address = string
 type AddressInput = string
 type FromMode = string
-type PeerStatus = string
-type Kind = string
+type PeerStatus string
+type Kind string
 type Epoch = int64
 type Instance = string
 type LogID = string
@@ -23,7 +23,7 @@ type Hop struct {
 	Limit int64 `json:"limit"`
 }
 type HopChain = []string
-type ErrorCode = string
+type ErrorCode string
 type ErrorBody struct {
 	Error       ErrorCode  `json:"error"`
 	Message     string     `json:"message"`
@@ -111,14 +111,15 @@ type SessionRegisterRequest struct {
 	ClaudeCode string `json:"claudeCode"`
 	StartedAt  Ms     `json:"startedAt"`
 }
+type SessionInfoStatus string
 type SessionInfo struct {
-	Key          SessionKey  `json:"key"`
-	Address      Address     `json:"address"`
-	Name         string      `json:"name"`
-	Project      string      `json:"project"`
-	Machine      MachineName `json:"machine"`
-	Status       string      `json:"status"`
-	RegisteredAt Ms          `json:"registeredAt"`
+	Key          SessionKey        `json:"key"`
+	Address      Address           `json:"address"`
+	Name         string            `json:"name"`
+	Project      string            `json:"project"`
+	Machine      MachineName       `json:"machine"`
+	Status       SessionInfoStatus `json:"status"`
+	RegisteredAt Ms                `json:"registeredAt"`
 }
 type SessionRegisterResponse struct {
 	Session SessionInfo `json:"session"`
@@ -145,9 +146,10 @@ type HumanTurnRequest struct {
 type HumanTurnResponse struct {
 	Reset int64 `json:"reset"`
 }
+type SessionEndRequestReason string
 type SessionEndRequest struct {
-	Epoch  Epoch  `json:"epoch"`
-	Reason string `json:"reason"`
+	Epoch  Epoch                   `json:"epoch"`
+	Reason SessionEndRequestReason `json:"reason"`
 }
 type SessionEndResponseSession struct {
 	Key    SessionKey `json:"key"`
@@ -177,17 +179,18 @@ type SendRequestTo struct {
 	Address  *AddressInput `json:"address,omitempty"`
 	Endpoint *EndpointID   `json:"endpoint,omitempty"`
 }
+type SendRequestOrigin string
 type SendRequest struct {
-	Epoch          Epoch           `json:"epoch"`
-	ID             UUID            `json:"id"`
-	From           SendRequestFrom `json:"from"`
-	To             SendRequestTo   `json:"to"`
-	Text           string          `json:"text"`
-	HopChain       HopChain        `json:"hopChain"`
-	FromMode       *FromMode       `json:"fromMode"`
-	Origin         string          `json:"origin"`
-	NotifyWhenIdle bool            `json:"notifyWhenIdle"`
-	FailureNotice  bool            `json:"failureNotice"`
+	Epoch          Epoch             `json:"epoch"`
+	ID             UUID              `json:"id"`
+	From           SendRequestFrom   `json:"from"`
+	To             SendRequestTo     `json:"to"`
+	Text           string            `json:"text"`
+	HopChain       HopChain          `json:"hopChain"`
+	FromMode       *FromMode         `json:"fromMode"`
+	Origin         SendRequestOrigin `json:"origin"`
+	NotifyWhenIdle bool              `json:"notifyWhenIdle"`
+	FailureNotice  bool              `json:"failureNotice"`
 }
 type EndpointRef struct {
 	ID   EndpointID `json:"id"`
@@ -211,8 +214,8 @@ type SendResponseMessage struct {
 type SendResponse struct {
 	Message SendResponseMessage `json:"message"`
 }
-type DeliveryState = string
-type DropReason = string
+type DeliveryState string
+type DropReason string
 type StateReport struct {
 	Kind    string      `json:"kind"`
 	ID      UUID        `json:"id"`
@@ -244,17 +247,18 @@ type EndpointEventPeer struct {
 	Address Address `json:"address"`
 	Kind    Kind    `json:"kind"`
 }
+type EndpointEventState string
 type EndpointEvent struct {
-	Kind      string            `json:"kind"`
-	Seq       int64             `json:"seq"`
-	ID        EndpointID        `json:"id"`
-	Name      string            `json:"name"`
-	Peer      EndpointEventPeer `json:"peer"`
-	Context   *string           `json:"context"`
-	Sessions  []SessionKey      `json:"sessions"`
-	State     string            `json:"state"`
-	CreatedAt Ms                `json:"createdAt"`
-	ClosedAt  *Ms               `json:"closedAt"`
+	Kind      string             `json:"kind"`
+	Seq       int64              `json:"seq"`
+	ID        EndpointID         `json:"id"`
+	Name      string             `json:"name"`
+	Peer      EndpointEventPeer  `json:"peer"`
+	Context   *string            `json:"context"`
+	Sessions  []SessionKey       `json:"sessions"`
+	State     EndpointEventState `json:"state"`
+	CreatedAt Ms                 `json:"createdAt"`
+	ClosedAt  *Ms                `json:"closedAt"`
 }
 type MessageEvent struct {
 	Kind           string      `json:"kind"`
@@ -286,9 +290,10 @@ type DeliveryEvent struct {
 	Message string          `json:"message"`
 	At      Ms              `json:"at"`
 }
+type LimitEventStoppedDirection string
 type LimitEventStopped struct {
-	ID        UUID   `json:"id"`
-	Direction string `json:"direction"`
+	ID        UUID                       `json:"id"`
+	Direction LimitEventStoppedDirection `json:"direction"`
 }
 type LimitEvent struct {
 	Kind     string            `json:"kind"`
@@ -358,18 +363,21 @@ type NativeNotifyWhenIdle struct {
 	MsgV     int64         `json:"msgV"`
 	FromMode *FromMode     `json:"from_mode,omitempty"`
 }
+type NativeReceiptStatus string
+type NativeReceiptStatusDetail string
+type NativeReceiptDropReason string
 type NativeReceipt struct {
-	Type          string        `json:"type"`
-	Action        string        `json:"action"`
-	Status        string        `json:"status"`
-	StatusDetail  *string       `json:"status_detail,omitempty"`
-	Reason        string        `json:"reason"`
-	From          NativeAddress `json:"from"`
-	OrigMsgID     UUID          `json:"orig_msg_id"`
-	DropReason    *string       `json:"drop_reason,omitempty"`
-	DroppedMsgIDs *[]UUID       `json:"dropped_msg_ids,omitempty"`
-	MsgV          int64         `json:"msgV"`
-	MsgID         UUID          `json:"msg_id"`
+	Type          string                     `json:"type"`
+	Action        string                     `json:"action"`
+	Status        NativeReceiptStatus        `json:"status"`
+	StatusDetail  *NativeReceiptStatusDetail `json:"status_detail,omitempty"`
+	Reason        string                     `json:"reason"`
+	From          NativeAddress              `json:"from"`
+	OrigMsgID     UUID                       `json:"orig_msg_id"`
+	DropReason    *NativeReceiptDropReason   `json:"drop_reason,omitempty"`
+	DroppedMsgIDs *[]UUID                    `json:"dropped_msg_ids,omitempty"`
+	MsgV          int64                      `json:"msgV"`
+	MsgID         UUID                       `json:"msg_id"`
 }
 type NativeIdleNotice struct {
 	Type       string        `json:"type"`
@@ -413,9 +421,10 @@ type HookOutputPreToolUse struct {
 	HookSpecificOutput HookOutputPreToolUseHookSpecificOutput `json:"hookSpecificOutput"`
 }
 type NotHumanPromptPrefixes = []string
+type LocalErrorError string
 type LocalError struct {
-	Error   string `json:"error"`
-	Message string `json:"message"`
+	Error   LocalErrorError `json:"error"`
+	Message string          `json:"message"`
 }
 type DaemonStatusDaemon struct {
 	Version   string `json:"version"`
@@ -426,12 +435,13 @@ type DaemonStatusMachine struct {
 	ID   MachineID   `json:"id"`
 	Name MachineName `json:"name"`
 }
+type DaemonStatusHubState string
 type DaemonStatusHub struct {
-	State  string     `json:"state"`
-	Since  Ms         `json:"since"`
-	Epoch  *Epoch     `json:"epoch"`
-	Cursor int64      `json:"cursor"`
-	Halt   *ErrorBody `json:"halt"`
+	State  DaemonStatusHubState `json:"state"`
+	Since  Ms                   `json:"since"`
+	Epoch  *Epoch               `json:"epoch"`
+	Cursor int64                `json:"cursor"`
+	Halt   *ErrorBody           `json:"halt"`
 }
 type DaemonStatusConfigDirsItem struct {
 	Path     string `json:"path"`
@@ -555,6 +565,7 @@ type NoticeIDVector struct {
 	Rule      string    `json:"rule"`
 	Namespace UUID      `json:"namespace"`
 	MachineID MachineID `json:"machineId"`
+	Log       LogID     `json:"log"`
 	Source    string    `json:"source"`
 	Kind      string    `json:"kind"`
 	MsgID     UUID      `json:"msgId"`
@@ -598,6 +609,96 @@ type EnvelopeVector struct {
 	Attributed bool          `json:"attributed"`
 	Note       *string       `json:"note,omitempty"`
 }
+
+const (
+	PeerStatusIdle                     PeerStatus                 = "idle"
+	PeerStatusBusy                     PeerStatus                 = "busy"
+	PeerStatusOffline                  PeerStatus                 = "offline"
+	KindAgent                          Kind                       = "agent"
+	KindSession                        Kind                       = "session"
+	ErrorCodeBadRequest                ErrorCode                  = "bad_request"
+	ErrorCodeBadBody                   ErrorCode                  = "bad_body"
+	ErrorCodeEmptyText                 ErrorCode                  = "empty_text"
+	ErrorCodeSlashCommand              ErrorCode                  = "slash_command"
+	ErrorCodeBadAddress                ErrorCode                  = "bad_address"
+	ErrorCodeBadCursor                 ErrorCode                  = "bad_cursor"
+	ErrorCodeBadSignature              ErrorCode                  = "bad_signature"
+	ErrorCodeUnknownMachine            ErrorCode                  = "unknown_machine"
+	ErrorCodeStaleTimestamp            ErrorCode                  = "stale_timestamp"
+	ErrorCodeReplayed                  ErrorCode                  = "replayed"
+	ErrorCodeMachineRevoked            ErrorCode                  = "machine_revoked"
+	ErrorCodeNotMember                 ErrorCode                  = "not_member"
+	ErrorCodeNotAParty                 ErrorCode                  = "not_a_party"
+	ErrorCodeNotFound                  ErrorCode                  = "not_found"
+	ErrorCodeNotRunning                ErrorCode                  = "not_running"
+	ErrorCodeUnknownSession            ErrorCode                  = "unknown_session"
+	ErrorCodeUnknownEndpoint           ErrorCode                  = "unknown_endpoint"
+	ErrorCodeAmbiguous                 ErrorCode                  = "ambiguous"
+	ErrorCodeIDConflict                ErrorCode                  = "id_conflict"
+	ErrorCodeHopLimit                  ErrorCode                  = "hop_limit"
+	ErrorCodeQueueFull                 ErrorCode                  = "queue_full"
+	ErrorCodeMachineInUse              ErrorCode                  = "machine_in_use"
+	ErrorCodeSuperseded                ErrorCode                  = "superseded"
+	ErrorCodeTooLarge                  ErrorCode                  = "too_large"
+	ErrorCodeProtocol                  ErrorCode                  = "protocol"
+	ErrorCodeUpgradeRequired           ErrorCode                  = "upgrade_required"
+	ErrorCodeRateLimited               ErrorCode                  = "rate_limited"
+	ErrorCodeInternal                  ErrorCode                  = "internal"
+	ErrorCodeUnavailable               ErrorCode                  = "unavailable"
+	SessionInfoStatusIdle              SessionInfoStatus          = "idle"
+	SessionInfoStatusBusy              SessionInfoStatus          = "busy"
+	SessionInfoStatusOffline           SessionInfoStatus          = "offline"
+	SessionInfoStatusEnded             SessionInfoStatus          = "ended"
+	SessionEndRequestReasonExited      SessionEndRequestReason    = "exited"
+	SessionEndRequestReasonExcluded    SessionEndRequestReason    = "excluded"
+	SessionEndRequestReasonNotHosted   SessionEndRequestReason    = "not_hosted"
+	SendRequestOriginHuman             SendRequestOrigin          = "human"
+	SendRequestOriginPeer              SendRequestOrigin          = "peer"
+	SendRequestOriginUnknown           SendRequestOrigin          = "unknown"
+	DeliveryStateQueued                DeliveryState              = "queued"
+	DeliveryStateSent                  DeliveryState              = "sent"
+	DeliveryStateAccepted              DeliveryState              = "accepted"
+	DeliveryStateHeld                  DeliveryState              = "held"
+	DeliveryStateDelivered             DeliveryState              = "delivered"
+	DeliveryStateDenied                DeliveryState              = "denied"
+	DeliveryStateExpired               DeliveryState              = "expired"
+	DeliveryStateRefused               DeliveryState              = "refused"
+	DeliveryStateDropped               DeliveryState              = "dropped"
+	DeliveryStateUnknown               DeliveryState              = "unknown"
+	DropReasonRateLimited              DropReason                 = "rate-limited"
+	DropReasonQueueFull                DropReason                 = "queue-full"
+	DropReasonDuplicate                DropReason                 = "duplicate"
+	DropReasonHopLoop                  DropReason                 = "hop-loop"
+	DropReasonHopRunaway               DropReason                 = "hop-runaway"
+	DropReasonOversized                DropReason                 = "oversized"
+	DropReasonSessionGone              DropReason                 = "session_gone"
+	DropReasonUnknownSession           DropReason                 = "unknown_session"
+	DropReasonQueueExpired             DropReason                 = "queue_expired"
+	DropReasonEnded                    DropReason                 = "ended"
+	DropReasonInterrupted              DropReason                 = "interrupted"
+	DropReasonRouteFailed              DropReason                 = "route_failed"
+	EndpointEventStateOpen             EndpointEventState         = "open"
+	EndpointEventStateClosed           EndpointEventState         = "closed"
+	LimitEventStoppedDirectionIn       LimitEventStoppedDirection = "in"
+	LimitEventStoppedDirectionOut      LimitEventStoppedDirection = "out"
+	NativeReceiptStatusHeld            NativeReceiptStatus        = "held"
+	NativeReceiptStatusDelivered       NativeReceiptStatus        = "delivered"
+	NativeReceiptStatusDenied          NativeReceiptStatus        = "denied"
+	NativeReceiptStatusExpired         NativeReceiptStatus        = "expired"
+	NativeReceiptStatusDropped         NativeReceiptStatus        = "dropped"
+	NativeReceiptStatusDetailRefused   NativeReceiptStatusDetail  = "refused"
+	NativeReceiptDropReasonRateLimited NativeReceiptDropReason    = "rate-limited"
+	NativeReceiptDropReasonQueueFull   NativeReceiptDropReason    = "queue-full"
+	NativeReceiptDropReasonDuplicate   NativeReceiptDropReason    = "duplicate"
+	NativeReceiptDropReasonHopLoop     NativeReceiptDropReason    = "hop-loop"
+	NativeReceiptDropReasonHopRunaway  NativeReceiptDropReason    = "hop-runaway"
+	LocalErrorErrorNotInSession        LocalErrorError            = "not_in_session"
+	LocalErrorErrorExcluded            LocalErrorError            = "excluded"
+	LocalErrorErrorBadRequest          LocalErrorError            = "bad_request"
+	DaemonStatusHubStateConnected      DaemonStatusHubState       = "connected"
+	DaemonStatusHubStateConnecting     DaemonStatusHubState       = "connecting"
+	DaemonStatusHubStateHalted         DaemonStatusHubState       = "halted"
+)
 
 func DefaultSettings() Settings {
 	return Settings{HeartbeatMs: 20000, StreamSilenceMs: 45000, BackoffInitialMs: 500, BackoffMaxMs: 10000, BackoffResetAfterMs: 5000, AcceptWindowMs: 8000, RequestTimeoutMs: 10000, SendWaitMs: 5000}

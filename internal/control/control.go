@@ -19,20 +19,31 @@ import (
 	"unicode/utf8"
 
 	"github.com/tenequm/amesh/internal/config"
+	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/mcpserver"
 	"github.com/tenequm/amesh/internal/peercred"
 	"github.com/tenequm/amesh/internal/registry"
 )
 
+type meshService interface {
+	mcpserver.MeshBackend
+	Status(*contract.DaemonStatus) error
+}
+type laneService interface {
+	mcpserver.LaneBackend
+	LaneStatus(context.Context) []contract.DaemonStatusLanesItem
+}
+
 type daemon struct {
 	ownsRelay func(string) bool
 	cfg       config.Config
 	registry  *registry.Registry
-	lane      mcpserver.LaneBackend
-	mesh      mcpserver.MeshBackend
+	lane      laneService
+	mesh      meshService
 	ctx       context.Context
 	started   time.Time
 	mu        sync.Mutex
+	turns     map[registry.Key]*pendingTurn
 	pipes     map[*registration]struct{}
 	work      sync.WaitGroup
 }
@@ -86,7 +97,7 @@ func listen(ctx context.Context, path string) (net.Listener, error) {
 	return l, nil
 }
 
-func Serve(ctx context.Context, cfg config.Config, sessions *registry.Registry, lane mcpserver.LaneBackend, mesh mcpserver.MeshBackend, ownsRelay func(string) bool) error {
+func Serve(ctx context.Context, cfg config.Config, sessions *registry.Registry, lane laneService, mesh meshService, ownsRelay func(string) bool) error {
 	if err := sessions.SelfCheck(ctx); err != nil {
 		return fmt.Errorf("registry startup check: %w", err)
 	}
@@ -128,21 +139,7 @@ func reject(w http.ResponseWriter, status int, code, message string) {
 }
 
 func (d *daemon) meshExcluded(s registry.Session) bool {
-	return (len(d.cfg.ClaudeConfigDirs) > 0 && s.ConfigDir != d.cfg.ClaudeConfigDirs[0]) || excluded(s.CWD, d.cfg.ExcludeRoots)
-}
-
-func excluded(cwd string, roots []string) bool {
-	for _, root := range roots {
-		if cwd == root || strings.HasPrefix(cwd, strings.TrimRight(root, "/")+"/") {
-			return true
-		}
-		resolved, err := filepath.EvalSymlinks(cwd)
-		base, e := filepath.EvalSymlinks(root)
-		if err == nil && e == nil && (resolved == base || strings.HasPrefix(resolved, strings.TrimRight(base, "/")+"/")) {
-			return true
-		}
-	}
-	return false
+	return s.MeshExcluded(d.cfg.ClaudeConfigDirs, d.cfg.ExcludeRoots)
 }
 
 func mode(r *http.Request) (string, bool, error) {

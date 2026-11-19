@@ -189,16 +189,8 @@ func decode(line []byte) (Event, error) {
 	case f.Type == "control" && uuidRE.MatchString(f.OriginalID):
 		switch f.Action {
 		case "peer_message_status":
-			switch f.Status {
-			case "held", "delivered", "denied", "expired":
-			case "dropped":
-				switch f.DropReason {
-				case "rate-limited", "queue-full", "duplicate", "hop-loop", "hop-runaway":
-				default:
-					return Event{}, errors.New("invalid native drop reason")
-				}
-			default:
-				return Event{}, errors.New("invalid native receipt status")
+			if f.Status == "" {
+				return Event{}, errors.New("missing native receipt status")
 			}
 			for _, id := range f.DroppedIDs {
 				if !uuidRE.MatchString(id) {

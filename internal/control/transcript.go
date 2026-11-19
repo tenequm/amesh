@@ -3,6 +3,7 @@ package control
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -37,7 +38,18 @@ type (
 	}
 )
 
-func (d *daemon) confirmTurn(s registry.Session, h hookInput, received time.Time) {
+type pendingTurn struct{ cancel context.CancelFunc }
+
+func (d *daemon) scheduleTurn(s registry.Session, h hookInput, received time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if old := d.turns[s.Key]; old != nil {
+		old.cancel()
+		delete(d.turns, s.Key)
+	}
+	if h.Transcript == "" {
+		return
+	}
 	projects := filepath.Join(s.ConfigDir, "projects")
 	rel, err := filepath.Rel(projects, h.Transcript)
 	if err != nil || !filepath.IsLocal(rel) || filepath.Base(rel) != s.SessionID+".jsonl" || len(strings.Split(rel, string(filepath.Separator))) != 2 {
@@ -47,28 +59,56 @@ func (d *daemon) confirmTurn(s registry.Session, h hookInput, received time.Time
 	if err != nil {
 		return
 	}
-	defer root.Close()
+	file := filepath.Join("projects", rel)
 	var offset int64
-	for {
-		current, e := d.registry.Resolve(d.ctx, s.PID)
+	info, err := root.Stat(file)
+	if err == nil && info.Mode().IsRegular() {
+		offset = info.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		_ = root.Close()
+		return
+	}
+	ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
+	pending := &pendingTurn{cancel}
+	if d.turns == nil {
+		d.turns = make(map[registry.Key]*pendingTurn)
+	}
+	d.turns[s.Key] = pending
+	d.work.Go(func() {
+		defer root.Close()
+		defer cancel()
+		defer func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if d.turns[s.Key] == pending {
+				delete(d.turns, s.Key)
+			}
+		}()
+		d.confirmTurn(ctx, root, file, offset, s, h, received)
+	})
+}
+
+func (d *daemon) confirmTurn(ctx context.Context, root *os.Root, file string, offset int64, s registry.Session, h hookInput, received time.Time) {
+	for ctx.Err() == nil {
+		current, e := d.registry.Resolve(ctx, s.PID)
 		if e != nil || current.Key != s.Key || current.SessionID != s.SessionID || !d.mesh.IsMember(s.Key) || d.meshExcluded(current) {
 			return
 		}
-		next, matched, err := scanTranscript(root, filepath.Join("projects", rel), offset, s.SessionID, h, received)
+		next, matched, err := scanTranscript(root, file, offset, s.SessionID, h, received)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return
 		}
 		offset = next
 		if matched != nil {
-			if matched.Kind == "human" {
-				if err := d.mesh.HumanTurn(d.ctx, current); err != nil && d.ctx.Err() == nil {
+			if matched.Kind == "human" && ctx.Err() == nil {
+				if err := d.mesh.HumanTurn(ctx, current); err != nil && d.ctx.Err() == nil {
 					slog.Warn("human turn report failed", "error", err)
 				}
 			}
 			return
 		}
 		select {
-		case <-d.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-time.After(250 * time.Millisecond):
 		}
@@ -90,7 +130,7 @@ func scanTranscript(root *os.Root, rel string, offset int64, id string, h hookIn
 		return offset, nil, errors.New("invalid transcript file")
 	}
 	if offset > info.Size() {
-		offset = 0
+		return offset, nil, errors.New("transcript truncated")
 	}
 	if _, err = f.Seek(offset, io.SeekStart); err != nil {
 		return offset, nil, err

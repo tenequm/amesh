@@ -119,7 +119,11 @@ func TestRecoveryAndLogReplacement(t *testing.T) {
 		if id == "notice" {
 			session = ""
 		}
-		ok, err := s.BeginWrite("old", id, session, expiry, false)
+		kind := "message"
+		if id == "notice" {
+			kind = "notice"
+		}
+		ok, err := s.BeginWrite("old", id, session, expiry, kind)
 		if !ok || err != nil {
 			t.Fatal(id, ok, err)
 		}
@@ -135,17 +139,9 @@ func TestRecoveryAndLogReplacement(t *testing.T) {
 	if len(entries) != 2 || entries["complete"].Phase != Written || entries["partial"].Phase != Writing || entries["partial"].Session != member.Key {
 		t.Fatal(entries)
 	}
-	ok, err := s.BeginWrite("old", "final", member.Key, expiry, true)
-	if !ok || err != nil {
-		t.Fatal(ok, err)
-	}
-	check(s.MarkWritten("old", "final"))
-	if s.data.IDs["final"].Phase != Reported {
-		t.Fatal(s.data.IDs["final"])
-	}
 	check(s.SetLog("new"))
-	ok, err = s.BeginWrite("new", "partial", member.Key, expiry, false)
-	if !ok || err != nil {
+	ok, err := s.BeginWrite("new", "partial", member.Key, expiry, "message")
+	if ok || err != nil {
 		t.Fatal(ok, err)
 	}
 	if s.MarkReported("old", "partial") == nil || s.ForgetWrite("old", "partial") == nil {
@@ -155,7 +151,7 @@ func TestRecoveryAndLogReplacement(t *testing.T) {
 	check(s.Lock())
 	members, err := s.Members()
 	check(err)
-	if len(members) != 1 || members[0] != member || len(s.data.IDs) != 1 {
+	if len(members) != 1 || members[0] != member || len(s.data.IDs) != 3 {
 		t.Fatal(members, s.data.IDs)
 	}
 	check(s.DeleteMember(member.Key))

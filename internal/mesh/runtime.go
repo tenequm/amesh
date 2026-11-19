@@ -54,7 +54,7 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	hello := contract.HelloRequest{
 		Amesh:        contract.HelloRequestAmesh{Version: version.Value, OS: runtime.GOOS, Arch: runtime.GOARCH},
 		ClaudeCode:   contract.HelloRequestClaudeCode{Versions: slices.Sorted(maps.Keys(versions)), PeerProtocol: 1, NativeCheck: "ok"},
-		Capabilities: []string{"receipts", "idle", "human-turn"},
+		Capabilities: []string{"receipts", "human-turn"},
 	}
 	if hello.ClaudeCode.Versions == nil {
 		hello.ClaudeCode.Versions = []string{}
@@ -62,6 +62,13 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	ctx, cancel := context.WithCancel(parent)
 	b.ctx = ctx
 	var workers sync.WaitGroup
+	pending := store.PendingRewrites()
+	workers.Go(func() {
+		b.relays.ResumeRewrites(ctx, pending, func(ctx context.Context, key string, pid int, path string) bool {
+			s, ok, err := b.liveSession(ctx, key)
+			return err == nil && ok && s.PID == pid && s.SocketPath == path
+		})
+	})
 	workers.Go(func() {
 		_, helloErr := b.client.Hello(ctx, hello)
 		b.connectivity(helloErr)
@@ -72,7 +79,7 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 			slog.Warn("mesh stream stopped", "error", streamErr)
 		}
 	})
-	return sync.OnceValue(func() error { cancel(); workers.Wait(); b.closeEndpoints(); b.retries.Wait(); return store.Close() }), nil
+	return sync.OnceValue(func() error { cancel(); workers.Wait(); b.closeEndpoints(); return store.Close() }), nil
 }
 
 // Expiry notices still need the public machine id when a restarted daemon
@@ -114,17 +121,17 @@ func (b *Backend) rememberMachine(id string) error {
 func (b *Backend) runUploader(ctx context.Context) {
 	for ctx.Err() == nil {
 		conn, halt := b.client.Connection()
-		if halt != nil {
-			return
-		}
 		var err error
-		if conn.Log != "" {
+		if conn.Log != "" && halt == nil {
 			err = b.prepareLog(ctx, conn)
 		}
 		if err == nil {
-			err = b.client.RunOutbox(ctx, b.completed)
+			err = b.client.Drain(ctx, b.reregister, b.completed)
 		}
 		if ctx.Err() != nil {
+			return
+		}
+		if _, halt = b.client.Connection(); halt != nil {
 			return
 		}
 		slog.Warn("mesh outbox stopped", "error", err)

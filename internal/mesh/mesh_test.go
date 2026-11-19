@@ -54,7 +54,9 @@ func meshDir(t *testing.T) string {
 
 func fixture(t *testing.T, routes map[string]http.HandlerFunc) (*Backend, *testRegistry) {
 	t.Helper()
-	routes["POST /peer/hello"] = hubtest.Reply(t, "helloResponse")
+	if routes["POST /peer/hello"] == nil {
+		routes["POST /peer/hello"] = hubtest.Reply(t, "helloResponse")
+	}
 	server, err := hubtest.New(t, routes)
 	if err != nil {
 		t.Fatal(err)
@@ -184,6 +186,7 @@ func TestDirectoryAndSend(t *testing.T) {
 	if !reflect.DeepEqual(dir, want) {
 		t.Fatalf("directory %#v", dir)
 	}
+	b.synchronized = true
 	for _, tc := range []struct{ to, text, example string }{{"stna", "hi", "mcpSendRefusedNotFound"}, {"stan", strings.Repeat("a", 32769), "mcpSendRefusedTooLarge"}} {
 		got, e := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: tc.to, Message: tc.text})
 		var expected mcpserver.SendResult
@@ -194,7 +197,7 @@ func TestDirectoryAndSend(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- b.client.RunOutbox(ctx, b.completed) }()
+	go func() { done <- b.client.Drain(ctx, b.reregister, b.completed) }()
 	defer func() { cancel(); <-done }()
 	got, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "stan", Message: "hello"})
 	var expected mcpserver.SendResult
@@ -303,7 +306,7 @@ func TestDaemonLifecycle(t *testing.T) {
 		"POST /peer/hello": func(w http.ResponseWriter, r *http.Request) {
 			var req contract.HelloRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			if !req.Takeover || req.Amesh.Version == "" || req.ClaudeCode.NativeCheck != "ok" || req.ClaudeCode.PeerProtocol != 1 {
+			if !slices.Equal(req.Capabilities, []string{"receipts", "human-turn"}) || !req.Takeover || req.Amesh.Version == "" || req.ClaudeCode.NativeCheck != "ok" || req.ClaudeCode.PeerProtocol != 1 {
 				t.Error("hello before native checks")
 			}
 			hubtest.Reply(t, "helloResponse")(w, r)
@@ -350,6 +353,20 @@ func TestDaemonLifecycle(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no event stream")
 	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var snapshot contract.DaemonStatus
+		if err = b.Status(&snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.Hub.State == "connected" && snapshot.Hub.Epoch != nil && *snapshot.Hub.Epoch == 7 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stream status: %+v", snapshot.Hub)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if err = stop(); err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +404,7 @@ func TestUnknownSessionSendKeepsID(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- b.client.RunOutbox(ctx, b.completed) }()
+	go func() { done <- b.client.Drain(ctx, b.reregister, b.completed) }()
 	defer func() { cancel(); <-done }()
 	got, err := b.SendMessage(ctx, s, mcpserver.SendArgs{To: "stan", Message: "retry this id"})
 	if err != nil || !got.Accepted || !slices.Equal(ids, []string{got.ID, got.ID}) {
@@ -420,22 +437,158 @@ func TestQueuedSendWaitAndDirectoryReplacement(t *testing.T) {
 		if err := r.handle(t.Context(), item); err != nil {
 			t.Fatal(err)
 		}
-		if err := r.handle(t.Context(), contract.EventStreamItem{Event: "synchronized", Data: `{"kind":"synchronized","seq":0}`}); err != nil {
+		early, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "absent", Message: "before sync"})
+		if err != nil || !early.Accepted {
+			t.Fatal(early, err)
+		}
+		if err = r.handle(t.Context(), contract.EventStreamItem{Event: "synchronized", Data: `{"kind":"synchronized","seq":0}`}); err != nil {
 			t.Fatal(err)
 		}
 		if len(b.peers) != 1 || b.peers[0].Address != "stan" {
 			t.Fatal("stale directory entry survived synchronization")
 		}
+		for _, addr := range []string{"absent", "other@pond"} {
+			b.peers = append(b.peers, contract.Peer{Address: "other@pond:bl", Kind: "session"})
+			miss, e := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: addr, Message: "after sync"})
+			if e != nil || miss.Accepted {
+				t.Fatal("post-sync cache miss accepted", addr, e)
+			}
+		}
 		start := time.Now()
-		result, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "stan", Message: "durably queued"})
+		result, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "__STAN..", Message: "durably queued"})
 		var want mcpserver.SendResult
 		_ = json.Unmarshal(hubtest.Example(t, "mcpSendAcceptedHubDown"), &want)
 		want.ID = result.ID
 		if err != nil || result.ID == "" || !reflect.DeepEqual(result, want) || time.Since(start) != 5*time.Second {
 			t.Fatalf("queued result %#v: %v", result, err)
 		}
-		if n, e := c.Pending(sessionKey(s.Key)); e != nil || n != 1 {
+		if n, e := c.Pending(sessionKey(s.Key)); e != nil || n != 2 {
 			t.Fatal("queued send was not durable")
 		}
 	})
+}
+
+func TestRestoreExclusionEndsAfterAnswer(t *testing.T) {
+	for _, source := range []string{"cwd", "second-seat", "removed-seat"} {
+		t.Run(source, func(t *testing.T) {
+			var calls int
+			var store *state.Store
+			s := testSession()
+			s.ConfigDir = "/amesh-a2-primary"
+			key := sessionKey(s.Key)
+			b, r := fixture(t, map[string]http.HandlerFunc{
+				"POST /peer/sessions/{key}/end": func(w http.ResponseWriter, r *http.Request) {
+					var req contract.SessionEndRequest
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Reason != contract.SessionEndRequestReasonExcluded {
+						t.Error(req, err)
+					}
+					saved, err := store.Members()
+					if err != nil || len(saved) != 1 {
+						t.Error("member disappeared before end answer", err)
+					}
+					calls++
+					if calls == 1 {
+						hubtest.Reply(t, "errUnavailable")(w, r)
+						return
+					}
+					hubtest.Reply(t, "errUnknownSession")(w, r)
+				}, "POST /peer/heartbeat": hubtest.Reply(t, "heartbeatResponse"),
+			})
+			store = b.store
+			b.cfg.ClaudeConfigDirs = []string{s.ConfigDir}
+			if _, err := b.Connect(t.Context(), s); err != nil {
+				t.Fatal(err)
+			}
+			b.members = map[string]member{}
+			switch source {
+			case "cwd":
+				s.CWD = "/amesh-a2-exclude/sub"
+				b.cfg.ExcludeRoots = []string{"/amesh-a2-exclude"}
+			case "second-seat":
+				b.cfg.ClaudeConfigDirs = []string{"/amesh-a2-new", s.ConfigDir}
+			case "removed-seat":
+				b.cfg.ClaudeConfigDirs = []string{"/amesh-a2-new"}
+			}
+			if source != "removed-seat" {
+				*r = append(*r, s)
+			}
+			if err := b.restore(t.Context()); err != nil || b.IsMember(s.Key) {
+				t.Fatal("hosted excluded session", err)
+			}
+			if err := b.reconcile(t.Context()); err == nil {
+				t.Fatal("lost failed end")
+			}
+			if err := b.reconcile(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			saved, err := store.Members()
+			if err != nil || len(saved) != 0 || calls != 2 {
+				t.Fatal(key, saved, err, calls)
+			}
+		})
+	}
+}
+
+func TestPresenceChangesAndStatus(t *testing.T) {
+	var registrations []contract.SessionRegisterRequest
+	var heartbeats []contract.HeartbeatRequest
+	b, r := fixture(t, map[string]http.HandlerFunc{
+		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.SessionRegisterRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Error(err)
+			}
+			registrations = append(registrations, req)
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: r.PathValue("key"), Address: "review-2@pond:mac"}})
+		},
+		"POST /peer/heartbeat": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.HeartbeatRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Error(err)
+			}
+			heartbeats = append(heartbeats, req)
+			_, _ = io.WriteString(w, "{}")
+		},
+	})
+	s := testSession()
+	*r = append(*r, s)
+	if _, err := b.Connect(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	b.members = map[string]member{}
+	b.presenceLog = ""
+	if err := b.restore(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	(*r)[0].Status = "busy"
+	(*r)[0].Version = "changed"
+	(*r)[0].FromMode = "prompting"
+	b.lastHeartbeat = time.Now().Add(-2 * time.Second)
+	if err := b.reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(registrations) != 1 || registrations[0].Status != "idle" || len(heartbeats) != 2 || heartbeats[1].Sessions[0].Status != "busy" {
+		t.Fatal(registrations, heartbeats)
+	}
+	(*r)[0].SessionID = "changed"
+	if err := b.reconcile(t.Context()); err != nil || len(registrations) != 2 {
+		t.Fatal(err, registrations)
+	}
+	conn, _ := b.client.Connection()
+	if err := b.store.SetLog(conn.Log); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.store.BeginWrite(conn.Log, "open-id", sessionKey(s.Key), time.Now().Add(time.Hour), "message"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.store.MarkWritten(conn.Log, "open-id"); err != nil {
+		t.Fatal(err)
+	}
+	var status contract.DaemonStatus
+	if err := b.Status(&status); err != nil || len(status.Sessions) != 1 || status.Sessions[0].Address != "review-2@pond:mac" || status.Sessions[0].Status != "busy" || status.Open.Count != 1 || status.Machine.ID != conn.Machine.ID {
+		t.Fatal(status, err)
+	}
 }

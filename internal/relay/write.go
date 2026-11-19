@@ -222,9 +222,6 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 	}
 	defer release()
 	if retry {
-		if _, err = m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), true); err != nil {
-			return time.Time{}, err
-		}
 		if err = wait(ctx, refill); err != nil {
 			return time.Time{}, err
 		}
@@ -250,7 +247,11 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 				return errors.New("native rewrite claim expired")
 			}
 		} else {
-			claimed, checkErr := m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), false)
+			kind := "message"
+			if d.Notice {
+				kind = "notice"
+			}
+			claimed, checkErr := m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), kind)
 			if checkErr != nil {
 				return checkErr
 			}
@@ -280,9 +281,9 @@ func (m *Manager) Write(ctx context.Context, d Delivery) error {
 		if d.Message.FromName != "amesh" || d.Message.FromSession != "" || len(d.Message.HopChain) != 0 || d.NotifyWhenIdle {
 			return errors.New("a frame without a relay must be an amesh notice")
 		}
-		d.notice = true
+		d.Notice = true
 	}
-	if d.notice || d.lane() {
+	if d.lane() {
 		d.Session = ""
 	}
 	d.Message.HopChain = slices.Clone(d.Message.HopChain)
@@ -329,14 +330,14 @@ func (m *Manager) NotifyWhenIdle(ctx context.Context, inbox, from, fromMode, id 
 	return err
 }
 
-type NoticeSource struct{ MachineID, Source, Kind string }
+type NoticeSource struct{ MachineID, Log, Source, Kind string }
 
 func (n NoticeSource) ID() string {
-	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("amesh-notice\n"+n.MachineID+"\n"+n.Source+"\n"+n.Kind)).String()
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("amesh-notice\n"+n.MachineID+"\n"+n.Log+"\n"+n.Source+"\n"+n.Kind)).String()
 }
 
 func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSource, cause, peer, detail string) error {
-	if source.MachineID == "" || source.Source == "" {
+	if source.MachineID == "" || source.Log == "" || source.Source == "" {
 		return errors.New("missing notice source")
 	}
 	switch source.Kind {
@@ -348,6 +349,8 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSour
 	switch cause {
 	case "denied", "refused", "start_refused":
 		body = fmt.Sprintf("your message to %s was not delivered: %s", peer, detail)
+	case "reply_refused":
+		body = fmt.Sprintf("your reply to %s was not delivered: %s", peer, detail)
 	case "expired", "dropped":
 		body = fmt.Sprintf("your message to %s did not arrive: %s", peer, detail)
 	case "outbox_expired":
@@ -362,7 +365,7 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSour
 		return fmt.Errorf("unknown notice cause %q", cause)
 	}
 	d.ID = source.ID()
-	d.notice = true
+	d.Notice = true
 	if d.Message.From == "" {
 		d.Message.FromName = "amesh"
 		d.Message.FromSession = ""
@@ -370,7 +373,13 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSour
 	d.Message.HopChain = nil
 	d.NotifyWhenIdle = false
 	d.Message.Body = "amesh notice: " + body + " No reply needed."
-	return m.Write(ctx, d)
+	if err := m.Write(ctx, d); err != nil {
+		return err
+	}
+	if !m.store.NoticeWritten(d.ID) {
+		return errors.New("notice write incomplete")
+	}
+	return nil
 }
 
 const maxRewrites = 3

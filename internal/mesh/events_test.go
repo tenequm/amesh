@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -127,7 +128,7 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 			var report contract.StateReport
 			_ = json.Unmarshal(req.Reports[0], &report)
 			reports <- report
-			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: report.ID, State: &report.State, Applied: true}}})
+			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: report.ID, State: optional(contract.DeliveryState(report.State)), Applied: true}}})
 		},
 	})
 	b.cfg.ClaudeConfigDirs = []string{seat}
@@ -227,7 +228,7 @@ func TestOrphanAndInterruptedReports(t *testing.T) {
 			var rep contract.StateReport
 			_ = json.Unmarshal(req.Reports[0], &rep)
 			states = append(states, rep)
-			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: rep.ID, State: &rep.State, Applied: true}}})
+			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: rep.ID, State: optional(contract.DeliveryState(rep.State)), Applied: true}}})
 		},
 		"POST /peer/sessions/{key}/end": hubtest.Reply(t, "sessionEndResponse"),
 	})
@@ -236,7 +237,7 @@ func TestOrphanAndInterruptedReports(t *testing.T) {
 	if err := b.store.SetLog(conn.Log); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.store.BeginWrite(conn.Log, "first", key, time.Now().Add(time.Hour), false); err != nil {
+	if _, err := b.store.BeginWrite(conn.Log, "first", key, time.Now().Add(time.Hour), "message"); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.prepareLog(t.Context(), conn); err != nil {
@@ -296,7 +297,7 @@ func TestRelayReplyReceiptAndNotice(t *testing.T) {
 			var rep contract.StateReport
 			_ = json.Unmarshal(req.Reports[0], &rep)
 			reported <- rep
-			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: rep.ID, State: &rep.State, Applied: true}}})
+			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: rep.ID, State: optional(contract.DeliveryState(rep.State)), Applied: true}}})
 		},
 	})
 	*r = append(*r, s)
@@ -310,7 +311,7 @@ func TestRelayReplyReceiptAndNotice(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- b.client.RunOutbox(ctx, b.completed) }()
+	go func() { done <- b.client.Drain(ctx, b.reregister, b.completed) }()
 	defer func() { cancel(); <-done }()
 	var msg contract.MessageEvent
 	_ = json.Unmarshal(hubtest.Example(t, "eventMessage"), &msg)
@@ -367,7 +368,9 @@ func TestRelayReplyReceiptAndNotice(t *testing.T) {
 	}
 	addr := "stan"
 	req := contract.SendRequest{ID: msg.ID, From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &addr}}
-	b.completed(hub.SendOutcome{Request: req, Err: &hub.HTTPError{Body: contract.ErrorBody{Error: "log_replaced"}}})
+	if err = b.completed(hub.SendOutcome{NoticeRequired: true, Request: req, Err: &hub.HTTPError{Body: contract.ErrorBody{Error: "log_replaced"}}}); err != nil {
+		t.Fatal(err)
+	}
 	frame = contract.NativeUserFrame{}
 	if err = json.Unmarshal(<-lines, &frame); err != nil {
 		t.Fatal(err)
@@ -405,7 +408,12 @@ func TestOfflineRestartWritesExpiryNotice(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		if runErr := b.client.RunOutbox(ctx, func(out hub.SendOutcome) { b.completed(out); cancel() }); !errors.Is(runErr, context.Canceled) {
+		if runErr := b.client.RunOutbox(ctx, func(out hub.SendOutcome) {
+			if e := b.completed(out); e != nil {
+				t.Error(e)
+			}
+			cancel()
+		}); !errors.Is(runErr, context.Canceled) {
 			t.Fatal(runErr)
 		}
 	})
@@ -418,8 +426,147 @@ func TestOfflineRestartWritesExpiryNotice(t *testing.T) {
 	default:
 		t.Fatal("expired send did not notify the offline session")
 	}
-	want := (relay.NoticeSource{MachineID: conn.Machine.ID, Kind: "outbox", Source: req.ID}).ID()
+	want := (relay.NoticeSource{MachineID: conn.Machine.ID, Log: conn.Log, Kind: "outbox", Source: req.ID}).ID()
 	if frame.MsgID != want || frame.From != nil || !strings.Contains(frame.Message.Content, "could not reach the hub for 24 hours") {
 		t.Fatal("incorrect offline expiry notice")
+	}
+}
+
+func TestDeferredRefusalSurvivesFailedNoticeWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name, code string
+		reply      bool
+	}{
+		{"start", "new_permanent_code", false}, {"reply", "id_conflict", true}, {"start-conflict", "id_conflict", false}, {"reply-limit", "hop_limit", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var posts atomic.Int32
+			var hello contract.HelloResponse
+			if err := json.Unmarshal(hubtest.Example(t, "helloResponse"), &hello); err != nil {
+				t.Fatal(err)
+			}
+			hello.Settings.SendWaitMs = 0
+			b, r := fixture(t, map[string]http.HandlerFunc{"POST /peer/hello": func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(hello) }, "POST /peer/messages": func(w http.ResponseWriter, _ *http.Request) {
+				posts.Add(1)
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(contract.ErrorBody{Error: contract.ErrorCode(tc.code), Message: "refusal detail"})
+			}})
+			conn, _ := b.client.Connection()
+			if err := b.prepareLog(t.Context(), conn); err != nil {
+				t.Fatal(err)
+			}
+			s := testSession()
+			s.FromMode = "bypass"
+			s.SocketPath = filepath.Join(b.cfg.StateDir, "amesh-a2-missing.sock")
+			*r = append(*r, s)
+			if _, err := b.Connect(t.Context(), s); err != nil {
+				t.Fatal(err)
+			}
+			ep := contract.EndpointRef{ID: "pe_amesha2example", Peer: "stan", Name: "stan"}
+			req := contract.SendRequest{ID: "54ad69a0-b410-4a59-9fb1-90ff72440102", From: contract.SendRequestFrom{Session: sessionKey(s.Key)}, Text: "test", Origin: contract.SendRequestOriginUnknown}
+			if tc.reply {
+				req.To.Endpoint = &ep.ID
+			} else {
+				req.To.Address = &ep.Peer
+			}
+			_, sendErr := b.client.SendReply(t.Context(), req, ep)
+			if !errors.Is(sendErr, hub.ErrQueued) {
+				t.Fatal(sendErr)
+			}
+
+			drain := func() error {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				return b.client.Drain(ctx, b.reregister, func(out hub.SendOutcome) error {
+					err := b.completed(out)
+					cancel()
+					return err
+				})
+			}
+			err := drain()
+			if tc.code == "hop_limit" {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+				if n, e := b.client.Pending(""); n != 0 || e != nil {
+					t.Fatal(n, e)
+				}
+				return
+			}
+			if err == nil || errors.Is(err, context.Canceled) {
+				t.Fatal("missing inbox did not fail the notice")
+			}
+			if n, e := b.client.Pending(""); n != 1 || e != nil {
+				t.Fatal(n, e)
+			}
+			inbox, lines, e := relaytest.Inbox(t)
+			if e != nil {
+				t.Fatal(e)
+			}
+			(*r)[0].SocketPath = inbox
+			b.client = hub.New(b.cfg)
+			if err = drain(); !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			if n, e := b.client.Pending(""); n != 0 || e != nil || posts.Load() != 1 {
+				t.Fatal(n, e, posts.Load())
+			}
+			var f contract.NativeUserFrame
+			if err = json.Unmarshal(<-lines, &f); err != nil {
+				t.Fatal(err)
+			}
+			note, err := envelope.Parse(f.Message.Content)
+			word := "message"
+			if tc.reply {
+				word = "reply"
+				path, e := relay.Path(b.socketDir, "amesh-relay\n"+conn.Machine.ID, ep.ID)
+				if e != nil || note.From != envelope.Address(path) || note.FromSession != ep.ID {
+					t.Fatal("wrong reply relay")
+				}
+			} else if f.From != nil || note.From != "" {
+				t.Fatal("unexpected start relay")
+			}
+			if err != nil || note.Body != "amesh notice: your "+word+" to stan was not delivered: refusal detail No reply needed." || note.FromMode != "bypass" {
+				t.Fatal("wrong refusal notice", err)
+			}
+			if f.MsgID != (relay.NoticeSource{MachineID: conn.Machine.ID, Log: conn.Log, Source: req.ID, Kind: "outbox"}).ID() {
+				t.Fatal("wrong notice identity")
+			}
+		})
+	}
+}
+
+func TestAgentDeliveryAndEndpointClosure(t *testing.T) {
+	b, _ := fixture(t, map[string]http.HandlerFunc{})
+	e := streamRun{b: b}
+	item := contract.EventStreamItem{Event: "endpoint", Data: string(hubtest.Example(t, "eventEndpointSnapshot"))}
+	if err := e.handle(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	var ep contract.EndpointEvent
+	if err := json.Unmarshal([]byte(item.Data), &ep); err != nil {
+		t.Fatal(err)
+	}
+	bound, ok := b.endpoint(ep.ID)
+	if !ok || !b.relays.OwnsRelay(bound.from) {
+		t.Fatal("snapshot relay missing")
+	}
+	ep.State = "closed"
+	ep.Sessions = nil
+	data, _ := json.Marshal(ep)
+	item.Data = string(data)
+	if err := e.handle(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	if b.relays.OwnsRelay(bound.from) {
+		t.Fatal("closed relay still bound")
+	}
+	for _, reason := range []string{"route_failed", "not_member"} {
+		ev := contract.DeliveryEvent{State: "accepted", Reason: &reason}
+		raw, _ := json.Marshal(ev)
+		n, err := noticeEvent(contract.EventStreamItem{Event: "delivery", Data: string(raw)})
+		if err != nil || n.cause != "" {
+			t.Fatal("agent acceptance produced a notice", err)
+		}
 	}
 }

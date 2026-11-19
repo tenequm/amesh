@@ -2,10 +2,15 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
+
+	"github.com/tenequm/amesh/internal/registry"
+	"github.com/tenequm/amesh/internal/state"
 
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
@@ -19,12 +24,14 @@ type (
 		idle bool
 	}
 	pending struct {
-		e      *endpoint
-		key    subscription
-		d      Delivery
-		peer   peercred.Credentials
-		events chan Event
-		done   chan struct{}
+		e        *endpoint
+		key      subscription
+		d        Delivery
+		rewrites int
+		accepted bool
+		peer     peercred.Credentials
+		events   chan Event
+		done     chan struct{}
 	}
 )
 
@@ -106,7 +113,7 @@ func (e *endpoint) route(event Event) error {
 
 func (p *pending) report(event Event) {
 	event.Log, event.Session = p.d.Log, p.d.Session
-	if event.Action == "peer_message_status" && (p.d.notice || p.d.lane()) {
+	if event.Action == "peer_message_status" && (p.d.Notice || p.d.lane()) {
 		if event.Status != "accepted" {
 			slog.Info("local native delivery receipt", "id", p.d.ID, "status", event.Status, "drop_reason", event.DropReason)
 		}
@@ -127,8 +134,11 @@ func (p *pending) run(written time.Time) {
 	}
 	timer := time.NewTimer(time.Until(written.Add(window)))
 	defer timer.Stop()
-	held, accepted := false, false
-	rewrites := 0
+	held, accepted := false, p.accepted
+	if accepted {
+		timer.Reset(retention)
+	}
+	rewrites := p.rewrites
 	var processed []string
 	for {
 		select {
@@ -146,10 +156,17 @@ func (p *pending) run(written time.Time) {
 			if slices.Contains(processed, event.ID) {
 				continue
 			}
+			if !p.key.idle {
+				switch event.Status {
+				case "held", "delivered", "denied", "expired", "dropped":
+				default:
+					continue
+				}
+			}
 			if event.retryable(rewrites) {
 				processed = append(processed, event.ID)
 				rewrites++
-				retried, err := p.e.manager.rewrite(p.e.ctx, p.d, p.peer)
+				retried, err := p.rewrite(rewrites, accepted)
 				if err != nil {
 					if p.e.ctx.Err() == nil && !accepted {
 						event.DropReason = "session_gone"
@@ -163,7 +180,7 @@ func (p *pending) run(written time.Time) {
 				continue
 			}
 			if accepted {
-				if p.d.lane() || p.d.notice {
+				if p.d.lane() || p.d.Notice {
 					p.report(event)
 				}
 				if event.Status == "dropped" {
@@ -183,4 +200,80 @@ func (p *pending) run(written time.Time) {
 			return
 		}
 	}
+}
+
+type rewriteRecord struct {
+	Inbox    string        `json:"inbox"`
+	Content  string        `json:"content"`
+	PID      int           `json:"pid"`
+	UID      uint32        `json:"uid"`
+	Start    string        `json:"procStart"`
+	Rewrites int           `json:"rewrites"`
+	Accepted bool          `json:"accepted"`
+	Window   time.Duration `json:"acceptWindow"`
+	Ready    time.Time     `json:"ready"`
+}
+
+func (p *pending) rewrite(count int, accepted bool) (time.Time, error) {
+	start, err := registry.ProcessStart(p.peer.PID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	content, err := envelope.Render(p.d.Message)
+	if err != nil {
+		return time.Time{}, err
+	}
+	record := rewriteRecord{Inbox: p.d.Inbox, Content: content, PID: p.peer.PID, UID: p.peer.UID, Window: p.d.AcceptWindow, Start: start, Rewrites: count, Accepted: accepted, Ready: time.Now().Add(31 * time.Second)}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return time.Time{}, err
+	}
+	m := p.e.manager
+	if err = m.store.SetRewrite(p.d.ID, raw); err != nil {
+		return time.Time{}, err
+	}
+	return m.rewrite(p.e.ctx, p.d, p.peer)
+}
+
+// ResumeRewrites is started once under the daemon lock. Only confirmed drops retain their payload.
+func (m *Manager) ResumeRewrites(ctx context.Context, pending map[string]state.Entry, hosted func(context.Context, string, int, string) bool) {
+	var workers sync.WaitGroup
+	for id, entry := range pending {
+		workers.Go(func() {
+			var record rewriteRecord
+			if err := json.Unmarshal(entry.Pending, &record); err != nil {
+				slog.Error("invalid pending rewrite", "id", id)
+				return
+			}
+			if wait(ctx, time.Until(record.Ready)) != nil {
+				return
+			}
+			msg, err := envelope.Parse(record.Content)
+			if err != nil {
+				slog.Error("invalid pending rewrite envelope", "id", id)
+				return
+			}
+			d := Delivery{Inbox: record.Inbox, ID: id, Message: msg, Session: entry.Session, AcceptWindow: record.Window, Notice: entry.Kind == "notice"}
+			if d.Session != "" {
+				d.Log = m.store.Log()
+			}
+			if entry.Session != "" && !hosted(ctx, entry.Session, record.PID, record.Inbox) {
+				return
+			}
+			p := m.watch(d, false)
+			p.rewrites, p.accepted = record.Rewrites, record.Accepted || entry.Phase == state.Reported
+			written, err := m.post(ctx, d, true, func(peer peercred.Credentials) error {
+				start, lookupErr := registry.ProcessStart(peer.PID)
+				if lookupErr != nil || peer.PID != record.PID || peer.UID != record.UID || start != record.Start {
+					return errors.New("pending rewrite recipient changed")
+				}
+				return p.register(peer)
+			})
+			p.finish(written, err)
+			if err != nil && ctx.Err() == nil {
+				slog.Warn("pending inbox rewrite failed", "id", id, "error", err)
+			}
+		})
+	}
+	workers.Wait()
 }

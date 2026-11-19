@@ -118,3 +118,20 @@ func TestContractExamples(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenEnumValuesAndReasonUnion(t *testing.T) {
+	for _, reason := range []string{string(DropReasonRouteFailed), string(ErrorCodeNotMember), "future_reason", ""} {
+		var want *string
+		if reason != "" {
+			want = &reason
+		}
+		raw, err := json.Marshal(map[string]any{"state": "future_state", "reason": want})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var event DeliveryEvent
+		if err = json.Unmarshal(raw, &event); err != nil || event.State != "future_state" || !reflect.DeepEqual(event.Reason, want) {
+			t.Fatal(event, err)
+		}
+	}
+}

@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/tenequm/amesh/internal/config"
+	"github.com/tenequm/amesh/internal/contract"
+	"github.com/tenequm/amesh/internal/hub/hubtest"
 
 	"github.com/tenequm/amesh/internal/mcpserver"
 
@@ -53,7 +55,7 @@ func TestUpgradeArgumentsAndRefusals(t *testing.T) {
 	if w.Code != 403 {
 		t.Fatal(w.Code)
 	}
-	if !excluded("/tmp/amesh-identity/sub", []string{"/tmp/amesh-identity"}) || excluded("/tmp/amesh-identity-other", []string{"/tmp/amesh-identity"}) {
+	if !(registry.Session{CWD: "/tmp/amesh-identity/sub"}).MeshExcluded(nil, []string{"/tmp/amesh-identity"}) || (registry.Session{CWD: "/tmp/amesh-identity-other"}).MeshExcluded(nil, []string{"/tmp/amesh-identity"}) {
 		t.Fatal("directory boundary")
 	}
 	dir, key := liveEntry(t)
@@ -130,6 +132,11 @@ type humanBackend struct {
 	member registry.Key
 }
 
+func (b humanBackend) Status(s *contract.DaemonStatus) error {
+	s.Sessions = append(s.Sessions, contract.DaemonStatusSessionsItem{Key: sessionKey(b.member), Address: "amesh-a2@project:mac", Role: "member"})
+	return nil
+}
+
 func (b humanBackend) IsMember(key registry.Key) bool { return b.member == key }
 
 func (humanBackend) OwnsRelay(addr string) bool { return addr == "uds:/tmp/amesh-identity-relay.sock" }
@@ -184,6 +191,16 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 		t.Fatal(e)
 	}
 	call(fmt.Sprintf(`{"session_id":"claimed","hook_event_name":"UserPromptSubmit","prompt":"hello","prompt_id":"candidate","transcript_path":%q,"permission_mode":"bypassPermissions"}`, transcript), 202)
+	file, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteString(row); err != nil {
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
 	d.work.Wait()
 	if got := <-backend.human; got.SessionID != "id" || got.FromMode != "bypass" {
 		t.Fatal(got)
@@ -193,6 +210,10 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	call(`{"hook_event_name":"PreToolUse","session_id":"id","tool_name":"SendMessage","tool_input":{"to":"uds:/tmp/amesh-identity-relay.sock"}}`, 204)
 	if current, err := sessions.Resolve(t.Context(), key.PID); err != nil || current.FromMode != "prompting" {
 		t.Fatal("hook without bypass permission retained elevated class", current, err)
+	}
+	call(`{"hook_event_name":"PreToolUse","session_id":"id","tool_name":"SendMessage","agent_id":"sub","permission_mode":"bypassPermissions"}`, 204)
+	if current, err := sessions.Resolve(t.Context(), key.PID); err != nil || current.FromMode != "prompting" {
+		t.Fatal(current, err)
 	}
 	d.cfg.ClaudeConfigDirs = []string{dir + "/other", dir}
 	call(prompt("hello"), 204)
@@ -245,10 +266,10 @@ func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 	w := httptest.NewRecorder()
 	d.status(w, request(t, ""))
 	var got struct {
-		Dirs     []configDir    `json:"configDirs"`
-		Pipes    []pipeStatus   `json:"pipes"`
-		Members  []memberStatus `json:"sessions"`
-		Warnings []string       `json:"warnings"`
+		Dirs     []contract.DaemonStatusConfigDirsItem `json:"configDirs"`
+		Pipes    []pipeStatus                          `json:"pipes"`
+		Members  []contract.DaemonStatusSessionsItem   `json:"sessions"`
+		Warnings []string                              `json:"warnings"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
@@ -314,7 +335,7 @@ func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := daemon{ctx: t.Context(), registry: r, mesh: backend}
 		received := time.Now()
-		d.work.Go(func() { d.confirmTurn(s, h, received) })
+		d.scheduleTurn(s, h, received)
 		synctest.Wait()
 		if len(backend.human) != 0 {
 			t.Fatal("early report")
@@ -331,12 +352,38 @@ func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
 		if err := os.WriteFile(transcript, []byte(strings.Replace(line, `"kind":"human"`, `"kind":""`, 1)+line), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		d.confirmTurn(s, h, received)
+		start := time.Now()
+		d.scheduleTurn(s, h, received)
+		d.work.Wait()
+		if time.Since(start) != 30*time.Second {
+			t.Fatal("old row used or wrong check deadline", time.Since(start))
+		}
 		if len(backend.human) != 1 {
 			t.Fatal("used the origin of a later row")
 		}
+		h.PromptID = "p"
+		d.scheduleTurn(s, h, received)
+		synctest.Wait()
+		newer := h
+		newer.PromptID = "newer"
+		d.scheduleTurn(s, newer, received)
+		file, e := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0)
+		if e != nil {
+			t.Fatal(e)
+		}
+		_, e = file.WriteString(line)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = file.Close(); e != nil {
+			t.Fatal(e)
+		}
+		d.work.Wait()
+		if len(backend.human) != 1 {
+			t.Fatal("superseded transcript check reported a turn")
+		}
 		h.PromptID = "absent"
-		d.work.Go(func() { d.confirmTurn(s, h, received) })
+		d.scheduleTurn(s, h, received)
 		synctest.Wait()
 		if err := os.Remove(filepath.Join(dir, "sessions", strconv.Itoa(key.PID)+".json")); err != nil {
 			t.Fatal(err)
@@ -358,4 +405,14 @@ func TestReconnectedPipeReturnsRefusal(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestHumanHookTranscriptExample(t *testing.T) {
+	var h hookInput
+	if err := json.Unmarshal(hubtest.Example(t, "hookPromptHuman"), &h); err != nil {
+		t.Fatal(err)
+	}
+	if h.SessionID == nil || h.Transcript != "/Users/tenequm/.claude/projects/-Users-tenequm-pj-pond/"+*h.SessionID+".jsonl" {
+		t.Fatal("hook transcript path")
+	}
 }

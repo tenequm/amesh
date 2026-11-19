@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +26,7 @@ type member struct {
 	address       string
 	pipes         int
 	hosted, dirty bool
-	last          contract.SessionRegisterRequest
+	last          state.Registration
 }
 
 func sessionKey(k registry.Key) string {
@@ -36,19 +35,7 @@ func sessionKey(k registry.Key) string {
 }
 
 func (b *Backend) eligible(s registry.Session) bool {
-	if len(b.cfg.ClaudeConfigDirs) > 0 && s.ConfigDir != b.cfg.ClaudeConfigDirs[0] {
-		return false
-	}
-	cwd, _ := filepath.EvalSymlinks(s.CWD)
-	for _, root := range b.cfg.ExcludeRoots {
-		realRoot, _ := filepath.EvalSymlinks(root)
-		for _, pair := range [][2]string{{root, s.CWD}, {realRoot, cwd}} {
-			if pair[0] != "" && (pair[1] == pair[0] || strings.HasPrefix(pair[1], strings.TrimSuffix(pair[0], "/")+"/")) {
-				return false
-			}
-		}
-	}
-	return true
+	return !s.MeshExcluded(b.cfg.ClaudeConfigDirs, b.cfg.ExcludeRoots)
 }
 
 func (b *Backend) member(key string) (member, bool) {
@@ -61,7 +48,7 @@ func (b *Backend) member(key string) (member, bool) {
 func (b *Backend) IsMember(key registry.Key) bool { _, ok := b.member(sessionKey(key)); return ok }
 
 func (b *Backend) persist(key string, m member) error {
-	return b.store.PutMember(state.Member{Key: key, PID: m.session.PID, ProcStart: m.session.ProcStart, Address: m.address})
+	return b.store.PutMember(state.Member{Key: key, PID: m.session.PID, ProcStart: m.session.ProcStart, Address: m.address, Registration: m.last, ConfigDir: m.session.ConfigDir})
 }
 
 func (b *Backend) restore(ctx context.Context) error {
@@ -87,8 +74,9 @@ func (b *Backend) restore(ctx context.Context) error {
 		s, ok := byKey[key]
 		if !ok {
 			s.Key = key
+			s.ConfigDir = row.ConfigDir
 		}
-		b.members[row.Key] = member{session: s, address: row.Address, hosted: ok && b.eligible(s), dirty: true}
+		b.members[row.Key] = member{session: s, address: row.Address, last: row.Registration, hosted: ok && b.eligible(s)}
 	}
 	return nil
 }
@@ -171,6 +159,10 @@ func registration(s registry.Session) (contract.SessionRegisterRequest, error) {
 	return req, nil
 }
 
+func registeredFields(log string, req contract.SessionRegisterRequest) state.Registration {
+	return state.Registration{Log: log, SessionID: req.SessionID, Name: req.Name, NameSource: req.NameSource, Project: req.Project}
+}
+
 func (b *Backend) register(ctx context.Context, key string) error {
 	m, ok := b.member(key)
 	if !ok {
@@ -180,6 +172,7 @@ func (b *Backend) register(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
+	conn, _ := b.client.Connection()
 	resp, err := b.client.Register(ctx, key, req)
 	if err != nil {
 		return err
@@ -191,8 +184,8 @@ func (b *Backend) register(ctx context.Context, key string) error {
 	defer b.mu.Unlock()
 	current := b.members[key]
 	current.address = resp.Session.Address
-	current.last = req
-	current.dirty = current.session != m.session || current.pipes != m.pipes
+	current.last = registeredFields(conn.Log, req)
+	current.dirty = false
 	if err = b.persist(key, current); err != nil {
 		return err
 	}
@@ -200,7 +193,7 @@ func (b *Backend) register(ctx context.Context, key string) error {
 	return nil
 }
 
-func (b *Backend) end(ctx context.Context, key, reason string) error {
+func (b *Backend) end(ctx context.Context, key string, reason contract.SessionEndRequestReason) error {
 	n, err := b.client.Pending(key)
 	if err != nil || n > 0 {
 		return err
@@ -245,15 +238,15 @@ func (b *Backend) reconcile(ctx context.Context) error {
 		s, found := byKey[m.session.Key]
 		m.hosted = found && b.eligible(s) || !found && m.pipes > 0
 		if found {
-			m.dirty = m.dirty || m.session != s
+			changed = changed || status(m.session) != status(s)
 			m.session = s
 		}
 		b.members[key] = m
 		b.mu.Unlock()
 		if !m.hosted {
-			reason := "exited"
-			if found {
-				reason = "excluded"
+			reason := contract.SessionEndRequestReasonExited
+			if found || m.session.ConfigDir != "" && !b.eligible(m.session) {
+				reason = contract.SessionEndRequestReasonExcluded
 			}
 			if err = b.end(ctx, key, reason); err != nil {
 				return err
@@ -268,7 +261,7 @@ func (b *Backend) reconcile(ctx context.Context) error {
 		if readErr != nil {
 			return readErr
 		}
-		if m.dirty || req != m.last || b.presenceLog != conn.Log {
+		if m.dirty || registeredFields(conn.Log, req) != m.last {
 			if err = b.register(ctx, key); err != nil {
 				return err
 			}
@@ -319,4 +312,28 @@ func (b *Backend) runPresence(ctx context.Context) {
 		case <-b.wake:
 		}
 	}
+}
+
+func (b *Backend) Status(s *contract.DaemonStatus) error {
+	if err := b.client.Status(s); err != nil {
+		return err
+	}
+	open, err := b.store.OpenEntries("")
+	if err != nil {
+		return err
+	}
+	for _, e := range open {
+		if e.Phase == state.Written {
+			s.Open.Count++
+		}
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, key := range slices.Sorted(maps.Keys(b.members)) {
+		m := b.members[key]
+		if m.hosted {
+			s.Sessions = append(s.Sessions, contract.DaemonStatusSessionsItem{Key: key, Address: m.address, Status: contract.PeerStatus(status(m.session)), Role: "member"})
+		}
+	}
+	return nil
 }

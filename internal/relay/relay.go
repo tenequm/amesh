@@ -24,7 +24,7 @@ type (
 		// Hub deliveries carry the log ID and receiving session key for startup reports.
 		Log, Session   string
 		AcceptWindow   time.Duration
-		notice         bool
+		Notice         bool
 		Message        envelope.Message
 		NotifyWhenIdle bool
 		IdleFromMode   string // Receiver mode for the optional idle subscription.

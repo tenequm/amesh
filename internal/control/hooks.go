@@ -46,18 +46,20 @@ func (d *daemon) applyHook(w http.ResponseWriter, r *http.Request, s registry.Se
 	}
 	switch {
 	case h.Event == "PreToolUse" && h.Tool != nil:
-		d.registry.RecordPermissionMode(s.Key, h.Mode)
+		if h.Agent == nil {
+			d.registry.RecordPermissionMode(s.Key, h.Mode)
+		}
 		if h.Agent != nil && (strings.HasPrefix(*h.Tool, "mcp__amesh__") || (*h.Tool == "SendMessage" && d.relayTarget(h.Input.To))) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, denySubagent)
 			return
 		}
 	case h.Event == "UserPromptSubmit" && h.Prompt != nil:
-		d.registry.RecordPermissionMode(s.Key, h.Mode)
+		if h.Agent == nil {
+			d.registry.RecordPermissionMode(s.Key, h.Mode)
+		}
 		if humanPrompt(*h.Prompt) && !d.meshExcluded(s) && d.mesh.IsMember(s.Key) {
-			if h.Transcript != "" {
-				d.work.Go(func() { d.confirmTurn(s, h, received) })
-			}
+			d.scheduleTurn(s, h, received)
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}

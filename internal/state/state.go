@@ -28,17 +28,29 @@ const (
 	Reported Phase = "reported"
 )
 
+type Registration struct {
+	Log        string `json:"log,omitempty"`
+	SessionID  string `json:"sessionId,omitempty"`
+	Name       string `json:"name,omitempty"`
+	NameSource string `json:"nameSource,omitempty"`
+	Project    string `json:"project,omitempty"`
+}
+
 type Member struct {
-	Key       string `json:"key"`
-	PID       int    `json:"pid"`
-	ProcStart string `json:"procStart"`
-	Address   string `json:"address"`
+	Registration Registration `json:"registration,omitzero"`
+	ConfigDir    string       `json:"configDir,omitempty"`
+	Key          string       `json:"key"`
+	PID          int          `json:"pid"`
+	ProcStart    string       `json:"procStart"`
+	Address      string       `json:"address"`
 }
 
 type Entry struct {
-	Session string `json:"session,omitempty"`
-	Phase   Phase  `json:"phase"`
-	Expires int64  `json:"expires"`
+	Kind    string          `json:"kind,omitempty"`
+	Pending json.RawMessage `json:"rewrite,omitempty"`
+	Session string          `json:"session,omitempty"`
+	Phase   Phase           `json:"phase"`
+	Expires int64           `json:"expires"`
 }
 
 type snapshot struct {
@@ -89,6 +101,25 @@ func (s *Store) Lock() error {
 		return errors.Join(err, file.Close(), root.Close())
 	}
 	s.root, s.lock, s.data = root, file, next
+	changed := false
+	for id, e := range next.IDs {
+		if e.Kind == "" {
+			// A1 omitted the kind. Its sessionless claims are dedup-only and its notice IDs used a different namespace input.
+			e.Kind = "message"
+			next.IDs[id] = e
+			changed = true
+		}
+		if e.Kind == "notice" && e.Phase == Writing && e.Pending == nil {
+			delete(next.IDs, id)
+			changed = true
+		}
+	}
+	if changed {
+		if err := s.persist(next); err != nil {
+			s.root, s.lock, s.data = nil, nil, snapshot{}
+			return errors.Join(err, file.Close(), root.Close())
+		}
+	}
 	return nil
 }
 
@@ -159,12 +190,11 @@ func (s *Store) SetLog(log string) error {
 	}
 	next := s.data
 	next.Log = log
-	next.IDs = make(map[string]Entry)
 	return s.persist(next)
 }
 
 func (s *Store) Claim(id string, expiresAt time.Time) (bool, error) {
-	return s.BeginWrite("", id, "", expiresAt, false)
+	return s.BeginWrite("", id, "", expiresAt, "message")
 }
 
 func (s *Store) Contains(log, id string) (bool, error) {
@@ -177,8 +207,7 @@ func (s *Store) Contains(log, id string) (bool, error) {
 	return ok && entry.Expires > time.Now().UnixNano(), nil
 }
 
-// BeginWrite atomically replaces a confirmed drop's claim on retry. A final report survives the rewrite.
-func (s *Store) BeginWrite(log, id, session string, expiresAt time.Time, retry bool) (bool, error) {
+func (s *Store) BeginWrite(log, id, session string, expiresAt time.Time, kind string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.check(log); err != nil {
@@ -190,23 +219,19 @@ func (s *Store) BeginWrite(log, id, session string, expiresAt time.Time, retry b
 	}
 	prior, exists := s.data.IDs[id]
 	exists = exists && prior.Expires > now.UnixNano()
-	if exists && !retry {
-		return false, nil
+	if kind != "message" && kind != "notice" {
+		return false, errors.New("invalid entry kind")
 	}
-	if retry && (!exists || prior.Session != session) {
-		return false, errors.New("retry has no matching claim")
+	if exists {
+		return false, nil
 	}
 	next := s.data
 	next.IDs = maps.Clone(next.IDs)
 	maps.DeleteFunc(next.IDs, func(_ string, entry Entry) bool { return entry.Expires <= now.UnixNano() })
-	if !exists && len(next.IDs) >= maxClaims {
+	if len(next.IDs) >= maxClaims {
 		return false, errors.New("delivered-id record full")
 	}
-	phase := Writing
-	if retry && prior.Phase == Reported {
-		phase = Reported
-	}
-	next.IDs[id] = Entry{Session: session, Phase: phase, Expires: expiresAt.UnixNano()}
+	next.IDs[id] = Entry{Kind: kind, Session: session, Phase: Writing, Expires: expiresAt.UnixNano()}
 	if err := s.persist(next); err != nil {
 		return false, err
 	}
@@ -228,10 +253,14 @@ func (s *Store) mark(log, id string, phase Phase) error {
 	if !ok {
 		return errors.New("missing delivered-id entry")
 	}
-	if entry.Phase == Reported || entry.Phase == phase {
+	if phase == Written && entry.Pending != nil {
+		entry.Pending = nil
+	} else if entry.Phase == Reported || entry.Phase == phase {
 		return nil
 	}
-	entry.Phase = phase
+	if entry.Phase != Reported {
+		entry.Phase = phase
+	}
 	next := s.data
 	next.IDs = maps.Clone(next.IDs)
 	next.IDs[id] = entry
@@ -248,11 +277,53 @@ func (s *Store) OpenEntries(log string) (map[string]Entry, error) {
 	entries := make(map[string]Entry)
 	now := time.Now().UnixNano()
 	for id, entry := range s.data.IDs {
-		if entry.Session != "" && entry.Phase != Reported && entry.Expires > now {
+		if entry.Kind != "notice" && entry.Pending == nil && entry.Session != "" && entry.Phase != Reported && entry.Expires > now {
 			entries[id] = entry
 		}
 	}
 	return entries, nil
+}
+
+func (s *Store) SetRewrite(id string, payload json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.check(""); err != nil {
+		return err
+	}
+	entry, ok := s.data.IDs[id]
+	if !ok {
+		return errors.New("missing rewrite claim")
+	}
+	entry.Pending = payload
+	next := s.data
+	next.IDs = maps.Clone(next.IDs)
+	next.IDs[id] = entry
+	return s.persist(next)
+}
+
+func (s *Store) PendingRewrites() map[string]Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]Entry)
+	for id, e := range s.data.IDs {
+		if e.Pending != nil && e.Expires > time.Now().UnixNano() {
+			out[id] = e
+		}
+	}
+	return out
+}
+
+func (s *Store) NoticeWritten(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.data.IDs[id]
+	return e.Kind == "notice" && e.Phase == Written && e.Expires > time.Now().UnixNano()
+}
+
+func (s *Store) Log() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data.Log
 }
 
 func (s *Store) Forget(id string) error { return s.ForgetWrite("", id) }
