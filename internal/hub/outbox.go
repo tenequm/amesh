@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,7 +37,8 @@ func (c *Client) statePath(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(c.cfg.StateDir, id.id, name), nil
+	baseHash := sha256.Sum256([]byte(c.cfg.HubURL))
+	return filepath.Join(c.cfg.StateDir, id.id, encoding.EncodeToString(baseHash[:16]), name), nil
 }
 
 func (c *Client) readQueue() ([]entry, error) {
@@ -241,14 +243,35 @@ func (c *Client) RunOutbox(ctx context.Context, completed func(SendOutcome)) err
 		if err != nil {
 			return err
 		}
-		if len(q) == 0 || conn.Epoch == 0 {
+		var remaining time.Duration
+		if len(q) > 0 {
+			remaining = time.Duration(conn.Limits.QueueTTLMs)*time.Millisecond - time.Since(time.UnixMilli(q[0].At))
+		}
+		if len(q) == 0 || conn.Epoch == 0 && remaining > 0 {
+			var expiry <-chan time.Time
+			var timer *time.Timer
+			if len(q) > 0 {
+				timer = time.NewTimer(remaining)
+				expiry = timer.C
+			}
 			select {
 			case <-ctx.Done():
+				if timer != nil {
+					timer.Stop()
+				}
 				return ctx.Err()
 			case <-c.stopped:
+				if timer != nil {
+					timer.Stop()
+				}
 				_, err = c.Connection()
 				return err
 			case <-c.wake:
+				if timer != nil {
+					timer.Stop()
+				}
+				continue
+			case <-expiry:
 				continue
 			}
 		}
@@ -256,12 +279,13 @@ func (c *Client) RunOutbox(ctx context.Context, completed func(SendOutcome)) err
 		req := head.Request
 		req.Epoch = conn.Epoch
 		out := SendOutcome{Request: req}
-		if time.Since(time.UnixMilli(head.At)) >= time.Duration(conn.Limits.QueueTTLMs)*time.Millisecond {
+		if remaining <= 0 {
 			out.Err = &HTTPError{Status: 410, Body: contract.ErrorBody{Error: "queue_expired", Message: "Message expired in the local outbox."}}
 		} else {
 			c.helloMu.RLock()
 			current, _ := c.Connection()
 			req.Epoch = current.Epoch
+			out.Request.Epoch = req.Epoch
 			out.Response, out.Err = rpc[contract.SendResponse](ctx, c, http.MethodPost, "/messages", req)
 			c.helloMu.RUnlock()
 			if out.Err == nil && out.Response.Message.ID != req.ID {
@@ -276,7 +300,7 @@ func (c *Client) RunOutbox(ctx context.Context, completed func(SendOutcome)) err
 			if delay == 0 {
 				delay = time.Duration(conn.Settings.BackoffInitialMs) * time.Millisecond
 			}
-			if err = c.pause(ctx, retryDelay(out.Err, delay)); err != nil {
+			if err = c.pause(ctx, min(remaining, retryDelay(out.Err, delay))); err != nil {
 				return err
 			}
 			delay = min(2*delay, time.Duration(conn.Settings.BackoffMaxMs)*time.Millisecond)

@@ -230,3 +230,67 @@ func TestOutboxRestartAndRetry(t *testing.T) {
 	checkSignature(t, c, a)
 	checkSignature(t, c, b)
 }
+
+func TestSettingsAndAuthenticationRecovery(t *testing.T) {
+	for _, mutation := range []string{"missing", "type", "bounds", "zero"} {
+		t.Run(mutation, func(t *testing.T) {
+			body := example[map[string]any](t, "helloResponse")
+			settings := body["settings"].(map[string]any)
+			settings["heartbeatMs"] = 6000
+			switch mutation {
+			case "missing":
+				delete(settings, "sendWaitMs")
+			case "type":
+				settings["heartbeatMs"] = "bad"
+			case "bounds":
+				settings["requestTimeoutMs"] = -1
+			case "zero":
+				settings["sendWaitMs"] = 0
+			}
+			reply := func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(body) }
+			s := hubtest.Script(t, hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "errStaleTimestamp")}, hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: reply})
+			c := enrolled(t, s.URL)
+			resp, err := c.Hello(t.Context(), contract.HelloRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mutation == "zero" {
+				if resp.Settings.SendWaitMs != 0 || resp.Settings.HeartbeatMs != 6000 {
+					t.Fatal("valid settings lost")
+				}
+			} else if resp.Settings != contract.DefaultSettings() {
+				t.Fatal("incomplete settings fallback")
+			}
+			calls := s.Calls()
+			checkSignature(t, c, calls[1])
+			server := example[contract.ErrorBody](t, "errStaleTimestamp")
+			if !strings.Contains(calls[1].Header.Get("Authorization"), ",t="+strconv.FormatInt(*server.ServerTime/1000, 10)+",") {
+				t.Fatal("clock correction missing")
+			}
+		})
+	}
+}
+
+func TestOutboxExpiryWithoutHello(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := enrolled(t, "http://amesh-hub.test")
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		outcomes := make(chan SendOutcome, 1)
+		done := make(chan error, 1)
+		go func() { done <- c.RunOutbox(ctx, func(out SendOutcome) { outcomes <- out; cancel() }) }()
+		req := example[contract.SendRequest](t, "sendStartRequest")
+		if _, err := c.Send(ctx, req); !errors.Is(err, ErrQueued) {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		out := <-outcomes
+		h, ok := errors.AsType[*HTTPError](out.Err)
+		if !ok || h.Body.Error != "queue_expired" || time.Since(start) != 24*time.Hour-5*time.Second {
+			t.Fatal("offline expiry failed")
+		}
+		if !errors.Is(<-done, context.Canceled) {
+			t.Fatal("uploader did not stop")
+		}
+	})
+}

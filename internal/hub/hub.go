@@ -9,9 +9,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,12 +37,15 @@ type Client struct {
 	draining chan struct{}
 	wake     chan struct{}
 	waiters  map[string][]chan SendOutcome
-	cursor   int64
+	progress
+	streamRunning bool
 }
 
-func New(cfg config.Config) *Client {
+func New(cfg config.Config) *Client { return NewWithTransport(cfg, nil) }
+
+func NewWithTransport(cfg config.Config, transport http.RoundTripper) *Client {
 	return &Client{
-		cfg: cfg, http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		cfg: cfg, http: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		key:     sync.OnceValues(func() (identity, error) { return loadKey(filepath.Join(cfg.StateDir, "machine.key")) }),
 		current: contract.HelloResponse{Settings: contract.DefaultSettings(), Limits: contract.Limits{MaxTextBytes: 32768, QueueTTLMs: 86400000}},
 		stopped: make(chan struct{}), draining: make(chan struct{}, 1), wake: make(chan struct{}, 1), waiters: make(map[string][]chan SendOutcome),
@@ -64,7 +69,7 @@ func (e *HTTPError) Error() string {
 }
 
 func (e *HTTPError) transient() bool {
-	return e.Status >= 500 || e.Status == 429 || e.Status == 408 || e.Body.Error == "machine_in_use" || e.Body.Error == "stale_timestamp"
+	return e.Status >= 500 || e.Status == 429 || e.Status == 408 || (e.Status == 409 && e.Body.Error == "machine_in_use") || (e.Status == 401 && e.Body.Error == "stale_timestamp")
 }
 
 func (c *Client) stop(err error) error {
@@ -85,6 +90,9 @@ func (c *Client) open(ctx context.Context, method, route string, body []byte, me
 		req, err := http.NewRequestWithContext(ctx, method, c.cfg.HubURL+route, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
+		}
+		if !strings.HasPrefix(req.URL.Path, "/peer/") || req.URL.Path != path.Clean(req.URL.Path) || req.URL.RawPath != "" || req.URL.User != nil {
+			return nil, errors.New("invalid peer API target")
 		}
 		req.Header.Set("Accept", media)
 		req.Header.Set("Accept-Encoding", "identity")
@@ -118,20 +126,22 @@ func (c *Client) open(ctx context.Context, method, route string, body []byte, me
 		if seconds, parseErr := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 32); parseErr == nil && seconds > 0 {
 			e.RetryAfter = time.Duration(seconds) * time.Second
 		}
-		switch e.Body.Error {
-		case "bad_signature", "replayed":
+		switch {
+		case e.Status < 400:
+			return nil, c.stop(e)
+		case e.Status == 401 && (e.Body.Error == "bad_signature" || e.Body.Error == "replayed"):
 			if attempt == 0 {
 				continue
 			}
 			return nil, c.stop(e)
-		case "stale_timestamp":
+		case e.Status == 401 && e.Body.Error == "stale_timestamp":
 			if attempt == 0 && e.Body.ServerTime != nil {
 				c.mu.Lock()
 				c.offset = time.Until(time.UnixMilli(*e.Body.ServerTime))
 				c.mu.Unlock()
 				continue
 			}
-		case "unknown_machine", "machine_revoked", "superseded", "upgrade_required", "protocol":
+		case e.Status == 401 && e.Body.Error == "unknown_machine", e.Status == 403 && e.Body.Error == "machine_revoked", e.Status == 409 && e.Body.Error == "superseded", e.Status == 426:
 			return nil, c.stop(e)
 		}
 		return nil, e
@@ -170,6 +180,9 @@ func (c *Client) Info(ctx context.Context) (contract.HelloInfo, error) {
 func (c *Client) Hello(ctx context.Context, req contract.HelloRequest) (contract.HelloResponse, error) {
 	c.helloMu.Lock()
 	defer c.helloMu.Unlock()
+	if err := c.loadCursor(); err != nil {
+		return contract.HelloResponse{}, c.stop(err)
+	}
 	c.mu.Lock()
 	req.Takeover = !c.started
 	req.ResumeEpoch = nil
@@ -218,7 +231,26 @@ func sessionRPC[T any](ctx context.Context, c *Client, method, key, suffix strin
 }
 
 func (c *Client) Peers(ctx context.Context) (contract.PeersResponse, error) {
-	return rpc[contract.PeersResponse](ctx, c, http.MethodGet, "/peers", nil)
+	return c.PeersFiltered(ctx, "", "")
+}
+
+var projectLabel = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,39}$`)
+
+func (c *Client) PeersFiltered(ctx context.Context, project, machine string) (contract.PeersResponse, error) {
+	route := "/peers"
+	if project != "" {
+		if !projectLabel.MatchString(project) {
+			return contract.PeersResponse{}, errors.New("invalid peer project filter")
+		}
+		route += "?project=" + project
+	}
+	if machine != "" {
+		if project == "" || !machineName.MatchString(machine) {
+			return contract.PeersResponse{}, errors.New("invalid peer machine filter")
+		}
+		route += "&machine=" + machine
+	}
+	return rpc[contract.PeersResponse](ctx, c, http.MethodGet, route, nil)
 }
 
 func retryWrite[T any](ctx context.Context, c *Client, send func(epoch int64) (T, error)) (T, error) {
@@ -297,8 +329,3 @@ func (c *Client) Report(ctx context.Context, req contract.ReportsRequest) (contr
 		return rpc[contract.ReportsResponse](ctx, c, http.MethodPost, "/reports", req)
 	})
 }
-
-func (*Client) Stream(ctx context.Context, handle func(context.Context, contract.EventStreamItem) error) error {
-	return errors.ErrUnsupported
-}
-func (*Client) Ack(ctx context.Context, seq int64) error { return errors.ErrUnsupported }

@@ -133,8 +133,20 @@ type Recorder struct {
 // Script consumes steps in order and checks for unused steps at cleanup.
 func Script(tb testing.TB, steps ...Step) *Recorder {
 	tb.Helper()
+	return script(tb, steps, httptest.NewServer)
+}
+
+// MemoryScript uses an in-memory HTTP connection for synctest. Pass its Client().Transport
+// to hub.NewWithTransport. The base URL can be any HTTP URL inside the test.
+func MemoryScript(tb testing.TB, steps ...Step) *Recorder {
+	tb.Helper()
+	return script(tb, steps, func(h http.Handler) *httptest.Server { return httptest.NewTestServer(tb, h) })
+}
+
+func script(tb testing.TB, steps []Step, server func(http.Handler) *httptest.Server) *Recorder {
+	tb.Helper()
 	r := new(Recorder)
-	r.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	r.Server = server(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, 256<<10))
 		if err != nil {
 			tb.Errorf("reading request: %v", err)
