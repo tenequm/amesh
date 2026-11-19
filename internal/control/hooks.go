@@ -5,14 +5,15 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tenequm/amesh/internal/registry"
 )
 
 type hookInput struct {
-	Mode       *string `json:"permission_mode"`
-	Transcript string  `json:"transcript_path"`
-	PromptID   string  `json:"prompt_id"`
+	Mode       string `json:"permission_mode"`
+	Transcript string `json:"transcript_path"`
+	PromptID   string `json:"prompt_id"`
 	Input      struct {
 		To json.RawMessage `json:"to"`
 	} `json:"tool_input"`
@@ -36,26 +37,26 @@ func (d *daemon) hook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *daemon) applyHook(w http.ResponseWriter, r *http.Request, s registry.Session) {
+	received := time.Now().Truncate(time.Millisecond)
 	var h hookInput
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
 	if err != nil || json.Unmarshal(b, &h) != nil || h.SessionID == nil {
 		reject(w, 400, "bad_request", "Invalid hook input.")
 		return
 	}
-	if h.Mode != nil {
-		d.registry.RecordPermissionMode(s.Key, *h.Mode)
-	}
 	switch {
 	case h.Event == "PreToolUse" && h.Tool != nil:
+		d.registry.RecordPermissionMode(s.Key, h.Mode)
 		if h.Agent != nil && (strings.HasPrefix(*h.Tool, "mcp__amesh__") || (*h.Tool == "SendMessage" && d.relayTarget(h.Input.To))) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, denySubagent)
 			return
 		}
 	case h.Event == "UserPromptSubmit" && h.Prompt != nil:
-		if humanPrompt(*h.Prompt) && !d.meshExcluded(s) && d.meshMember(s.Key) {
+		d.registry.RecordPermissionMode(s.Key, h.Mode)
+		if humanPrompt(*h.Prompt) && !d.meshExcluded(s) && d.mesh.IsMember(s.Key) {
 			if h.Transcript != "" {
-				d.work.Go(func() { d.confirmTurn(s, h) })
+				d.work.Go(func() { d.confirmTurn(s, h, received) })
 			}
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -69,17 +70,6 @@ func (d *daemon) applyHook(w http.ResponseWriter, r *http.Request, s registry.Se
 
 func humanPrompt(prompt string) bool {
 	return !strings.HasPrefix(prompt, "<cross-session-message") && !strings.HasPrefix(prompt, "<agent-message") && !strings.HasPrefix(prompt, "<task-notification>")
-}
-
-func (d *daemon) meshMember(key registry.Key) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	for reg := range d.pipes {
-		if reg.parent == "" && reg.key == key {
-			return true
-		}
-	}
-	return false
 }
 
 func (d *daemon) relayTarget(raw json.RawMessage) bool {

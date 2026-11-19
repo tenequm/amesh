@@ -56,6 +56,16 @@ func TestUpgradeArgumentsAndRefusals(t *testing.T) {
 	if !excluded("/tmp/amesh-identity/sub", []string{"/tmp/amesh-identity"}) || excluded("/tmp/amesh-identity-other", []string{"/tmp/amesh-identity"}) {
 		t.Fatal("directory boundary")
 	}
+	dir, key := liveEntry(t)
+	d.cfg.ClaudeConfigDirs = []string{filepath.Join(dir, "primary"), dir}
+	d.registry = registry.New(d.cfg.ClaudeConfigDirs)
+	r := request(t, "")
+	w = httptest.NewRecorder()
+	d.upgrade(w, r.WithContext(context.WithValue(r.Context(), peerPID{}, key.PID)))
+	var refusal localError
+	if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != http.StatusForbidden || refusal.Code != "excluded" {
+		t.Fatal(w.Code, refusal, err)
+	}
 }
 
 func TestReconnectBudget(t *testing.T) {
@@ -116,8 +126,11 @@ func TestPipeForwardsArgvAndBytes(t *testing.T) {
 
 type humanBackend struct {
 	mcpserver.MeshBackend
-	human chan registry.Session
+	human  chan registry.Session
+	member registry.Key
 }
+
+func (b humanBackend) IsMember(key registry.Key) bool { return b.member == key }
 
 func (humanBackend) OwnsRelay(addr string) bool { return addr == "uds:/tmp/amesh-identity-relay.sock" }
 
@@ -133,9 +146,11 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := humanBackend{human: make(chan registry.Session, 1)}
-	reg := &registration{key: s.Key}
-	d := daemon{ctx: t.Context(), mesh: backend, ownsRelay: backend.OwnsRelay, registry: sessions, pipes: map[*registration]struct{}{reg: {}}}
+	backend := humanBackend{human: make(chan registry.Session, 1), member: key}
+	d := daemon{ctx: t.Context(), mesh: &backend, ownsRelay: backend.OwnsRelay, registry: sessions}
+	if s.FromMode != "" {
+		t.Fatal("classified before first hook")
+	}
 	call := func(input string, code int) {
 		t.Helper()
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/amesh/hooks", strings.NewReader(input))
@@ -175,12 +190,17 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	}
 	call(`{"hook_event_name":"PreToolUse","session_id":"id","tool_name":"SendMessage","agent_id":"sub","tool_input":{"to":"uds:/tmp/amesh-identity-relay.sock"}}`, 200)
 	call(`{"hook_event_name":"PreToolUse","session_id":"id","tool_name":"SendMessage","agent_id":"sub","tool_input":{"to":"uds:/tmp/amesh-identity-other.sock"}}`, 204)
+	call(`{"hook_event_name":"PreToolUse","session_id":"id","tool_name":"SendMessage","tool_input":{"to":"uds:/tmp/amesh-identity-relay.sock"}}`, 204)
+	if current, err := sessions.Resolve(t.Context(), key.PID); err != nil || current.FromMode != "prompting" {
+		t.Fatal("hook without bypass permission retained elevated class", current, err)
+	}
 	d.cfg.ClaudeConfigDirs = []string{dir + "/other", dir}
 	call(prompt("hello"), 204)
 	d.cfg.ClaudeConfigDirs = []string{dir}
-	reg.parent = "parent"
+	backend.member = registry.Key{}
+	d.pipes = map[*registration]struct{}{{key: key, parent: "parent"}: {}}
 	call(prompt("hello"), 204)
-	delete(d.pipes, reg)
+	clear(d.pipes)
 	call(prompt("hello"), 204)
 	call("{}", 400)
 }
@@ -210,7 +230,7 @@ func liveEntry(t *testing.T) (string, registry.Key) {
 	if err := os.Mkdir(filepath.Join(dir, "sessions"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	entry := map[string]any{"pid": pid, "procStart": start, "sessionId": "id", "name": "amesh-identity", "cwd": dir, "messagingSocketPath": "/tmp/amesh-identity.sock", "peerProtocol": 1, "status": "idle"}
+	entry := map[string]any{"pid": pid, "procStart": start, "sessionId": "id", "name": "amesh-identity", "cwd": dir, "messagingSocketPath": "/tmp/amesh-identity.sock", "peerProtocol": 1, "status": "idle", "version": "2.1.330"}
 	b, _ := json.Marshal(entry)
 	if err := os.WriteFile(filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
 		t.Fatal(err)
@@ -221,19 +241,28 @@ func liveEntry(t *testing.T) (string, registry.Key) {
 func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 	dir, key := liveEntry(t)
 	dirs := []string{dir, filepath.Join(dir, "empty")}
-	d := daemon{registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs, MachineName: "mac"}, started: time.Now(), pipes: map[*registration]struct{}{{key: key}: {}, {key: key, parent: "parent"}: {}}}
+	d := daemon{mesh: humanBackend{member: key}, registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs, MachineName: "mac"}, started: time.Now(), pipes: map[*registration]struct{}{{key: key}: {}, {key: key, parent: "parent"}: {}}}
 	w := httptest.NewRecorder()
 	d.status(w, request(t, ""))
 	var got struct {
-		Dirs    []configDir    `json:"configDirs"`
-		Pipes   []pipeStatus   `json:"pipes"`
-		Members []memberStatus `json:"sessions"`
+		Dirs     []configDir    `json:"configDirs"`
+		Pipes    []pipeStatus   `json:"pipes"`
+		Members  []memberStatus `json:"sessions"`
+		Warnings []string       `json:"warnings"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
 	if len(got.Dirs) != 2 || got.Dirs[0].Sessions != 1 || got.Dirs[1].Sessions != 0 || len(got.Pipes) != 2 || got.Pipes[1].Parent != "parent" || len(got.Members) != 1 {
 		t.Fatal(got)
+	}
+	clear(d.pipes)
+	got.Warnings = nil
+	got.Members = nil
+	w = httptest.NewRecorder()
+	d.status(w, request(t, ""))
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || len(got.Pipes) != 0 || len(got.Members) != 1 || len(got.Warnings) != 1 || !strings.Contains(got.Warnings[0], "2.1.330") {
+		t.Fatal(got, err)
 	}
 }
 
@@ -256,14 +285,14 @@ func TestTranscriptRequiresMatchingCompleteRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	n, kind, err := scanTranscript(root, filepath.Base(file), 0, "id", h, time.Now())
-	if err != nil || n != int64(len(old)) || kind != "" {
+	if err != nil || n != int64(len(old)) || kind != nil {
 		t.Fatal(n, kind, err)
 	}
 	if err = os.WriteFile(file, []byte(old+target+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, kind, err = scanTranscript(root, filepath.Base(file), n, "id", h, time.Now())
-	if err != nil || kind != "peer" {
+	if err != nil || kind == nil || kind.Kind != "peer" {
 		t.Fatal(kind, err)
 	}
 }
@@ -275,7 +304,7 @@ func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := humanBackend{human: make(chan registry.Session, 1)}
+	backend := humanBackend{human: make(chan registry.Session, 2), member: key}
 	transcript := filepath.Join(dir, "projects", "amesh-identity", "id.jsonl")
 	if err = os.MkdirAll(filepath.Dir(transcript), 0o700); err != nil {
 		t.Fatal(err)
@@ -283,8 +312,9 @@ func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
 	text := "queued"
 	h := hookInput{Prompt: &text, PromptID: "p", Transcript: transcript}
 	synctest.Test(t, func(t *testing.T) {
-		d := daemon{ctx: t.Context(), registry: r, mesh: backend, pipes: map[*registration]struct{}{{key: key}: {}}}
-		d.work.Go(func() { d.confirmTurn(s, h) })
+		d := daemon{ctx: t.Context(), registry: r, mesh: backend}
+		received := time.Now()
+		d.work.Go(func() { d.confirmTurn(s, h, received) })
 		synctest.Wait()
 		if len(backend.human) != 0 {
 			t.Fatal("early report")
@@ -297,8 +327,16 @@ func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
 		if len(backend.human) != 1 {
 			t.Fatal("missing report")
 		}
+		// An unattributed matching row ends this candidate, even if the text is repeated later.
+		if err := os.WriteFile(transcript, []byte(strings.Replace(line, `"kind":"human"`, `"kind":""`, 1)+line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		d.confirmTurn(s, h, received)
+		if len(backend.human) != 1 {
+			t.Fatal("used the origin of a later row")
+		}
 		h.PromptID = "absent"
-		d.work.Go(func() { d.confirmTurn(s, h) })
+		d.work.Go(func() { d.confirmTurn(s, h, received) })
 		synctest.Wait()
 		if err := os.Remove(filepath.Join(dir, "sessions", strconv.Itoa(key.PID)+".json")); err != nil {
 			t.Fatal(err)

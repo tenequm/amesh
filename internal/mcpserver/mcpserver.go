@@ -20,6 +20,8 @@ type LaneBackend interface {
 
 type MeshBackend interface {
 	Connect(ctx context.Context, session registry.Session) (io.Closer, error)
+	// IsMember includes restored sessions whose pipes have not reconnected.
+	IsMember(key registry.Key) bool
 	HumanTurn(ctx context.Context, session registry.Session) error
 	ListPeers(ctx context.Context, session registry.Session, filter string) (Directory, error)
 	SendMessage(ctx context.Context, session registry.Session, args SendArgs) (SendResult, error)

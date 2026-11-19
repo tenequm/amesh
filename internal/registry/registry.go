@@ -56,7 +56,7 @@ func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {
 	return Session{}, fmt.Errorf("no live Claude session for caller: %w", os.ErrNotExist)
 }
 
-var errStaleProcess = errors.New("registry procStart differs from live process")
+var errStaleProcess = errors.New("registry identity differs from live process")
 
 func read(dir string, pid int, start string) (Session, error) {
 	path := filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json")
@@ -78,10 +78,10 @@ func read(dir string, pid int, start string) (Session, error) {
 	if err := json.Unmarshal(b, &entry); err != nil {
 		return Session{}, fmt.Errorf("session registry %s: %w", path, err)
 	}
-	if entry.PID != pid || entry.ProcStart == "" {
+	if entry.PID <= 0 || entry.ProcStart == "" {
 		return Session{}, fmt.Errorf("session registry %s: invalid pid or procStart", path)
 	}
-	if entry.ProcStart != start {
+	if entry.PID != pid || entry.ProcStart != start {
 		return Session{}, errStaleProcess
 	}
 	for _, field := range []struct{ name, value string }{

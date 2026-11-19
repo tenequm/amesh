@@ -143,4 +143,11 @@ func TestStoredKeyLivenessAndMode(t *testing.T) {
 	if s, err := r.List(t.Context()); err != nil || s[0].FromMode != "prompting" {
 		t.Fatal(s, err)
 	}
+	fixture(t, dir, 13, "start", "other", "other")
+	if err := os.Rename(filepath.Join(dir, "sessions", "13.json"), filepath.Join(dir, "sessions", "12.json")); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := r.Live(t.Context(), key); ok || err != nil {
+		t.Fatalf("stored entry with a different PID: live=%t err=%v", ok, err)
+	}
 }

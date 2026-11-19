@@ -57,27 +57,34 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	pipes := []pipeStatus{}
 	members := []memberStatus{}
 	warnings := map[string]bool{}
-	seen := map[registry.Key]bool{}
+	lanePipes := map[registry.Key]bool{}
 	d.mu.Lock()
 	for reg := range d.pipes {
 		s := byKey[reg.key]
-		digest := sha256.Sum256([]byte(reg.key.ProcStart))
-		key := fmt.Sprintf("%d-%x", reg.key.PID, digest[:4])
-		if s.Version != "" && !slices.Contains(verifiedNativeVersions, s.Version) {
-			warnings[fmt.Sprintf("%s runs Claude Code %s without a recorded native delivery check.", s.Name, s.Version)] = true
+		pipes = append(pipes, pipeStatus{sessionKey(reg.key), s.Name, s.SessionID, s.ConfigDir, reg.parent})
+		if reg.parent != "" {
+			lanePipes[reg.key] = true
 		}
-		pipes = append(pipes, pipeStatus{key, s.Name, s.SessionID, s.ConfigDir, reg.parent})
-		if reg.parent != "" || seen[reg.key] || s.Key != reg.key {
+	}
+	d.mu.Unlock()
+	for key, s := range byKey {
+		member := d.mesh.IsMember(key)
+		if !member && !lanePipes[key] {
 			continue
 		}
-		seen[reg.key] = true
 		address := s.Name + "@" + s.Project
 		if d.cfg.MachineName != "" {
 			address += ":" + d.cfg.MachineName
 		}
-		members = append(members, memberStatus{key, address, s.Status, "member"})
+		if s.Version == "" {
+			warnings[fmt.Sprintf("%s has no recorded Claude Code version for the native delivery check.", address)] = true
+		} else if !slices.Contains(verifiedNativeVersions, s.Version) {
+			warnings[fmt.Sprintf("%s runs Claude Code %s without a recorded native delivery check.", address, s.Version)] = true
+		}
+		if member {
+			members = append(members, memberStatus{sessionKey(key), address, s.Status, "member"})
+		}
 	}
-	d.mu.Unlock()
 	slices.SortFunc(pipes, func(a, b pipeStatus) int {
 		if a.Key == b.Key {
 			return strings.Compare(a.Parent, b.Parent)
@@ -97,4 +104,9 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+func sessionKey(key registry.Key) string {
+	digest := sha256.Sum256([]byte(key.ProcStart))
+	return fmt.Sprintf("%d-%x", key.PID, digest[:4])
 }

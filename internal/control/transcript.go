@@ -37,7 +37,7 @@ type (
 	}
 )
 
-func (d *daemon) confirmTurn(s registry.Session, h hookInput) {
+func (d *daemon) confirmTurn(s registry.Session, h hookInput, received time.Time) {
 	projects := filepath.Join(s.ConfigDir, "projects")
 	rel, err := filepath.Rel(projects, h.Transcript)
 	if err != nil || !filepath.IsLocal(rel) || filepath.Base(rel) != s.SessionID+".jsonl" || len(strings.Split(rel, string(filepath.Separator))) != 2 {
@@ -48,20 +48,19 @@ func (d *daemon) confirmTurn(s registry.Session, h hookInput) {
 		return
 	}
 	defer root.Close()
-	after := time.Now()
 	var offset int64
 	for {
 		current, e := d.registry.Resolve(d.ctx, s.PID)
-		if e != nil || current.Key != s.Key || current.SessionID != s.SessionID || !d.meshMember(s.Key) || d.meshExcluded(current) {
+		if e != nil || current.Key != s.Key || current.SessionID != s.SessionID || !d.mesh.IsMember(s.Key) || d.meshExcluded(current) {
 			return
 		}
-		next, kind, err := scanTranscript(root, filepath.Join("projects", rel), offset, s.SessionID, h, after)
+		next, matched, err := scanTranscript(root, filepath.Join("projects", rel), offset, s.SessionID, h, received)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return
 		}
 		offset = next
-		if kind != "" {
-			if kind == "human" {
+		if matched != nil {
+			if matched.Kind == "human" {
 				if err := d.mesh.HumanTurn(d.ctx, current); err != nil && d.ctx.Err() == nil {
 					slog.Warn("human turn report failed", "error", err)
 				}
@@ -77,24 +76,24 @@ func (d *daemon) confirmTurn(s registry.Session, h hookInput) {
 }
 
 // Consume complete JSONL records only. Claude can append the rest of a row between polls.
-func scanTranscript(root *os.Root, rel string, offset int64, id string, h hookInput, after time.Time) (int64, string, error) {
+func scanTranscript(root *os.Root, rel string, offset int64, id string, h hookInput, after time.Time) (int64, *origin, error) {
 	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return offset, "", err
+		return offset, nil, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return offset, "", err
+		return offset, nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return offset, "", errors.New("invalid transcript file")
+		return offset, nil, errors.New("invalid transcript file")
 	}
 	if offset > info.Size() {
 		offset = 0
 	}
 	if _, err = f.Seek(offset, io.SeekStart); err != nil {
-		return offset, "", err
+		return offset, nil, err
 	}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 32*1024), 16<<20)
@@ -121,15 +120,15 @@ func scanTranscript(root *os.Root, rel string, offset int64, id string, h hookIn
 		switch row.Type {
 		case "user":
 			if promptMatches(row.Message.Content, *h.Prompt) {
-				return offset, row.Origin.Kind, nil
+				return offset, &row.Origin, nil
 			}
 		case "attachment":
 			if row.Attachment.Type == "queued_command" && row.Attachment.Prompt == *h.Prompt {
-				return offset, row.Attachment.Origin.Kind, nil
+				return offset, &row.Attachment.Origin, nil
 			}
 		}
 	}
-	return offset, "", scanner.Err()
+	return offset, nil, scanner.Err()
 }
 
 func promptMatches(raw json.RawMessage, prompt string) bool {
