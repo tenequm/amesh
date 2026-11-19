@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -85,6 +86,11 @@ func Reply(tb testing.TB, name string) http.HandlerFunc {
 		media = "text/event-stream"
 	}
 	return func(w http.ResponseWriter, _ *http.Request) {
+		if obj, ok := f.Value.(map[string]any); ok {
+			if seconds, ok := obj["retryAfter"].(int); ok {
+				w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			}
+		}
 		w.Header().Set("Content-Type", media)
 		w.WriteHeader(status)
 		_, _ = w.Write(body)

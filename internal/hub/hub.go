@@ -3,6 +3,7 @@ package hub
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,16 +40,31 @@ type Client struct {
 	waiters  map[string][]chan SendOutcome
 	progress
 	streamRunning bool
+	usedHello     uint64
+	logChanged    chan struct{}
+	instance      string
+	helloCount    uint64
+	verifying     bool
+	presenceMu    sync.Mutex
+	bindingMu     sync.Mutex
 }
 
 func New(cfg config.Config) *Client { return NewWithTransport(cfg, nil) }
 
 func NewWithTransport(cfg config.Config, transport http.RoundTripper) *Client {
+	var n [16]byte
+	rand.Read(n[:])
 	return &Client{
-		cfg: cfg, http: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		key:     sync.OnceValues(func() (identity, error) { return loadKey(filepath.Join(cfg.StateDir, "machine.key")) }),
-		current: contract.HelloResponse{Settings: contract.DefaultSettings(), Limits: contract.Limits{MaxTextBytes: 32768, QueueTTLMs: 86400000}},
-		stopped: make(chan struct{}), draining: make(chan struct{}, 1), wake: make(chan struct{}, 1), waiters: make(map[string][]chan SendOutcome),
+		instance:   encoding.EncodeToString(n[:]),
+		logChanged: make(chan struct{}),
+		cfg:        cfg,
+		http:       &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		key:        sync.OnceValues(func() (identity, error) { return loadKey(filepath.Join(cfg.StateDir, "machine.key")) }),
+		current:    contract.HelloResponse{Settings: contract.DefaultSettings(), Limits: contract.Limits{MaxTextBytes: 32768, QueueTTLMs: 86400000}},
+		stopped:    make(chan struct{}),
+		draining:   make(chan struct{}, 1),
+		wake:       make(chan struct{}, 1),
+		waiters:    make(map[string][]chan SendOutcome),
 	}
 }
 
@@ -69,7 +85,7 @@ func (e *HTTPError) Error() string {
 }
 
 func (e *HTTPError) transient() bool {
-	return e.Status >= 500 || e.Status == 429 || e.Status == 408 || (e.Status == 409 && e.Body.Error == "machine_in_use") || (e.Status == 401 && e.Body.Error == "stale_timestamp")
+	return e.Body.Error == "" || e.Status >= 500 || e.Status == 429 || e.Status == 408 || (e.Status == 409 && e.Body.Error == "machine_in_use") || (e.Status == 401 && e.Body.Error == "stale_timestamp")
 }
 
 func (c *Client) stop(err error) error {
@@ -127,6 +143,8 @@ func (c *Client) open(ctx context.Context, method, route string, body []byte, me
 			e.RetryAfter = time.Duration(seconds) * time.Second
 		}
 		switch {
+		case e.Body.Error == "" && (route == "/hello" || strings.HasPrefix(route, "/events?")):
+			return nil, e
 		case e.Status < 400:
 			return nil, c.stop(e)
 		case e.Status == 401 && (e.Body.Error == "bad_signature" || e.Body.Error == "replayed"):
@@ -141,7 +159,7 @@ func (c *Client) open(ctx context.Context, method, route string, body []byte, me
 				c.mu.Unlock()
 				continue
 			}
-		case e.Status == 401 && e.Body.Error == "unknown_machine", e.Status == 403 && e.Body.Error == "machine_revoked", e.Status == 409 && e.Body.Error == "superseded", e.Status == 426:
+		case e.Status == 401 && e.Body.Error == "unknown_machine", e.Status == 403 && e.Body.Error == "machine_revoked", e.Status == 426:
 			return nil, c.stop(e)
 		}
 		return nil, e
@@ -180,10 +198,33 @@ func (c *Client) Info(ctx context.Context) (contract.HelloInfo, error) {
 func (c *Client) Hello(ctx context.Context, req contract.HelloRequest) (contract.HelloResponse, error) {
 	c.helloMu.Lock()
 	defer c.helloMu.Unlock()
+	return c.helloLocked(ctx, req)
+}
+
+func hasCode(err error, status int, code string) bool {
+	h, ok := errors.AsType[*HTTPError](err)
+	return ok && h.Status == status && h.Body.Error == code
+}
+
+func (c *Client) confirmOwner(ctx context.Context, revision uint64) error {
+	c.helloMu.Lock()
+	defer c.helloMu.Unlock()
+	if c.helloCount != revision {
+		return nil
+	}
+	c.verifying = true
+	_, err := c.helloLocked(ctx, c.hello)
+	return err
+}
+
+var logID = regexp.MustCompile(`^lg_[A-Za-z0-9_-]{8,64}$`)
+
+func (c *Client) helloLocked(ctx context.Context, req contract.HelloRequest) (contract.HelloResponse, error) {
 	if err := c.loadCursor(); err != nil {
 		return contract.HelloResponse{}, c.stop(err)
 	}
 	c.mu.Lock()
+	req.Instance = c.instance
 	req.Takeover = !c.started
 	req.ResumeEpoch = nil
 	if c.current.Epoch > 0 {
@@ -200,9 +241,15 @@ func (c *Client) Hello(ctx context.Context, req contract.HelloRequest) (contract
 	}
 	wire, err := rpc[response](ctx, c, http.MethodPost, "/hello", req)
 	if err != nil {
+		if c.verifying && hasCode(err, 409, "machine_in_use") {
+			return contract.HelloResponse{}, c.stop(&HTTPError{Status: 409, Body: contract.ErrorBody{Error: "superseded", Message: "Another daemon owns this machine."}})
+		}
 		return contract.HelloResponse{}, err
 	}
 	v := wire.HelloResponse
+	if v.Limits.MaxTextBytes <= 0 || v.Limits.QueueTTLMs <= 0 || v.Limits.QueueTTLMs > int64((1<<63-1)/time.Millisecond) {
+		return v, errors.New("invalid hub send limits")
+	}
 	if v.Epoch < 1 {
 		return v, errors.New("hub hello returned an invalid epoch")
 	}
@@ -213,6 +260,19 @@ func (c *Client) Hello(ctx context.Context, req contract.HelloRequest) (contract
 		v.Settings = contract.DefaultSettings()
 		slog.Warn("invalid peer timing settings, using defaults")
 	}
+	if !logID.MatchString(v.Log) {
+		return v, errors.New("invalid hub event log id")
+	}
+	c.bindingMu.Lock()
+	defer c.bindingMu.Unlock()
+	if err = c.bindOutbox(v.Log); err != nil {
+		return v, err
+	}
+	if err = c.replaceLog(v.Log); err != nil {
+		return v, err
+	}
+	c.helloCount++
+	c.verifying = false
 	c.mu.Lock()
 	c.current = v
 	c.mu.Unlock()
@@ -253,7 +313,7 @@ func (c *Client) PeersFiltered(ctx context.Context, project, machine string) (co
 	return rpc[contract.PeersResponse](ctx, c, http.MethodGet, route, nil)
 }
 
-func retryWrite[T any](ctx context.Context, c *Client, send func(epoch int64) (T, error)) (T, error) {
+func retryWrite[T any](ctx context.Context, c *Client, retry bool, send func(epoch int64) (T, error)) (T, error) {
 	var backoff time.Duration
 	for {
 		c.helloMu.RLock()
@@ -263,10 +323,19 @@ func retryWrite[T any](ctx context.Context, c *Client, send func(epoch int64) (T
 			var zero T
 			return zero, halt
 		}
+		rev := c.helloCount
 		value, err := send(conn.Epoch)
 		c.helloMu.RUnlock()
 		if err == nil {
 			return value, nil
+		}
+		if hasCode(err, 409, "superseded") {
+			if err = c.confirmOwner(ctx, rev); err == nil {
+				continue
+			}
+		}
+		if !retry {
+			return value, err
 		}
 		if h, ok := errors.AsType[*HTTPError](err); ok && !h.transient() {
 			return value, err
@@ -288,43 +357,53 @@ func (c *Client) Register(ctx context.Context, key string, req contract.SessionR
 	if !sessionKey.MatchString(key) {
 		return contract.SessionRegisterResponse{}, errors.New("invalid peer session key")
 	}
-	return retryWrite(ctx, c, func(epoch int64) (contract.SessionRegisterResponse, error) {
+	c.presenceMu.Lock()
+	defer c.presenceMu.Unlock()
+	return retryWrite(ctx, c, true, func(epoch int64) (contract.SessionRegisterResponse, error) {
 		req.Epoch = epoch
 		return sessionRPC[contract.SessionRegisterResponse](ctx, c, http.MethodPut, key, "", req)
 	})
 }
 
 func (c *Client) HumanTurn(ctx context.Context, key string, req contract.HumanTurnRequest) (contract.HumanTurnResponse, error) {
-	c.helloMu.RLock()
-	defer c.helloMu.RUnlock()
-	conn, _ := c.Connection()
-	req.Epoch = conn.Epoch
-	return sessionRPC[contract.HumanTurnResponse](ctx, c, http.MethodPost, key, "/human", req)
+	return retryWrite(ctx, c, false, func(epoch int64) (contract.HumanTurnResponse, error) {
+		req.Epoch = epoch
+		return sessionRPC[contract.HumanTurnResponse](ctx, c, http.MethodPost, key, "/human", req)
+	})
 }
 
 func (c *Client) End(ctx context.Context, key string, req contract.SessionEndRequest) (contract.SessionEndResponse, error) {
-	c.helloMu.RLock()
-	defer c.helloMu.RUnlock()
-	conn, _ := c.Connection()
-	req.Epoch = conn.Epoch
-	return sessionRPC[contract.SessionEndResponse](ctx, c, http.MethodPost, key, "/end", req)
+	c.presenceMu.Lock()
+	defer c.presenceMu.Unlock()
+	return retryWrite(ctx, c, false, func(epoch int64) (contract.SessionEndResponse, error) {
+		req.Epoch = epoch
+		v, err := sessionRPC[contract.SessionEndResponse](ctx, c, http.MethodPost, key, "/end", req)
+		if hasCode(err, 404, "unknown_session") {
+			v.Session.Key = key
+			v.Session.Status = "ended"
+			return v, nil
+		}
+		return v, err
+	})
 }
 
 func (c *Client) Heartbeat(ctx context.Context, req contract.HeartbeatRequest) (contract.HeartbeatResponse, error) {
-	c.helloMu.RLock()
-	defer c.helloMu.RUnlock()
-	c.mu.Lock()
-	req.Epoch = c.current.Epoch
-	req.Cursor = c.cursor
-	c.mu.Unlock()
-	if req.Sessions == nil {
-		req.Sessions = []contract.HeartbeatRequestSessionsItem{}
-	}
-	return rpc[contract.HeartbeatResponse](ctx, c, http.MethodPost, "/heartbeat", req)
+	c.presenceMu.Lock()
+	defer c.presenceMu.Unlock()
+	return retryWrite(ctx, c, false, func(epoch int64) (contract.HeartbeatResponse, error) {
+		req.Epoch = epoch
+		c.mu.Lock()
+		req.Cursor = c.cursor
+		c.mu.Unlock()
+		if req.Sessions == nil {
+			req.Sessions = []contract.HeartbeatRequestSessionsItem{}
+		}
+		return rpc[contract.HeartbeatResponse](ctx, c, http.MethodPost, "/heartbeat", req)
+	})
 }
 
 func (c *Client) Report(ctx context.Context, req contract.ReportsRequest) (contract.ReportsResponse, error) {
-	return retryWrite(ctx, c, func(epoch int64) (contract.ReportsResponse, error) {
+	return retryWrite(ctx, c, true, func(epoch int64) (contract.ReportsResponse, error) {
 		req.Epoch = epoch
 		return rpc[contract.ReportsResponse](ctx, c, http.MethodPost, "/reports", req)
 	})

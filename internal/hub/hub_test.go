@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -291,6 +292,213 @@ func TestOutboxExpiryWithoutHello(t *testing.T) {
 		}
 		if !errors.Is(<-done, context.Canceled) {
 			t.Fatal("uploader did not stop")
+		}
+	})
+}
+
+func TestRetryAcrossEpochsAndReplacedLog(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(strconv.FormatBool(replace), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				hello := example[contract.HelloResponse](t, "helloResponse")
+				hello.Epoch++
+				if replace {
+					hello.Log = "lg_replaced123"
+				}
+				reply := func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(hello) }
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				steps := []hubtest.Step{
+					{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+					{Method: "POST", Target: "/peer/messages", Reply: func(http.ResponseWriter, *http.Request) { cancel(); panic(http.ErrAbortHandler) }},
+					{Method: "POST", Target: "/peer/hello", Reply: reply},
+				}
+				if !replace {
+					steps = append(steps, hubtest.Step{Method: "POST", Target: "/peer/messages", Reply: hubtest.Reply(t, "sendResponse")})
+				}
+				s := hubtest.MemoryScript(t, steps...)
+				c := enrolled(t, "http://amesh-hub.test")
+				c.http.Transport = s.Client().Transport
+				hr := example[contract.HelloRequest](t, "helloRequest")
+				if _, err := c.Hello(ctx, hr); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.event(ctx, contract.EventStreamItem{Event: "synchronized", Data: `{"kind":"synchronized","seq":41}`}, func(context.Context, contract.EventStreamItem) error { return nil }); err != nil {
+					t.Fatal(err)
+				}
+				req := example[contract.SendRequest](t, "sendStartRequest")
+				if _, err := c.Send(ctx, req); !errors.Is(err, ErrQueued) {
+					t.Fatal(err)
+				}
+				same := req
+				same.Origin = "human"
+				same.Epoch = 88
+				same.FromMode = nil
+				if _, err := c.Send(ctx, same); !errors.Is(err, ErrQueued) {
+					t.Fatal("semantic duplicate refused")
+				}
+				different := req
+				different.Text += "!"
+				if _, err := c.Send(ctx, different); !hasCode(err, 409, "id_conflict") {
+					t.Fatal("conflicting contents accepted")
+				}
+				if err := c.RunOutbox(ctx, nil); !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+				restarted := NewWithTransport(c.cfg, s.Client().Transport)
+				if _, err := restarted.Hello(t.Context(), hr); err != nil {
+					t.Fatal(err)
+				}
+				if replace && restarted.cursor != 0 || !replace && restarted.cursor != 41 {
+					t.Fatal("wrong cursor after reconnect")
+				}
+				run, stop := context.WithCancel(t.Context())
+				defer stop()
+				err := restarted.RunOutbox(run, func(out SendOutcome) {
+					defer stop()
+					if replace && !hasCode(out.Err, 410, "log_replaced") || !replace && out.Err != nil {
+						t.Errorf("retry outcome %v", out.Err)
+					}
+				})
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+				calls := s.Calls()
+				if !replace {
+					var before, after contract.SendRequest
+					if json.Unmarshal(calls[1].Body, &before) != nil || json.Unmarshal(calls[3].Body, &after) != nil || before.Epoch != 7 || after.Epoch != 8 || before.ID != after.ID || before.Text != after.Text || before.From != after.From || !sameTarget(before.To.Address, after.To.Address) {
+						t.Fatal("send identity changed across epochs")
+					}
+				}
+				if c.instance == restarted.instance {
+					t.Fatal("new process reused instance")
+				}
+			})
+		})
+	}
+}
+
+func TestLostHelloAndConfirmedTakeover(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := hubtest.MemoryScript(t,
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.LostResponse},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=7", Reply: hubtest.Reply(t, "errSuperseded")},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=7", Reply: eventReply("revoked", hubtest.Example(t, "eventRevoked"))})
+		c := enrolled(t, "http://amesh-hub.test")
+		c.http.Transport = s.Client().Transport
+		if _, err := c.Hello(t.Context(), example[contract.HelloRequest](t, "helloRequest")); err == nil {
+			t.Fatal("expected lost hello")
+		}
+		err := c.Stream(t.Context(), func(context.Context, contract.EventStreamItem) error { return nil })
+		if !hasCode(err, 403, "machine_revoked") {
+			t.Fatal(err)
+		}
+		calls := s.Calls()
+		for i, index := range []int{0, 1, 3} {
+			var req contract.HelloRequest
+			if json.Unmarshal(calls[index].Body, &req) != nil || req.Instance != c.instance || req.Takeover != (i == 0) {
+				t.Fatal("lost process identity or repeated takeover")
+			}
+		}
+	})
+}
+
+func TestOutboxRetryAfter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := hubtest.MemoryScript(t, hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")}, hubtest.Step{Method: "POST", Target: "/peer/messages", Reply: hubtest.Reply(t, "errRateLimited")}, hubtest.Step{Method: "POST", Target: "/peer/messages", Reply: hubtest.Reply(t, "sendResponse")})
+		c := enrolled(t, "http://amesh-hub.test")
+		c.http.Transport = s.Client().Transport
+		if _, err := c.Hello(t.Context(), contract.HelloRequest{}); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			done <- c.RunOutbox(ctx, func(out SendOutcome) {
+				if out.Err != nil {
+					t.Error(out.Err)
+				}
+				cancel()
+			})
+		}()
+		if _, err := c.Send(ctx, example[contract.SendRequest](t, "sendStartRequest")); !errors.Is(err, ErrQueued) || !hasCode(err, 429, "rate_limited") {
+			t.Fatal("missing pacing result")
+		}
+		if n, err := c.Pending(""); err != nil || n != 1 {
+			t.Fatal("paced entry missing")
+		}
+		if !errors.Is(<-done, context.Canceled) {
+			t.Fatal("uploader did not stop")
+		}
+		if d := time.Since(start); d < 42*time.Second || d >= 43*time.Second {
+			t.Fatalf("wrong Retry-After delay %v", d)
+		}
+	})
+}
+
+func TestSleepOverrun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		time.Sleep(70 * time.Second)
+		if slept(start, 10*time.Second) {
+			t.Fatal("overrun boundary")
+		}
+		time.Sleep(time.Millisecond)
+		if !slept(start, 10*time.Second) {
+			t.Fatal("missed sleep")
+		}
+	})
+}
+
+func TestWriteRecoversEpochAndCompleteMembership(t *testing.T) {
+	const key = "15355-4f6c8c61"
+	hello := example[contract.HelloResponse](t, "helloResponse")
+	hello.Epoch++
+	s := hubtest.Script(t,
+		hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+		hubtest.Step{Method: "POST", Target: "/peer/heartbeat", Reply: hubtest.Reply(t, "errSuperseded")},
+		hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(hello) }},
+		hubtest.Step{Method: "POST", Target: "/peer/heartbeat", Reply: hubtest.Reply(t, "heartbeatResponse")},
+		hubtest.Step{Method: "POST", Target: "/peer/sessions/" + key + "/end", Reply: hubtest.Reply(t, "errUnknownSession")})
+	c := enrolled(t, s.URL)
+	if _, err := c.Hello(t.Context(), contract.HelloRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	req := example[contract.HeartbeatRequest](t, "heartbeatRequest")
+	if _, err := c.Heartbeat(t.Context(), req); err != nil {
+		t.Fatal(err)
+	}
+	end, err := c.End(t.Context(), key, contract.SessionEndRequest{Reason: "exited"})
+	if err != nil || end.Session.Status != "ended" || end.Session.Key != key {
+		t.Fatal("already ended key")
+	}
+	var replay contract.HeartbeatRequest
+	if json.Unmarshal(s.Calls()[3].Body, &replay) != nil || replay.Epoch != 8 || !slices.Equal(replay.Sessions, req.Sessions) {
+		t.Fatal("membership changed across retry")
+	}
+}
+
+func TestProxyErrorAllowsRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		denied := func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "proxy denied", http.StatusForbidden) }
+		s := hubtest.MemoryScript(t,
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: denied},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=7", Reply: denied},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=7", Reply: eventReply("revoked", hubtest.Example(t, "eventRevoked"))})
+		c := enrolled(t, "http://amesh-hub.test")
+		c.http.Transport = s.Client().Transport
+		if _, err := c.Hello(t.Context(), contract.HelloRequest{}); err == nil {
+			t.Fatal("expected a proxy error")
+		}
+		err := c.Stream(t.Context(), func(context.Context, contract.EventStreamItem) error { return nil })
+		if !hasCode(err, 403, "machine_revoked") {
+			t.Fatal(err)
 		}
 	})
 }

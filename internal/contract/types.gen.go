@@ -16,6 +16,8 @@ type FromMode = string
 type PeerStatus = string
 type Kind = string
 type Epoch = int64
+type Instance = string
+type LogID = string
 type Hop struct {
 	Count int64 `json:"count"`
 	Limit int64 `json:"limit"`
@@ -53,6 +55,7 @@ type HelloRequestClaudeCode struct {
 	NativeCheck  string   `json:"nativeCheck"`
 }
 type HelloRequest struct {
+	Instance     Instance               `json:"instance"`
 	ResumeEpoch  *Epoch                 `json:"resumeEpoch"`
 	Takeover     bool                   `json:"takeover"`
 	Amesh        HelloRequestAmesh      `json:"amesh"`
@@ -91,6 +94,7 @@ type HelloResponse struct {
 	MinProtocol int64                `json:"minProtocol"`
 	Machine     HelloResponseMachine `json:"machine"`
 	Epoch       Epoch                `json:"epoch"`
+	Log         LogID                `json:"log"`
 	Features    []string             `json:"features"`
 	Settings    Settings             `json:"settings"`
 	Limits      Limits               `json:"limits"`
@@ -180,7 +184,7 @@ type SendRequest struct {
 	To             SendRequestTo   `json:"to"`
 	Text           string          `json:"text"`
 	HopChain       HopChain        `json:"hopChain"`
-	FromMode       FromMode        `json:"fromMode"`
+	FromMode       *FromMode       `json:"fromMode"`
 	Origin         string          `json:"origin"`
 	NotifyWhenIdle bool            `json:"notifyWhenIdle"`
 	FailureNotice  bool            `json:"failureNotice"`
@@ -229,9 +233,9 @@ type ReportsRequest struct {
 	Reports []Report `json:"reports"`
 }
 type ReportsResponseResultsItem struct {
-	ID      UUID          `json:"id"`
-	State   DeliveryState `json:"state"`
-	Applied bool          `json:"applied"`
+	ID      UUID           `json:"id"`
+	State   *DeliveryState `json:"state"`
+	Applied bool           `json:"applied"`
 }
 type ReportsResponse struct {
 	Results []ReportsResponseResultsItem `json:"results"`
@@ -341,7 +345,7 @@ type NativeUserFrame struct {
 	Type     string                 `json:"type"`
 	Message  NativeUserFrameMessage `json:"message"`
 	Priority string                 `json:"priority"`
-	From     NativeAddress          `json:"from"`
+	From     *NativeAddress         `json:"from,omitempty"`
 	MsgV     int64                  `json:"msgV"`
 	MsgID    UUID                   `json:"msg_id"`
 }
@@ -352,7 +356,7 @@ type NativeNotifyWhenIdle struct {
 	From     NativeAddress `json:"from"`
 	MsgID    UUID          `json:"msg_id"`
 	MsgV     int64         `json:"msgV"`
-	FromMode FromMode      `json:"from_mode"`
+	FromMode *FromMode     `json:"from_mode,omitempty"`
 }
 type NativeReceipt struct {
 	Type          string        `json:"type"`
@@ -470,15 +474,15 @@ type DaemonStatus struct {
 	Lanes      []DaemonStatusLanesItem      `json:"lanes"`
 	Outbox     DaemonStatusOutbox           `json:"outbox"`
 	Open       DaemonStatusOpen             `json:"open"`
+	Warnings   *[]string                    `json:"warnings,omitempty"`
 }
 type LaneID = string
 type McpListPeersArguments struct {
 	Filter *string `json:"filter,omitempty"`
 }
 type McpSendMessageArguments struct {
-	To             string `json:"to"`
-	Message        string `json:"message"`
-	NotifyWhenIdle *bool  `json:"notify_when_idle,omitempty"`
+	To      string `json:"to"`
+	Message string `json:"message"`
 }
 type McpSendToParentArguments struct {
 	Message string `json:"message"`
@@ -547,6 +551,14 @@ type RelaySocketVector struct {
 	Path       string        `json:"path"`
 	Address    NativeAddress `json:"address"`
 }
+type NoticeIDVector struct {
+	Rule      string    `json:"rule"`
+	Namespace UUID      `json:"namespace"`
+	MachineID MachineID `json:"machineId"`
+	Source    string    `json:"source"`
+	Kind      string    `json:"kind"`
+	MsgID     UUID      `json:"msgId"`
+}
 type LaneSocketVector struct {
 	Rule           string    `json:"rule"`
 	ParentArgument string    `json:"parentArgument"`
@@ -588,7 +600,7 @@ type EnvelopeVector struct {
 }
 
 func DefaultSettings() Settings {
-	return Settings{HeartbeatMs: 20000, StreamSilenceMs: 45000, BackoffInitialMs: 500, BackoffMaxMs: 10000, BackoffResetAfterMs: 5000, AcceptWindowMs: 5000, RequestTimeoutMs: 10000, SendWaitMs: 5000}
+	return Settings{HeartbeatMs: 20000, StreamSilenceMs: 45000, BackoffInitialMs: 500, BackoffMaxMs: 10000, BackoffResetAfterMs: 5000, AcceptWindowMs: 8000, RequestTimeoutMs: 10000, SendWaitMs: 5000}
 }
 func (s Settings) Valid() bool {
 	return s.HeartbeatMs >= 5000 && s.HeartbeatMs <= 30000 &&

@@ -119,7 +119,7 @@ func TestSilenceReconnectAndFencing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		start := time.Now()
 		hello := example[contract.HelloResponse](t, "helloResponse")
-		hello.Epoch++
+
 		second := func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(hello) }
 		ping := func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -134,7 +134,7 @@ func TestSilenceReconnectAndFencing(t *testing.T) {
 			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
 			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=7", Reply: ping},
 			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: second},
-			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=8", Reply: eventReply("superseded", hubtest.Example(t, "eventSuperseded"))})
+			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=7", Reply: eventReply("superseded", hubtest.Example(t, "eventSuperseded"))}, hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "errMachineInUse")})
 		c := enrolled(t, "http://amesh-hub.test")
 		c = NewWithTransport(c.cfg, s.Client().Transport)
 		if _, err := c.Hello(t.Context(), example[contract.HelloRequest](t, "helloRequest")); err != nil {
@@ -178,11 +178,11 @@ func TestCanceledReplayAndFatalCodes(t *testing.T) {
 		defer cancel()
 		calls := 0
 		err := c.Stream(ctx, func(context.Context, contract.EventStreamItem) error { calls++; cancel(); return nil })
-		if !errors.Is(err, context.Canceled) || calls != 1 || c.cursor != 117 {
+		if !errors.Is(err, context.Canceled) || calls != 1 || c.cursor != 0 {
 			t.Fatal("cancellation did not preserve pending event")
 		}
 	})
-	for _, name := range []string{"errUnknownMachine", "errMachineRevoked", "errSuperseded", "errUpgradeRequired", "errProtocol"} {
+	for _, name := range []string{"errUnknownMachine", "errMachineRevoked", "errUpgradeRequired", "errProtocol"} {
 		t.Run(name, func(t *testing.T) {
 			s := hubtest.Script(t, hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, name)})
 			c := enrolled(t, s.URL)

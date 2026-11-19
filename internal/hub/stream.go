@@ -84,7 +84,12 @@ func (c *Client) event(ctx context.Context, item contract.EventStreamItem, handl
 		if item.ID != nil {
 			return errors.New("unexpected id on unnumbered peer event")
 		}
-	case "endpoint", "message", "delivery", "limit", "idle":
+	case "endpoint":
+		if item.ID == nil {
+			return handle(ctx, item)
+		}
+		logEvent = true
+	case "message", "delivery", "limit", "idle":
 		if item.ID == nil {
 			return errors.New("missing peer event id")
 		}
@@ -101,7 +106,7 @@ func (c *Client) event(ctx context.Context, item contract.EventStreamItem, handl
 				return errors.New("missing peer message id")
 			}
 		}
-		dispatch, err := c.observe(seq, id)
+		dispatch, err := c.observe(ctx, seq, id)
 		if err != nil || !dispatch {
 			return err
 		}
@@ -110,7 +115,7 @@ func (c *Client) event(ctx context.Context, item contract.EventStreamItem, handl
 		}
 		if err = handle(ctx, item); err != nil {
 			c.mu.Lock()
-			if p, ok := c.pending[seq]; ok {
+			if p, ok := c.pending[seq]; ok && !c.stale(ctx) {
 				p.handed = false
 				c.pending[seq] = p
 			}
@@ -122,7 +127,7 @@ func (c *Client) event(ctx context.Context, item contract.EventStreamItem, handl
 	case "revoked":
 		return c.stop(&HTTPError{Status: 403, Body: contract.ErrorBody{Error: "machine_revoked", Message: "Machine enrollment was revoked."}})
 	case "superseded":
-		return c.stop(&HTTPError{Status: 409, Body: contract.ErrorBody{Error: "superseded", Message: "Another daemon owns this machine."}})
+		return &HTTPError{Status: 409, Body: contract.ErrorBody{Error: "superseded", Message: "Another daemon owns this machine."}}
 	case "synchronized":
 		if json.Unmarshal(meta.Seq, &dataSeq) != nil || dataSeq == nil || *dataSeq < 0 {
 			return errors.New("missing or invalid synchronization sequence")
@@ -132,6 +137,9 @@ func (c *Client) event(ctx context.Context, item contract.EventStreamItem, handl
 		}
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if c.stale(ctx) {
+			return nil
+		}
 		c.head = max(c.head, *dataSeq)
 		return c.advance()
 	case "status":
@@ -166,6 +174,13 @@ func (c *Client) readStream(ctx context.Context, conn contract.HelloResponse, ha
 	defer cancel(nil)
 	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
+	c.mu.Lock()
+	cursor, gen, changed := c.cursor, c.generation, c.logChanged
+	currentLog := c.log
+	c.mu.Unlock()
+	if currentLog != conn.Log {
+		return 0, errors.New("event log changed before stream opened")
+	}
 	done := make(chan struct{})
 	silence := time.Duration(conn.Settings.StreamSilenceMs) * time.Millisecond
 	go func() {
@@ -175,6 +190,10 @@ func (c *Client) readStream(ctx context.Context, conn contract.HelloResponse, ha
 			start := time.Now()
 			timer := time.NewTimer(wait)
 			select {
+			case <-changed:
+				timer.Stop()
+				cancel(errors.New("event log replaced"))
+				return
 			case <-requestCtx.Done():
 				timer.Stop()
 				return
@@ -198,9 +217,6 @@ func (c *Client) readStream(ctx context.Context, conn contract.HelloResponse, ha
 		}
 	}()
 	defer func() { cancel(nil); <-done }()
-	c.mu.Lock()
-	cursor, gen := c.cursor, c.generation
-	c.mu.Unlock()
 	route := fmt.Sprintf("/events?after=%d&epoch=%d", cursor, conn.Epoch)
 	resp, err := c.open(requestCtx, http.MethodGet, route, nil, "text/event-stream")
 	if err != nil {
@@ -239,12 +255,23 @@ func (c *Client) Stream(ctx context.Context, handle func(context.Context, contra
 	}
 	c.streamRunning = true
 	c.mu.Unlock()
-	defer func() { c.mu.Lock(); c.streamRunning = false; c.mu.Unlock() }()
+	defer func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.streamRunning = false
+		// A new Stream has a new consumer context. Redeliver unfinished work to it.
+		c.head = c.cursor
+		c.pending = make(map[int64]pendingEvent)
+		c.order = nil
+		c.generation++
+	}()
 	if err := c.loadCursor(); err != nil {
 		return err
 	}
+	c.helloMu.RLock()
 	conn, err := c.Connection()
-	needHello := conn.Epoch == 0
+	needHello := conn.Epoch == 0 || c.usedHello == c.helloCount
+	c.helloMu.RUnlock()
 	delay := time.Duration(conn.Settings.BackoffInitialMs) * time.Millisecond
 	for {
 		if ctx.Err() != nil {
@@ -257,12 +284,24 @@ func (c *Client) Stream(ctx context.Context, handle func(context.Context, contra
 			c.mu.Lock()
 			hello := c.hello
 			c.mu.Unlock()
-			conn, err = c.Hello(ctx, hello)
+			_, err = c.Hello(ctx, hello)
 		}
 		needHello = true
 		var connected time.Duration
 		if err == nil {
+			c.helloMu.RLock()
+			revision := c.helloCount
+			c.usedHello = revision
+			conn, _ = c.Connection()
+			c.helloMu.RUnlock()
 			connected, err = c.readStream(ctx, conn, handle)
+			if hasCode(err, 409, "superseded") {
+				err = c.confirmOwner(ctx, revision)
+				if err == nil {
+					needHello = false
+					continue
+				}
+			}
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -287,7 +326,7 @@ func (c *Client) Stream(ctx context.Context, handle func(context.Context, contra
 				}
 				continue
 			}
-			if !h.transient() {
+			if h.Body.Error != "" && !h.transient() {
 				return err
 			}
 		}
