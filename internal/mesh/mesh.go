@@ -16,6 +16,9 @@ import (
 )
 
 type Backend struct {
+	attemptMu        sync.Mutex
+	attempts         map[string][]*attempt
+	retries          sync.WaitGroup
 	ctx              context.Context
 	socketDir        string
 	endpointMu       sync.Mutex
@@ -48,7 +51,7 @@ type sessionRegistry interface {
 var _ mcpserver.MeshBackend = (*Backend)(nil)
 
 func New(cfg config.Config, sessions *registry.Registry, relays *relay.Manager, client *hub.Client) *Backend {
-	return &Backend{endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), wake: make(chan struct{}, 1)}
+	return &Backend{attempts: make(map[string][]*attempt), endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), wake: make(chan struct{}, 1)}
 }
 
 func (*Backend) HumanTurn(ctx context.Context, session registry.Session) error {

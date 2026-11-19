@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,5 +213,133 @@ func TestOrphanAndInterruptedReports(t *testing.T) {
 	}
 	if len(states) != 2 || value(states[0].Reason) != "interrupted" || value(states[1].Reason) != "unknown_session" {
 		t.Fatalf("unexpected reports: %v", states)
+	}
+}
+
+func postNative(t *testing.T, addr string, raw []byte) {
+	t.Helper()
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "unix", strings.TrimPrefix(addr, "uds:"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err = conn.Write(append(raw, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.(*net.UnixConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err = io.Copy(io.Discard, conn); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRelayReplyReceiptAndNotice(t *testing.T) {
+	s := testSession()
+	key := sessionKey(s.Key)
+	inbox, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SocketPath = inbox
+	s.FromMode = "bypass"
+	received := make(chan contract.SendRequest, 1)
+	reported := make(chan contract.StateReport, 1)
+	b, r := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/messages": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.SendRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			received <- req
+			var res contract.SendResponse
+			_ = json.Unmarshal(hubtest.Example(t, "sendResponse"), &res)
+			res.Message.ID = req.ID
+			_ = json.NewEncoder(w).Encode(res)
+		},
+		"POST /peer/reports": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.ReportsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			var rep contract.StateReport
+			_ = json.Unmarshal(req.Reports[0], &rep)
+			reported <- rep
+			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: rep.ID, State: &rep.State, Applied: true}}})
+		},
+	})
+	*r = append(*r, s)
+	_, err = b.Connect(t.Context(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, _ := b.client.Connection()
+	if err = b.prepareLog(t.Context(), conn); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- b.client.RunOutbox(ctx, b.completed) }()
+	defer func() { cancel(); <-done }()
+	var msg contract.MessageEvent
+	_ = json.Unmarshal(hubtest.Example(t, "eventMessage"), &msg)
+	msg.Session = key
+	msg.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
+	ep, err := b.bind(conn, msg.Endpoint, []string{key}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = b.receive(ctx, conn, msg); err != nil {
+		t.Fatal(err)
+	}
+	<-lines
+	postNative(t, ep.from, hubtest.Example(t, "nativeReplyFrame"))
+	select {
+	case req := <-received:
+		if req.From.Session != key || value(req.To.Endpoint) != ep.ref.ID || req.ID != "1a616f5d-ad9d-4185-a462-0bf442288517" || req.Origin != "peer" || value(req.FromMode) != "bypass" || len(req.HopChain) != 1 {
+			t.Fatal("incorrect native reply request")
+		}
+	default:
+		t.Fatal("no reply posted")
+	}
+	postNative(t, ep.from, hubtest.Example(t, "receiptDelivered"))
+	select {
+	case rep := <-reported:
+		if rep.Session != key || rep.ID != msg.ID || rep.State != "delivered" {
+			t.Fatal(rep)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no report")
+	}
+	n, err := noticeEvent(contract.EventStreamItem{Event: "limit", Data: string(hubtest.Example(t, "eventLimit"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.session = key
+	for range 2 {
+		if err = b.writeNotice(ctx, conn, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var frame contract.NativeUserFrame
+	if err = json.Unmarshal(<-lines, &frame); err != nil {
+		t.Fatal(err)
+	}
+	note, err := envelope.Parse(frame.Message.Content)
+	if err != nil || value(frame.From) != ep.from || note.FromName != ep.ref.Name || note.FromMode != "bypass" || len(note.HopChain) != 0 || !strings.HasSuffix(note.Body, "No reply needed.") {
+		t.Fatal("incorrect conversation notice")
+	}
+	select {
+	case <-lines:
+		t.Fatal("duplicate notice")
+	default:
+	}
+	addr := "stan"
+	req := contract.SendRequest{ID: msg.ID, From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &addr}}
+	b.completed(hub.SendOutcome{Request: req, Err: &hub.HTTPError{Body: contract.ErrorBody{Error: "log_replaced"}}})
+	frame = contract.NativeUserFrame{}
+	if err = json.Unmarshal(<-lines, &frame); err != nil {
+		t.Fatal(err)
+	}
+	note, err = envelope.Parse(frame.Message.Content)
+	if err != nil || frame.From != nil || note.FromName != "amesh" || !strings.Contains(note.Body, "the hub was replaced") {
+		t.Fatal("missing no-from notice")
 	}
 }

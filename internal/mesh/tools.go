@@ -139,10 +139,10 @@ func unknownSession(err error) bool {
 }
 
 func (b *Backend) send(ctx context.Context, req contract.SendRequest) (contract.SendResponse, error) {
-	response, err := b.client.Send(ctx, req)
+	response, err := b.sendOnce(ctx, req, true)
 	if unknownSession(err) {
 		if err = b.reregister(ctx, req.From.Session); err == nil {
-			return b.client.Send(ctx, req)
+			return b.sendOnce(ctx, req, false)
 		}
 	}
 	return response, err

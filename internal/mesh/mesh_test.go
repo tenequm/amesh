@@ -68,6 +68,9 @@ func fixture(t *testing.T, routes map[string]http.HandlerFunc) (*Backend, *testR
 	t.Cleanup(func() { st.Close() })
 	b := New(cfg, nil, relay.New(cfg.StateDir, st), hub.New(cfg))
 	r := new(testRegistry)
+	b.ctx = t.Context()
+	b.socketDir = cfg.StateDir
+	t.Cleanup(b.closeEndpoints)
 	b.sessions = r
 	b.store = st
 	_, err = b.client.Hello(t.Context(), contract.HelloRequest{})
@@ -189,7 +192,7 @@ func TestDirectoryAndSend(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- b.client.RunOutbox(ctx, nil) }()
+	go func() { done <- b.client.RunOutbox(ctx, b.completed) }()
 	defer func() { cancel(); <-done }()
 	got, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "stan", Message: "hello"})
 	var expected mcpserver.SendResult

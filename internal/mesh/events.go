@@ -86,10 +86,6 @@ func (b *Backend) closeEndpoints() {
 	}
 }
 
-func (b *Backend) native(context.Context, string, string, relay.Event) error {
-	return errors.ErrUnsupported
-}
-
 func (b *Backend) report(ctx context.Context, log, id, key, status, reason string) error {
 	conn, err := b.client.Connection()
 	if err != nil {
@@ -334,6 +330,12 @@ func (r *streamRun) handle(ctx context.Context, item contract.EventStreamItem) e
 			return err
 		}
 		return r.enqueue(ctx, e.Session, e.Seq, func() error { return b.receive(ctx, conn, e) })
+	case "delivery", "limit", "idle":
+		n, err := noticeEvent(item)
+		if err != nil {
+			return err
+		}
+		return r.enqueue(ctx, n.session, n.seq, func() error { return b.writeNotice(ctx, conn, n) })
 	default:
 		if item.ID != nil {
 			n, e := strconv.ParseInt(*item.ID, 10, 64)
