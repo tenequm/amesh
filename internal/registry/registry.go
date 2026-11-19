@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -22,13 +24,33 @@ type Key struct {
 type Session struct {
 	Key
 	SessionID, Name, Project, CWD, ConfigDir, SocketPath, Status, FromMode, Version string
+	NameSource, Entrypoint                                                          string
+	StartedAt                                                                       int64
+}
+
+type Listing struct {
+	Sessions []Session
+	// A failed process lookup leaves the start time unknown.
+	unavailable map[entryPath]string
+}
+
+type entryPath struct {
+	dir string
+	pid int
+}
+
+func (l Listing) Unavailable(s Session) bool {
+	start, ok := l.unavailable[entryPath{s.ConfigDir, s.PID}]
+	return ok && (start == "" || start == s.ProcStart)
 }
 
 type Registry struct {
-	dirs   []string
-	lookup func(int) (int, string, error)
-	mu     sync.Mutex
-	modes  map[int]permissionClass
+	scanMu   sync.Mutex
+	reported map[entryPath]string
+	dirs     []string
+	lookup   func(int) (int, string, error)
+	mu       sync.Mutex
+	modes    map[int]permissionClass
 }
 
 func ProcessStart(pid int) (string, error) {
@@ -49,39 +71,80 @@ func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {
 		if err != nil {
 			return Session{}, err
 		}
-		for _, dir := range r.dirs {
-			session, err := read(dir, pid, start)
-			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errStaleProcess) {
-				continue
-			}
-			return r.withMode(session), err
+		session, err := r.readPID(pid, start)
+		if err == nil {
+			return r.withMode(session), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return Session{}, err
 		}
 		pid = parent
 	}
 	return Session{}, fmt.Errorf("no live Claude session for caller: %w", os.ErrNotExist)
 }
 
-var errStaleProcess = errors.New("registry identity differs from live process")
+var (
+	ErrEntryUnavailable = errors.New("session registry entry unavailable")
+	errNotReady         = errors.New("session registry entry not ready")
+	errStaleProcess     = errors.New("registry identity differs from live process")
+)
+
+// A bad entry can hide a valid entry for the same process in another seat.
+// If no seat verifies it, Resolve must stop before inheriting an ancestor's identity.
+func (r *Registry) readPID(pid int, start string) (Session, error) {
+	var unavailable error
+	for _, dir := range r.dirs {
+		s, err := read(dir, pid, start)
+		if err == nil {
+			return s, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errStaleProcess) {
+			unavailable = err
+		}
+	}
+	if unavailable != nil {
+		return Session{}, fmt.Errorf("%w: %w", ErrEntryUnavailable, unavailable)
+	}
+	return Session{}, os.ErrNotExist
+}
 
 func read(dir string, pid int, start string) (Session, error) {
 	path := filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json")
-	b, err := os.ReadFile(path) // #nosec G304 -- configured seat and numeric kernel pid
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- configured seat and numeric kernel pid
 	if err != nil {
 		return Session{}, err
 	}
-	var entry struct {
-		Version    string `json:"version"`
-		PID        int    `json:"pid"`
-		ProcStart  string `json:"procStart"`
-		SessionID  string `json:"sessionId"`
-		Name       string `json:"name"`
-		CWD        string `json:"cwd"`
-		SocketPath string `json:"messagingSocketPath"`
-		Status     string `json:"status"`
-		Protocol   int    `json:"peerProtocol"`
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return Session{}, err
 	}
-	if err := json.Unmarshal(b, &entry); err != nil {
+	if !info.Mode().IsRegular() {
+		return Session{}, fmt.Errorf("session registry %s: expected a regular file", path)
+	}
+	var entry struct {
+		Version    string          `json:"version"`
+		PID        int             `json:"pid"`
+		ProcStart  string          `json:"procStart"`
+		SessionID  string          `json:"sessionId"`
+		Name       string          `json:"name"`
+		CWD        string          `json:"cwd"`
+		SocketPath string          `json:"messagingSocketPath"`
+		Status     json.RawMessage `json:"status"`
+		NameSource string          `json:"nameSource"`
+		Entrypoint string          `json:"entrypoint"`
+		StartedAt  int64           `json:"startedAt"`
+		Protocol   int             `json:"peerProtocol"`
+	}
+	decoder := json.NewDecoder(f)
+	if err := decoder.Decode(&entry); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return Session{}, fmt.Errorf("%w: incomplete JSON in %s", errNotReady, path)
+		}
 		return Session{}, fmt.Errorf("session registry %s: %w", path, err)
+	}
+	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		return Session{}, fmt.Errorf("session registry %s: trailing JSON data", path)
 	}
 	if entry.PID <= 0 || entry.ProcStart == "" {
 		return Session{}, fmt.Errorf("session registry %s: invalid pid or procStart", path)
@@ -89,8 +152,11 @@ func read(dir string, pid int, start string) (Session, error) {
 	if entry.PID != pid || entry.ProcStart != start {
 		return Session{}, errStaleProcess
 	}
+	if entry.Status == nil {
+		return Session{}, fmt.Errorf("%w: missing status in %s", errNotReady, path)
+	}
 	for _, field := range []struct{ name, value string }{
-		{"sessionId", entry.SessionID}, {"name", entry.Name}, {"status", entry.Status}, {"cwd", entry.CWD}, {"messagingSocketPath", entry.SocketPath},
+		{"sessionId", entry.SessionID}, {"name", entry.Name}, {"cwd", entry.CWD}, {"messagingSocketPath", entry.SocketPath},
 	} {
 		if field.value == "" {
 			return Session{}, fmt.Errorf("session registry %s: missing %s", path, field.name)
@@ -102,9 +168,14 @@ func read(dir string, pid int, start string) (Session, error) {
 	if entry.Protocol != 1 {
 		return Session{}, fmt.Errorf("session registry %s: expected peerProtocol 1, got %d", path, entry.Protocol)
 	}
+	var status string
+	if json.Unmarshal(entry.Status, &status) != nil || status == "" {
+		return Session{}, fmt.Errorf("session registry %s: invalid status", path)
+	}
 	return Session{
+		NameSource: entry.NameSource, Entrypoint: entry.Entrypoint, StartedAt: entry.StartedAt,
 		Key: Key{pid, start}, SessionID: entry.SessionID, Name: entry.Name, CWD: entry.CWD,
-		Version: entry.Version, Project: project(entry.CWD), ConfigDir: dir, SocketPath: entry.SocketPath, Status: entry.Status,
+		Version: entry.Version, Project: project(entry.CWD), ConfigDir: dir, SocketPath: entry.SocketPath, Status: status,
 	}, nil
 }
 
@@ -132,22 +203,29 @@ func project(cwd string) string {
 }
 
 func (r *Registry) List(ctx context.Context) ([]Session, error) {
+	listing, err := r.Snapshot(ctx)
+	return listing.Sessions, err
+}
+
+func (r *Registry) Snapshot(ctx context.Context) (Listing, error) {
 	return r.scan(ctx, false)
 }
 
-func (r *Registry) scan(ctx context.Context, check bool) ([]Session, error) {
-	var live []Session
+func (r *Registry) scan(ctx context.Context, check bool) (Listing, error) {
+	r.scanMu.Lock()
+	defer r.scanMu.Unlock()
+	live := Listing{unavailable: make(map[entryPath]string)}
 	for _, dir := range r.dirs {
 		entries, err := os.ReadDir(filepath.Join(dir, "sessions"))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			return Listing{}, err
 		}
 		for _, entry := range entries {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return Listing{}, err
 			}
 			name, ok := strings.CutSuffix(entry.Name(), ".json")
 			pid, err := strconv.Atoi(name)
@@ -155,30 +233,37 @@ func (r *Registry) scan(ctx context.Context, check bool) ([]Session, error) {
 				continue
 			}
 			_, start, err := r.lookup(pid)
-			if errors.Is(err, os.ErrNotExist) {
-				continue
+			var session Session
+			if err == nil {
+				session, err = read(dir, pid, start)
 			}
-			if err != nil {
-				return nil, err
-			}
-			session, err := read(dir, pid, start)
 			if errors.Is(err, os.ErrNotExist) || (!check && errors.Is(err, errStaleProcess)) {
 				continue
 			}
 			if err != nil {
-				return nil, fmt.Errorf("registry entry %s: %w", filepath.Join(dir, "sessions", entry.Name()), err)
+				path := filepath.Join(dir, "sessions", entry.Name())
+				if check && !errors.Is(err, errNotReady) {
+					return Listing{}, fmt.Errorf("registry entry %s: %w", path, err)
+				}
+				key := entryPath{dir, pid}
+				live.unavailable[key] = start
+				if last, ok := r.reported[key]; !ok || last != start {
+					slog.Warn("skipping session registry entry", "path", path, "error", err)
+				}
+				continue
 			}
 			if check {
 				if e := checkInbox(session); e != nil {
 					if _, now, lookupErr := r.lookup(pid); errors.Is(lookupErr, os.ErrNotExist) || (lookupErr == nil && now != start) {
 						continue
 					}
-					return nil, e
+					return Listing{}, e
 				}
 			}
-			live = append(live, r.withMode(session))
+			live.Sessions = append(live.Sessions, r.withMode(session))
 		}
 	}
+	r.reported = live.unavailable
 	return live, nil
 }
 
@@ -240,14 +325,11 @@ func (r *Registry) Live(ctx context.Context, key Key) (bool, error) {
 	if err != nil || start != key.ProcStart {
 		return false, err
 	}
-	for _, dir := range r.dirs {
-		_, err = read(dir, key.PID, start)
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errStaleProcess) {
-			continue
-		}
-		return err == nil, err
+	_, err = r.readPID(key.PID, start)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
 	}
-	return false, nil
+	return err == nil, err
 }
 
 func (s Session) MeshExcluded(dirs, roots []string) bool {

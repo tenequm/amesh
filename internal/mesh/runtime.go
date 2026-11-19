@@ -41,12 +41,12 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	if err = b.restore(parent); err != nil {
 		return nil, errors.Join(err, store.Close())
 	}
-	live, err := b.sessions.List(parent)
+	live, err := b.sessions.Snapshot(parent)
 	if err != nil {
 		return nil, errors.Join(err, store.Close())
 	}
 	versions := map[string]bool{}
-	for _, s := range live {
+	for _, s := range live.Sessions {
 		if s.Version != "" && b.eligible(s) {
 			versions[s.Version] = true
 		}

@@ -262,6 +262,9 @@ func liveEntry(t *testing.T, version string) (string, registry.Key) {
 
 func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 	dir, key := liveEntry(t, "2.1.330")
+	if err := os.Mkdir(filepath.Join(dir, "sessions", strconv.Itoa(os.Getppid())+".json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	dirs := []string{dir, filepath.Join(dir, "empty")}
 	d := daemon{mesh: humanBackend{member: key}, registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs, MachineName: "mac"}, started: time.Now(), pipes: map[*registration]struct{}{{key: key}: {}, {key: key, parent: "parent"}: {}}}
 	w := httptest.NewRecorder()

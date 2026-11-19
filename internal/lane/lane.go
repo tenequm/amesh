@@ -402,7 +402,7 @@ func (c *conversation) watch() {
 				c.close()
 				return
 			}
-			if err != nil && ctx.Err() == nil {
+			if err != nil && ctx.Err() == nil && !errors.Is(err, registry.ErrEntryUnavailable) {
 				slog.Warn("lane monitor", "lane", c.id, "error", err)
 			}
 		}

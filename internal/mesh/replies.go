@@ -13,6 +13,7 @@ import (
 	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/hub"
+	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/relay"
 )
 
@@ -113,7 +114,10 @@ func (b *Backend) writeNotice(ctx context.Context, conn contract.HelloResponse, 
 	if identityErr == nil && b.store.NoticeWritten(source.ID()) {
 		return nil
 	}
-	s, ok, err := b.liveSession(ctx, n.session)
+	s, ok, err := b.deliverySession(ctx, n.session)
+	if n.seq != 0 && errors.Is(err, registry.ErrEntryUnavailable) {
+		return nil
+	}
 	if err != nil || !ok {
 		return err
 	}

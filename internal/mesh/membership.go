@@ -3,16 +3,12 @@ package mesh
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
-	"os"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"sync"
 	"time"
 
@@ -56,12 +52,12 @@ func (b *Backend) restore(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	live, err := b.sessions.List(ctx)
+	live, err := b.sessions.Snapshot(ctx)
 	if err != nil {
 		return err
 	}
 	byKey := map[registry.Key]registry.Session{}
-	for _, s := range live {
+	for _, s := range live.Sessions {
 		byKey[s.Key] = s
 	}
 	b.mu.Lock()
@@ -132,46 +128,15 @@ func status(s registry.Session) contract.PeerStatus {
 	return contract.PeerStatusBusy
 }
 
-func registration(s registry.Session) (contract.SessionRegisterRequest, error) {
-	req := contract.SessionRegisterRequest{SessionID: s.SessionID, Name: s.Name, Project: s.Project, Status: string(status(s)), ClaudeCode: s.Version}
-	// These registration attributes are absent from the identity package's process view.
-	if s.ConfigDir != "" {
-		raw, err := os.ReadFile(filepath.Join(s.ConfigDir, "sessions", strconv.Itoa(s.PID)+".json")) // #nosec G304 -- configured registry and numeric PID
-		if err != nil {
-			return req, err
-		}
-		var meta struct {
-			PID        int    `json:"pid"`
-			ProcStart  string `json:"procStart"`
-			SessionID  string `json:"sessionId"`
-			NameSource string `json:"nameSource"`
-			Entrypoint string `json:"entrypoint"`
-			StartedAt  int64  `json:"startedAt"`
-		}
-		if err = json.Unmarshal(raw, &meta); err != nil {
-			return req, err
-		}
-		if meta.PID != s.PID || meta.ProcStart != s.ProcStart || meta.SessionID != s.SessionID {
-			return req, errors.New("session changed during registration")
-		}
-		req.NameSource, req.Entrypoint, req.StartedAt = meta.NameSource, meta.Entrypoint, meta.StartedAt
-	}
-	return req, nil
+func registration(s registry.Session) contract.SessionRegisterRequest {
+	return contract.SessionRegisterRequest{SessionID: s.SessionID, Name: s.Name, NameSource: s.NameSource, Entrypoint: s.Entrypoint, StartedAt: s.StartedAt, Project: s.Project, Status: string(status(s)), ClaudeCode: s.Version}
 }
 
 func registeredFields(log string, req contract.SessionRegisterRequest) state.Registration {
 	return state.Registration{Log: log, SessionID: req.SessionID, Name: req.Name, NameSource: req.NameSource, Project: req.Project}
 }
 
-func (b *Backend) register(ctx context.Context, key string) error {
-	m, ok := b.member(key)
-	if !ok {
-		return nil
-	}
-	req, err := registration(m.session)
-	if err != nil {
-		return err
-	}
+func (b *Backend) register(ctx context.Context, key string, req contract.SessionRegisterRequest) error {
 	conn, _ := b.client.Connection()
 	resp, err := b.client.Register(ctx, key, req)
 	if err != nil {
@@ -220,12 +185,12 @@ func (b *Backend) reconcile(ctx context.Context) error {
 	if err != nil || conn.Epoch == 0 {
 		return err
 	}
-	live, err := b.sessions.List(ctx)
+	live, err := b.sessions.Snapshot(ctx)
 	if err != nil {
 		return err
 	}
 	byKey := map[registry.Key]registry.Session{}
-	for _, s := range live {
+	for _, s := range live.Sessions {
 		byKey[s.Key] = s
 	}
 	b.mu.RLock()
@@ -236,6 +201,10 @@ func (b *Backend) reconcile(ctx context.Context) error {
 		b.mu.Lock()
 		m := b.members[key]
 		s, found := byKey[m.session.Key]
+		if !found && live.Unavailable(m.session) {
+			b.mu.Unlock()
+			continue
+		}
 		m.hosted = found && b.eligible(s) || !found && m.pipes > 0
 		if found {
 			changed = changed || status(m.session) != status(s)
@@ -257,12 +226,9 @@ func (b *Backend) reconcile(ctx context.Context) error {
 		if !found {
 			continue
 		}
-		req, readErr := registration(s)
-		if readErr != nil {
-			return readErr
-		}
+		req := registration(s)
 		if m.dirty || registeredFields(conn.Log, req) != m.last {
-			if err = b.register(ctx, key); err != nil {
+			if err = b.register(ctx, key, req); err != nil {
 				return err
 			}
 			changed = true
@@ -288,7 +254,12 @@ func (b *Backend) reconcile(ctx context.Context) error {
 	b.lastHeartbeat = now
 	b.presenceLog = conn.Log
 	for _, key := range append(res.Unknown, res.Ended...) {
-		if err = b.register(ctx, key); err != nil {
+		m, hosted := b.member(key)
+		s, found := byKey[m.session.Key]
+		if !hosted || !found {
+			continue
+		}
+		if err = b.register(ctx, key, registration(s)); err != nil {
 			return err
 		}
 	}

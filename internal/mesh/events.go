@@ -16,6 +16,7 @@ import (
 
 	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/envelope"
+	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/relay"
 	"github.com/tenequm/amesh/internal/state"
 )
@@ -158,12 +159,29 @@ func (b *Backend) prepareLog(ctx context.Context, conn contract.HelloResponse) e
 	return nil
 }
 
+func (b *Backend) deliverySession(ctx context.Context, key string) (registry.Session, bool, error) {
+	s, live, err := b.liveSession(ctx, key)
+	if !errors.Is(err, registry.ErrEntryUnavailable) {
+		return s, live, err
+	}
+	// Give a concurrent registry write one presence interval to finish.
+	select {
+	case <-time.After(time.Second):
+		return b.liveSession(ctx, key)
+	case <-ctx.Done():
+		return registry.Session{}, false, ctx.Err()
+	}
+}
+
 func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg contract.MessageEvent) error {
 	key := msg.Session
 	if known, err := b.store.Contains(conn.Log, msg.ID); known || err != nil {
 		return err
 	}
-	s, live, err := b.liveSession(ctx, key)
+	s, live, err := b.deliverySession(ctx, key)
+	if errors.Is(err, registry.ErrEntryUnavailable) {
+		return b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateDropped, contract.DropReasonRouteFailed)
+	}
 	if err != nil {
 		return err
 	}

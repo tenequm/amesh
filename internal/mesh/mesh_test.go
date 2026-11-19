@@ -32,7 +32,10 @@ type testRegistry []registry.Session
 
 func (*testRegistry) SelfCheck(context.Context) error { return nil }
 
-func (r *testRegistry) List(context.Context) ([]registry.Session, error) { return *r, nil }
+func (r *testRegistry) Snapshot(context.Context) (registry.Listing, error) {
+	return registry.Listing{Sessions: *r}, nil
+}
+
 func (r *testRegistry) Resolve(_ context.Context, pid int) (registry.Session, error) {
 	for _, s := range *r {
 		if s.PID == pid {
@@ -374,7 +377,7 @@ func TestUnknownSessionSendKeepsID(t *testing.T) {
 	s := testSession()
 	key := sessionKey(s.Key)
 	var ids []string
-	b, _ := fixture(t, map[string]http.HandlerFunc{
+	b, sessions := fixture(t, map[string]http.HandlerFunc{
 		"GET /peer/peers": hubtest.Reply(t, "peersResponse"),
 		"POST /peer/messages": func(w http.ResponseWriter, r *http.Request) {
 			var req contract.SendRequest
@@ -393,6 +396,7 @@ func TestUnknownSessionSendKeepsID(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
 		},
 	})
+	*sessions = append(*sessions, s)
 	if _, err := b.Connect(t.Context(), s); err != nil {
 		t.Fatal(err)
 	}

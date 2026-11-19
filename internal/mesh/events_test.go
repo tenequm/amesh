@@ -70,6 +70,146 @@ func processSession(t *testing.T, inbox, dir string) registry.Session {
 	return result
 }
 
+func TestPresenceWhileRegistryEntryIsBeingWritten(t *testing.T) {
+	inbox, _, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := meshDir(t)
+	healthy := processSession(t, inbox, dir)
+	pid := os.Getppid()
+	start, err := registry.ProcessStart(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := map[string]any{"pid": pid, "procStart": start, "sessionId": "other", "name": "other", "cwd": dir, "messagingSocketPath": filepath.Join(dir, strconv.Itoa(pid)+".sock"), "peerProtocol": 1}
+	path := filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json")
+	writeEntry := func() {
+		t.Helper()
+		raw, marshalErr := json.Marshal(entry)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if writeErr := os.WriteFile(path, raw, 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	writeEntry()
+	var registrations []contract.SessionRegisterRequest
+	var beats []contract.HeartbeatRequest
+	b, _ := fixture(t, map[string]http.HandlerFunc{
+		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.SessionRegisterRequest
+			if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+				t.Error(decodeErr)
+			}
+			registrations = append(registrations, req)
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: r.PathValue("key"), Address: req.Name + "@test:mac"}})
+		},
+		"POST /peer/heartbeat": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.HeartbeatRequest
+			if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+				t.Error(decodeErr)
+			}
+			beats = append(beats, req)
+			_, _ = io.WriteString(w, "{}")
+		},
+	})
+	r := registry.New([]string{dir})
+	b.sessions = r
+	if err = r.SelfCheck(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = b.Connect(t.Context(), healthy); err != nil {
+		t.Fatal(err)
+	}
+	if err = b.reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(registrations) != 1 || registrations[0].SessionID != healthy.SessionID || registrations[0].NameSource != "user" || len(beats) != 1 || len(beats[0].Sessions) != 1 || beats[0].Sessions[0].Key != sessionKey(healthy.Key) {
+		t.Fatal(registrations, beats)
+	}
+
+	entry["status"] = "busy"
+	writeEntry()
+	other, err := r.Resolve(t.Context(), pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe, err := b.Connect(t.Context(), other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.lastHeartbeat = time.Time{}
+	if err = b.reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(registrations) != 2 || registrations[1].SessionID != "other" || len(beats) != 2 || len(beats[1].Sessions) != 2 {
+		t.Fatal(registrations, beats)
+	}
+
+	if err = pipe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte(`{"pid":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b.lastHeartbeat = time.Time{}
+	if err = b.reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !b.IsMember(other.Key) || len(beats) != 3 || !slices.Equal(beats[1].Sessions, beats[2].Sessions) {
+		t.Fatal("truncated registry file ended a member", beats)
+	}
+	entry["name"] = "renamed"
+	writeEntry()
+	if err = b.reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(registrations) != 3 || registrations[2].Name != "renamed" {
+		t.Fatal(registrations)
+	}
+}
+
+func TestDeliveryRetriesAnIncompleteEntry(t *testing.T) {
+	inbox, _, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := meshDir(t)
+	s := processSession(t, inbox, dir)
+	path := filepath.Join(dir, "sessions", strconv.Itoa(s.PID)+".json")
+	complete, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := sessionKey(s.Key)
+	b := &Backend{sessions: registry.New([]string{dir}), members: map[string]member{key: {session: s, hosted: true}}}
+	synctest.Test(t, func(t *testing.T) {
+		done := make(chan bool, 1)
+		go func() {
+			got, live, lookupErr := b.deliverySession(t.Context(), key)
+			done <- live && lookupErr == nil && got.Key == s.Key
+		}()
+		synctest.Wait()
+		if err := os.WriteFile(path, complete, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if !<-done {
+			t.Fatal("delivery did not recover after the entry became ready")
+		}
+		if err := os.WriteFile(path, []byte("!"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := b.deliverySession(t.Context(), key); !errors.Is(err, registry.ErrEntryUnavailable) {
+			t.Fatalf("bad entry did not release the delivery worker: %v", err)
+		}
+	})
+}
+
 func TestCrashBeforeAcknowledgement(t *testing.T) {
 	if dir := os.Getenv("AMESH_MESH_CRASH_TEST_DIR"); dir != "" {
 		cfg := config.Config{StateDir: dir, MachineName: "mac", HubURL: os.Getenv("AMESH_MESH_CRASH_TEST_URL"), ClaudeConfigDirs: []string{os.Getenv("AMESH_MESH_TEST_SEAT")}, SocketPath: filepath.Join(dir, "amesh-mesh-control.sock")}

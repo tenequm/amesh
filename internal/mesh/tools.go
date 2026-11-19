@@ -157,10 +157,14 @@ func matches(input, full string) bool {
 func (b *Backend) reregister(ctx context.Context, key string) error {
 	b.presence.Lock()
 	defer b.presence.Unlock()
-	if _, ok := b.member(key); !ok {
+	s, live, err := b.liveSession(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !live {
 		return errors.New("session is no longer a mesh member")
 	}
-	return b.register(ctx, key)
+	return b.register(ctx, key, registration(s))
 }
 
 func unknownSession(err error) bool {

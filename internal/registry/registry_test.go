@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -40,7 +41,13 @@ func TestSeatOrderAndMutableAttributes(t *testing.T) {
 			t.Fatalf("%+v %v", s, err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(a, "sessions", "12.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	check("child", "before")
+	if err := os.Remove(filepath.Join(a, "sessions", "12.json")); err != nil {
+		t.Fatal(err)
+	}
 	fixture(t, b, 12, "start", "clear", "renamed")
 	check("clear", "renamed")
 	fixture(t, b, 12, "stale", "clear", "renamed")
@@ -118,6 +125,66 @@ func TestStartupChecksNativeInbox(t *testing.T) {
 	fixture(t, dir, pid, "stale", "id", "name")
 	if err := r.SelfCheck(t.Context()); !errors.Is(err, errStaleProcess) {
 		t.Fatal(err)
+	}
+}
+
+func TestIncompleteAndMalformedEntries(t *testing.T) {
+	dir, healthyDir := t.TempDir(), t.TempDir()
+	fixture(t, healthyDir, 11, "start", "healthy", "healthy")
+	fixture(t, dir, 12, "start", "child", "child")
+	path := filepath.Join(dir, "sessions", "12.json")
+	complete, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		content  []byte
+		notReady bool
+	}{
+		{"missing status", bytes.Replace(complete, []byte(`,"status":"idle"`), nil, 1), true},
+		{"empty", nil, true},
+		{"truncated", complete[:len(complete)-1], true},
+		{"invalid syntax", []byte(`{"pid":!}`), false},
+		{"incompatible schema", []byte(`{"newFormat":true}`), false},
+		{"invalid status", bytes.Replace(complete, []byte(`"idle"`), []byte("null"), 1), false},
+		{"trailing data", append(bytes.Clone(complete), '{'), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			prior := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(prior) })
+			r := New([]string{dir, healthyDir})
+			r.lookup = func(pid int) (int, string, error) { return pid - 1, "start", nil }
+			if err := os.WriteFile(path, tc.content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				live, err := r.List(t.Context())
+				if err != nil || len(live) != 1 || live[0].SessionID != "healthy" {
+					t.Fatal(live, err)
+				}
+			}
+			if count := strings.Count(logs.String(), "skipping session registry entry"); count != 1 {
+				t.Fatalf("logged %d skips for one entry", count)
+			}
+			if _, err := r.Resolve(t.Context(), 12); !errors.Is(err, ErrEntryUnavailable) {
+				t.Fatalf("incomplete child resolved through its parent: %v", err)
+			}
+			startup := New([]string{dir})
+			startup.lookup = r.lookup
+			if err := startup.SelfCheck(t.Context()); (err == nil) != tc.notReady {
+				t.Fatalf("startup check: %v", err)
+			}
+			if err := os.WriteFile(path, complete, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if live, err := r.List(t.Context()); err != nil || len(live) != 2 {
+				t.Fatal(live, err)
+			}
+		})
 	}
 }
 
