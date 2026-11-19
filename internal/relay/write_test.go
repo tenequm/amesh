@@ -122,12 +122,12 @@ func TestConfirmedDropRewriteKeepsIDAndPaces(t *testing.T) {
 		d := delivery(path, 3)
 		var peer peercred.Credentials
 		start := time.Now()
-		ok, err := m.post(t.Context(), d, false, func(p peercred.Credentials) error { peer = p; return nil })
-		if !ok || err != nil {
-			t.Fatal(ok, err)
+		written, err := m.post(t.Context(), d, false, func(p peercred.Credentials) error { peer = p; return nil })
+		if written.IsZero() || err != nil {
+			t.Fatal(written, err)
 		}
 		first := string(<-lines)
-		if err = m.rewrite(t.Context(), d, peer); err != nil {
+		if _, err = m.rewrite(t.Context(), d, peer); err != nil {
 			t.Fatal(err)
 		}
 		if string(<-lines) != first || time.Since(start) != 31*time.Second {
@@ -146,4 +146,39 @@ func TestRewriteBudget(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestDuplicateWaitDoesNotBlockOtherSender(t *testing.T) {
+	m := manager(t)
+	path, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		first := delivery(path, 1)
+		if err := m.Write(t.Context(), first); err != nil {
+			t.Fatal(err)
+		}
+		<-lines
+		second := delivery(path, 2)
+		done := make(chan error, 1)
+		go func() { done <- m.Write(t.Context(), second) }()
+		synctest.Wait()
+		third := delivery(path, 3)
+		third.Message.From = "uds:/tmp/amesh-wire-other.sock"
+		start := time.Now()
+		if err := m.Write(t.Context(), third); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(<-lines); !strings.Contains(got, third.ID) || !time.Now().Equal(start) {
+			t.Fatal("independent sender was delayed")
+		}
+		time.Sleep(31 * time.Second)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if got := string(<-lines); !strings.Contains(got, second.ID) {
+			t.Fatal("missing delayed frame")
+		}
+	})
 }

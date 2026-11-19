@@ -2,8 +2,6 @@ package relay
 
 import (
 	"context"
-	"errors"
-	"io"
 	"sync"
 
 	"github.com/tenequm/amesh/internal/envelope"
@@ -17,6 +15,7 @@ type (
 		store     *state.Store
 		mu        sync.Mutex
 		inboxes   map[string]*inbox
+		endpoints map[string]*endpoint
 		slots     chan struct{}
 	}
 	Delivery struct {
@@ -37,9 +36,5 @@ type Event struct {
 type Handler func(context.Context, Event) error
 
 func New(socketDir string, store *state.Store) *Manager {
-	return &Manager{socketDir: socketDir, store: store, inboxes: make(map[string]*inbox), slots: make(chan struct{}, 32)}
-}
-func Path(socketDir, domain, id string) (string, error) { return "", errors.ErrUnsupported }
-func (*Manager) Listen(ctx context.Context, path string, handle Handler) (io.Closer, error) {
-	return nil, errors.ErrUnsupported
+	return &Manager{socketDir: socketDir, store: store, inboxes: make(map[string]*inbox), slots: make(chan struct{}, 32), endpoints: make(map[string]*endpoint)}
 }

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -51,23 +52,35 @@ type frame struct {
 }
 
 func (f frame) line() ([]byte, error) {
-	if !uuidRE.MatchString(f.ID) || !strings.HasPrefix(f.From, "uds:") || len(f.From) <= 4 || len(f.From) > 300 {
+	if !uuidRE.MatchString(f.ID) || !validFrom(f.From) {
 		return nil, errors.New("invalid native frame id or sender")
 	}
 	b, err := json.Marshal(f)
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > lineLimit {
-		n := 0
-		for _, r := range string(b) {
-			n += utf16.RuneLen(r)
-			if n > lineLimit {
-				return nil, errors.New("oversized native frame")
-			}
-		}
+	if oversized(b) {
+		return nil, errors.New("oversized native frame")
 	}
 	return append(b, '\n'), nil
+}
+
+var fromRE = regexp.MustCompile(`^uds:[A-Za-z0-9%:_/.-]+$`)
+
+func validFrom(s string) bool { return len(s) <= 300 && fromRE.MatchString(s) }
+
+func oversized(b []byte) bool {
+	if len(b) <= lineLimit {
+		return false
+	}
+	n := 0
+	for _, r := range string(b) {
+		n += utf16.RuneLen(r)
+		if n > lineLimit {
+			return true
+		}
+	}
+	return false
 }
 
 type bucket struct {
@@ -96,7 +109,7 @@ type inbox struct {
 	gate    chan struct{}
 	users   int
 	touched time.Time
-	senders map[string]bucket
+	pacing  bucket
 }
 
 func (m *Manager) acquire(ctx context.Context, path string) (*inbox, func(), error) {
@@ -109,7 +122,7 @@ func (m *Manager) acquire(ctx context.Context, path string) (*inbox, func(), err
 	}
 	box := m.inboxes[path]
 	if box == nil {
-		box = &inbox{gate: make(chan struct{}, 1), senders: make(map[string]bucket)}
+		box = &inbox{gate: make(chan struct{}, 1)}
 		m.inboxes[path] = box
 	}
 	box.users++
@@ -143,89 +156,99 @@ func wait(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (m *Manager) send(ctx context.Context, path string, line []byte, before func(peercred.Credentials) error) (int, error) {
+func (m *Manager) send(ctx context.Context, path string, line []byte, before func(peercred.Credentials) error) (int, time.Time, error) {
 	select {
 	case m.slots <- struct{}{}:
 		defer func() { <-m.slots }()
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, time.Time{}, ctx.Err()
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
 	if err != nil {
-		return 0, err
+		return 0, time.Time{}, err
 	}
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	peer, err := peercred.Read(conn.(*net.UnixConn))
 	if err != nil {
-		return 0, err
+		return 0, time.Time{}, err
 	}
 	if peer.PID <= 0 || int(peer.UID) != os.Geteuid() {
-		return 0, errors.New("inbox peer credentials mismatch")
+		return 0, time.Time{}, errors.New("inbox peer credentials mismatch")
 	}
 	if before != nil {
 		if err = before(peer); err != nil {
-			return 0, err
+			return 0, time.Time{}, err
 		}
 	}
 	n, err := conn.Write(line)
+	written := time.Now()
 	if err == nil && n != len(line) {
 		err = io.ErrShortWrite
 	}
-	return n, err
+	if err == nil {
+		// Darwin can lose peer credentials on full close before the receiver accepts.
+		// EOF ends this frame while the read half keeps the posting process identifiable.
+		unixConn := conn.(*net.UnixConn)
+		if unixConn.CloseWrite() == nil && conn.SetReadDeadline(time.Now().Add(time.Second)) == nil {
+			var discard [1]byte
+			_, _ = conn.Read(discard[:])
+		}
+	}
+	return n, written, err
 }
 
 // post releases a claim only after definite non-delivery. A partial write is ambiguous.
-func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(peercred.Credentials) error) (bool, error) {
+func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(peercred.Credentials) error) (time.Time, error) {
 	content, err := envelope.Render(d.Message)
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
 	f := frame{Type: "user", Message: &wireMessage{Role: "user", Content: content}, Priority: "next", From: d.Message.From, Version: 1, ID: d.ID}
 	line, err := f.line()
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
-	box, release, err := m.acquire(ctx, d.Inbox)
+	pair, release, err := m.acquire(ctx, d.Inbox+"\x00"+f.From)
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
 	defer release()
 	if retry {
 		if err = m.store.Forget(d.ID); err != nil {
-			return false, err
+			return time.Time{}, err
 		}
 	}
 	claimed, err := m.store.Claim(d.ID, time.Now().Add(retention))
 	if err != nil || !claimed {
-		return false, err
+		return time.Time{}, err
 	}
-	now := time.Now()
-	for from, b := range box.senders {
-		if now.Sub(b.last) >= burst*refill {
-			delete(box.senders, from)
-		}
-	}
-	b := box.senders[f.From]
 	body := content[strings.IndexByte(content, '\n')+1:]
-	if err = wait(ctx, b.delay(now, body)); err != nil {
-		return false, errors.Join(err, m.store.Forget(d.ID))
+	if err = wait(ctx, pair.pacing.delay(time.Now(), body)); err != nil {
+		return time.Time{}, errors.Join(err, m.store.Forget(d.ID))
 	}
-	n, err := m.send(ctx, d.Inbox, line, before)
+	_, unlockInbox, err := m.acquire(ctx, d.Inbox)
+	if err != nil {
+		return time.Time{}, errors.Join(err, m.store.Forget(d.ID))
+	}
+	defer unlockInbox()
+	n, written, err := m.send(ctx, d.Inbox, line, before)
 	if err != nil && n == 0 {
-		return false, errors.Join(err, m.store.Forget(d.ID))
+		return time.Time{}, errors.Join(err, m.store.Forget(d.ID))
 	}
-	b.sent(time.Now(), body)
-	box.senders[f.From] = b
-	return err == nil, err
+	pair.pacing.sent(written, body)
+	return written, err
 }
 
 func (m *Manager) Write(ctx context.Context, d Delivery) error {
-	written, err := m.post(ctx, d, false, nil)
-	if written && d.NotifyWhenIdle {
+	d.Message.HopChain = slices.Clone(d.Message.HopChain)
+	watch := m.watch(d, false)
+	written, err := m.post(ctx, d, false, watch.register)
+	watch.finish(written, err)
+	if err == nil && d.NotifyWhenIdle {
 		return m.NotifyWhenIdle(ctx, d.Inbox, d.Message.From, d.Message.FromMode, d.ID)
 	}
 	return err
@@ -244,7 +267,18 @@ func (m *Manager) NotifyWhenIdle(ctx context.Context, inbox, from, fromMode, id 
 		return err
 	}
 	defer release()
-	_, err = m.send(ctx, inbox, line, nil)
+	key := "idle:" + id
+	claimed, err := m.store.Claim(key, time.Now().Add(retention))
+	if err != nil || !claimed {
+		return err
+	}
+	d := Delivery{Inbox: inbox, ID: id, Message: envelope.Message{From: from, FromMode: fromMode}}
+	watch := m.watch(d, true)
+	n, written, err := m.send(ctx, inbox, line, watch.register)
+	watch.finish(written, err)
+	if err != nil && n == 0 {
+		return errors.Join(err, m.store.Forget(key))
+	}
 	return err
 }
 
@@ -272,17 +306,16 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, cause, peer, deta
 
 const maxRewrites = 3
 
-func (m *Manager) rewrite(ctx context.Context, d Delivery, peer peercred.Credentials) error {
+func (m *Manager) rewrite(ctx context.Context, d Delivery, peer peercred.Credentials) (time.Time, error) {
 	if err := wait(ctx, refill); err != nil {
-		return err
+		return time.Time{}, err
 	}
-	_, err := m.post(ctx, d, true, func(next peercred.Credentials) error {
+	return m.post(ctx, d, true, func(next peercred.Credentials) error {
 		if next != peer {
 			return errors.New("inbox process changed before retry")
 		}
 		return nil
 	})
-	return err
 }
 
 func (e Event) retryable(rewrites int) bool {
