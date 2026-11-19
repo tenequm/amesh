@@ -88,9 +88,12 @@ func (c *Client) writeCursor(log string, seq int64) error {
 	return saveFile(path, raw, false)
 }
 
-func (c *Client) resetCursor(seq int64) error {
+func (c *Client) resetCursor(log string, seq int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.log != log {
+		return nil
+	}
 	if seq < 0 || seq >= c.cursor {
 		return errors.New("invalid bad_cursor recovery sequence")
 	}
@@ -99,6 +102,16 @@ func (c *Client) resetCursor(seq int64) error {
 	}
 	c.progress = progress{loaded: true, log: c.log, cursor: seq, head: seq, generation: c.generation + 1, pending: make(map[int64]pendingEvent)}
 	return nil
+}
+
+func (c *Client) synchronize(ctx context.Context, seq int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stale(ctx) {
+		return nil
+	}
+	c.head = max(c.head, seq)
+	return c.advance()
 }
 
 func (c *Client) advance() error {

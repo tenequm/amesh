@@ -18,10 +18,18 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
+type ReplayExpectation struct {
+	CursorAfter       int64    `yaml:"cursorAfter"`
+	LogEvents         []int64  `yaml:"logEvents"`
+	StatusEvents      int      `yaml:"statusEvents"`
+	EndpointSnapshots []string `yaml:"endpointSnapshots"`
+}
+
 type fixture struct {
-	Value  any    `yaml:"dataValue"`
-	Stream string `yaml:"serializedValue"`
-	Status int    `yaml:"x-amesh-status"`
+	Expect ReplayExpectation `yaml:"x-amesh-expect"`
+	Value  any               `yaml:"dataValue"`
+	Stream string            `yaml:"serializedValue"`
+	Status int               `yaml:"x-amesh-status"`
 }
 
 var examples = sync.OnceValues(func() (map[string]fixture, error) {
@@ -57,6 +65,11 @@ func load(tb testing.TB, name string) fixture {
 		tb.Fatalf("unknown contract example %q", name)
 	}
 	return f
+}
+
+func ExpectedReplay(tb testing.TB) ReplayExpectation {
+	tb.Helper()
+	return load(tb, "streamReplay").Expect
 }
 
 // Example returns the exact stream bytes or the JSON value of a named example.

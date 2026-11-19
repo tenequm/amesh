@@ -22,25 +22,60 @@ import (
 
 func TestStreamReplayAtEveryByte(t *testing.T) {
 	raw := bytes.ReplaceAll(hubtest.Example(t, "streamReplay"), []byte("Rerun done"), []byte("Résumé ✓"))
-	var seq []string
+	want := hubtest.ExpectedReplay(t)
+	c := enrolled(t, "http://amesh-hub-a1.test")
+	if err := c.loadCursor(); err != nil {
+		t.Fatal(err)
+	}
+	var snapshots []string
+	var seq []int64
 	status := 0
-	err := parseStream(iotest.OneByteReader(bytes.NewReader(raw)), func(ev contract.EventStreamItem) error {
-		if !json.Valid([]byte(ev.Data)) {
-			t.Fatal("corrupt event")
+	synchronized := false
+	handle := func(ctx context.Context, ev contract.EventStreamItem) error {
+		if synchronized {
+			t.Fatal("unexpected event after synchronized in replay")
 		}
-		if ev.ID != nil {
-			seq = append(seq, *ev.ID)
-		}
-		if ev.Event == "status" {
+		switch {
+		case ev.ID != nil:
+			if !slices.Equal(snapshots, want.EndpointSnapshots) || status > 0 {
+				t.Fatal("logged event outside replay")
+			}
+			n, err := strconv.ParseInt(*ev.ID, 10, 64)
+			if err != nil {
+				return err
+			}
+			seq = append(seq, n)
+			if ev.Event == "message" && !strings.Contains(ev.Data, "Résumé ✓") {
+				t.Fatal("split UTF-8 lost")
+			}
+			return c.Ack(ctx, n)
+		case ev.Event == "endpoint":
+			if c.cursor != 0 {
+				t.Fatal("snapshot moved cursor")
+			}
+			var endpoint contract.EndpointEvent
+			if err := json.Unmarshal([]byte(ev.Data), &endpoint); err != nil {
+				return err
+			}
+			snapshots = append(snapshots, endpoint.ID)
+		case ev.Event == "status":
+			if !slices.Equal(seq, want.LogEvents) {
+				t.Fatal("status arrived before replay ended")
+			}
 			status++
-		}
-		if ev.Event == "message" && !strings.Contains(ev.Data, "Résumé ✓") {
-			t.Fatal("split UTF-8 lost")
+		case ev.Event == "synchronized":
+			if status != want.StatusEvents {
+				t.Fatal("status burst incomplete at synchronization")
+			}
+			synchronized = true
 		}
 		return nil
+	}
+	err := parseStream(iotest.OneByteReader(bytes.NewReader(raw)), func(ev contract.EventStreamItem) error {
+		return c.event(t.Context(), ev, handle)
 	})
-	if !errors.Is(err, io.EOF) || !slices.Equal(seq, []string{"118", "119", "121", "122", "123"}) || status != 1 {
-		t.Fatal("replay mismatch")
+	if !errors.Is(err, io.EOF) || !synchronized || c.cursor != want.CursorAfter {
+		t.Fatalf("replay ended at %d with synchronized=%t: %v", c.cursor, synchronized, err)
 	}
 	err = parseStream(strings.NewReader("event: message\ndata: {}\n"), func(contract.EventStreamItem) error { t.Fatal("partial event emitted"); return nil })
 	if !errors.Is(err, io.EOF) {
@@ -103,8 +138,34 @@ func TestLowWaterMarkSurvivesReplayAndRestart(t *testing.T) {
 	if n, ackErr := c.cursor, c.Ack(ctx, 150); ackErr == nil || n != c.cursor {
 		t.Fatal("ack beyond log accepted")
 	}
-	if err = restarted.resetCursor(4); err != nil || restarted.cursor != 4 {
-		t.Fatal("log reset failed")
+	old := context.WithValue(ctx, generationKey{}, c.generation)
+	if err = c.resetCursor("lg_oldlog123", 4); err != nil || c.cursor != 129 {
+		t.Fatal("bad_cursor from another log changed current progress")
+	}
+	if err = c.resetCursor(c.log, 4); err != nil {
+		t.Fatal(err)
+	}
+	message.Seq = 119
+	data, _ = json.Marshal(message)
+	id = "119"
+	replayed := false
+	if err = c.event(ctx, contract.EventStreamItem{ID: &id, Event: "message", Data: string(data)}, func(context.Context, contract.EventStreamItem) error { replayed = true; return nil }); err != nil || !replayed {
+		t.Fatalf("bad_cursor suppressed a reused sequence or message id: %v", err)
+	}
+	if err = c.Ack(old, 119); err != nil || c.cursor != 118 {
+		t.Fatal("ack from before bad_cursor crossed replayed message")
+	}
+}
+
+func TestSynchronizedAdvancesOnReceipt(t *testing.T) {
+	c := enrolled(t, "http://amesh-hub-a1.test")
+	if err := c.loadCursor(); err != nil {
+		t.Fatal(err)
+	}
+	stopped := errors.New("cache refresh stopped")
+	err := c.event(t.Context(), contract.EventStreamItem{Event: "synchronized", Data: `{"kind":"synchronized","seq":10}`}, func(context.Context, contract.EventStreamItem) error { return stopped })
+	if !errors.Is(err, stopped) || c.cursor != 10 {
+		t.Fatalf("synchronized cursor %d: %v", c.cursor, err)
 	}
 }
 

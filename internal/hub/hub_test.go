@@ -263,6 +263,12 @@ func TestSettingsAndAuthenticationRecovery(t *testing.T) {
 				t.Fatal("incomplete settings fallback")
 			}
 			calls := s.Calls()
+			first := contract.HelloRequest{}
+			retry := contract.HelloRequest{}
+			if json.Unmarshal(calls[0].Body, &first) != nil || json.Unmarshal(calls[1].Body, &retry) != nil ||
+				!first.Takeover || retry.Takeover || first.Instance != retry.Instance || retry.ResumeEpoch != nil {
+				t.Fatal("authentication retry changed ownership")
+			}
 			checkSignature(t, c, calls[1])
 			server := example[contract.ErrorBody](t, "errStaleTimestamp")
 			if !strings.Contains(calls[1].Header.Get("Authorization"), ",t="+strconv.FormatInt(*server.ServerTime/1000, 10)+",") {
@@ -310,7 +316,12 @@ func TestRetryAcrossEpochsAndReplacedLog(t *testing.T) {
 				defer cancel()
 				steps := []hubtest.Step{
 					{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
-					{Method: "POST", Target: "/peer/messages", Reply: func(http.ResponseWriter, *http.Request) { cancel(); panic(http.ErrAbortHandler) }},
+					{Method: "POST", Target: "/peer/messages", Reply: func(w http.ResponseWriter, _ *http.Request) {
+						w.WriteHeader(http.StatusOK)
+						w.(http.Flusher).Flush()
+						cancel()
+						panic(http.ErrAbortHandler)
+					}},
 					{Method: "POST", Target: "/peer/hello", Reply: reply},
 				}
 				if !replace {
@@ -484,12 +495,25 @@ func TestWriteRecoversEpochAndCompleteMembership(t *testing.T) {
 
 func TestProxyErrorAllowsRecovery(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		denied := func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "proxy denied", http.StatusForbidden) }
+		var attempts []time.Time
+		denied := func(w http.ResponseWriter, r *http.Request) {
+			attempts = append(attempts, time.Now())
+			w.WriteHeader(http.StatusForbidden)
+			if r.Method == http.MethodGet {
+				io.WriteString(w, "upstream access denied")
+			} else {
+				io.WriteString(w, `{"error":"machine_revoked"}`)
+			}
+		}
+		recovered := func(w http.ResponseWriter, r *http.Request) {
+			attempts = append(attempts, time.Now())
+			hubtest.Reply(t, "helloResponse")(w, r)
+		}
 		s := hubtest.MemoryScript(t,
 			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: denied},
-			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: recovered},
 			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=7", Reply: denied},
-			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: recovered},
 			hubtest.Step{Method: "GET", Target: "/peer/events?after=0&epoch=7", Reply: eventReply("revoked", hubtest.Example(t, "eventRevoked"))})
 		c := enrolled(t, "http://amesh-hub.test")
 		c.http.Transport = s.Client().Transport
@@ -499,6 +523,11 @@ func TestProxyErrorAllowsRecovery(t *testing.T) {
 		err := c.Stream(t.Context(), func(context.Context, contract.EventStreamItem) error { return nil })
 		if !hasCode(err, 403, "machine_revoked") {
 			t.Fatal(err)
+		}
+		for _, i := range []int{0, 2} {
+			if attempts[i+1].Sub(attempts[i]) < 250*time.Millisecond {
+				t.Fatal("retried proxy error before initial backoff")
+			}
 		}
 	})
 }

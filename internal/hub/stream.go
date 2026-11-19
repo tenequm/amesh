@@ -132,16 +132,10 @@ func (c *Client) event(ctx context.Context, item contract.EventStreamItem, handl
 		if json.Unmarshal(meta.Seq, &dataSeq) != nil || dataSeq == nil || *dataSeq < 0 {
 			return errors.New("missing or invalid synchronization sequence")
 		}
-		if err := handle(ctx, item); err != nil {
+		if err := c.synchronize(ctx, *dataSeq); err != nil {
 			return err
 		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.stale(ctx) {
-			return nil
-		}
-		c.head = max(c.head, *dataSeq)
-		return c.advance()
+		return handle(ctx, item)
 	case "status":
 		return handle(ctx, item)
 	default:
@@ -270,7 +264,12 @@ func (c *Client) Stream(ctx context.Context, handle func(context.Context, contra
 	}
 	c.helloMu.RLock()
 	conn, err := c.Connection()
-	needHello := conn.Epoch == 0 || c.usedHello == c.helloCount
+	needHello := c.usedHello == c.helloCount
+	if conn.Epoch == 0 && c.lastHelloErr != nil && err == nil {
+		// Apply the first failed hello's backoff before reconnecting.
+		err = c.lastHelloErr
+		needHello = false
+	}
 	c.helloMu.RUnlock()
 	delay := time.Duration(conn.Settings.BackoffInitialMs) * time.Millisecond
 	for {
@@ -295,6 +294,13 @@ func (c *Client) Stream(ctx context.Context, handle func(context.Context, contra
 			conn, _ = c.Connection()
 			c.helloMu.RUnlock()
 			connected, err = c.readStream(ctx, conn, handle)
+			if h, ok := errors.AsType[*HTTPError](err); ok && h.Status == 400 && h.Body.Error == "bad_cursor" && h.Body.Seq != nil {
+				slog.Warn("resetting peer cursor to hub head", "seq", *h.Body.Seq)
+				if resetErr := c.resetCursor(conn.Log, *h.Body.Seq); resetErr != nil {
+					return resetErr
+				}
+				continue
+			}
 			if hasCode(err, 409, "superseded") {
 				err = c.confirmOwner(ctx, revision)
 				if err == nil {
@@ -319,13 +325,6 @@ func (c *Client) Stream(ctx context.Context, handle func(context.Context, contra
 			continue
 		}
 		if h, ok := errors.AsType[*HTTPError](err); ok {
-			if h.Status == 400 && h.Body.Error == "bad_cursor" && h.Body.Seq != nil {
-				slog.Warn("resetting peer cursor to hub head", "seq", *h.Body.Seq)
-				if resetErr := c.resetCursor(*h.Body.Seq); resetErr != nil {
-					return resetErr
-				}
-				continue
-			}
 			if h.Body.Error != "" && !h.transient() {
 				return err
 			}

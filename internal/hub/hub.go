@@ -44,6 +44,7 @@ type Client struct {
 	logChanged    chan struct{}
 	instance      string
 	helloCount    uint64
+	lastHelloErr  error
 	verifying     bool
 	presenceMu    sync.Mutex
 	bindingMu     sync.Mutex
@@ -98,10 +99,22 @@ func (c *Client) stop(err error) error {
 	return c.halt
 }
 
-func (c *Client) open(ctx context.Context, method, route string, body []byte, media string) (*http.Response, error) {
+func (c *Client) open(ctx context.Context, method, route string, payload any, media string) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
 		if _, err := c.Connection(); err != nil {
 			return nil, err
+		}
+		var body []byte
+		if payload != nil {
+			if hello, ok := payload.(contract.HelloRequest); ok && attempt > 0 {
+				hello.Takeover = false
+				payload = hello
+			}
+			var err error
+			body, err = json.Marshal(payload)
+			if err != nil {
+				return nil, err
+			}
 		}
 		req, err := http.NewRequestWithContext(ctx, method, c.cfg.HubURL+route, bytes.NewReader(body))
 		if err != nil {
@@ -137,7 +150,16 @@ func (c *Client) open(ctx context.Context, method, route string, body []byte, me
 			return resp, nil
 		}
 		e := &HTTPError{Status: resp.StatusCode}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<18)).Decode(&e.Body)
+		var wire struct {
+			contract.ErrorBody
+			Message *string `json:"message"`
+		}
+		const maxErrorBody = 1 << 18
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
+		if readErr == nil && len(raw) <= maxErrorBody && json.Unmarshal(raw, &wire) == nil && wire.Message != nil {
+			e.Body = wire.ErrorBody
+			e.Body.Message = *wire.Message
+		}
 		_ = resp.Body.Close()
 		if seconds, parseErr := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 32); parseErr == nil && seconds > 0 {
 			e.RetryAfter = time.Duration(seconds) * time.Second
@@ -168,18 +190,10 @@ func (c *Client) open(ctx context.Context, method, route string, body []byte, me
 
 func rpc[T any](ctx context.Context, c *Client, method, route string, request any) (T, error) {
 	var result T
-	var body []byte
-	var err error
-	if request != nil {
-		body, err = json.Marshal(request)
-		if err != nil {
-			return result, err
-		}
-	}
 	conn, _ := c.Connection()
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(conn.Settings.RequestTimeoutMs)*time.Millisecond)
 	defer cancel()
-	resp, err := c.open(ctx, method, route, body, "application/json")
+	resp, err := c.open(ctx, method, route, request, "application/json")
 	if err != nil {
 		return result, err
 	}
@@ -198,7 +212,9 @@ func (c *Client) Info(ctx context.Context) (contract.HelloInfo, error) {
 func (c *Client) Hello(ctx context.Context, req contract.HelloRequest) (contract.HelloResponse, error) {
 	c.helloMu.Lock()
 	defer c.helloMu.Unlock()
-	return c.helloLocked(ctx, req)
+	v, err := c.helloLocked(ctx, req)
+	c.lastHelloErr = err
+	return v, err
 }
 
 func hasCode(err error, status int, code string) bool {
