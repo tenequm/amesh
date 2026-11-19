@@ -14,7 +14,6 @@ import (
 
 	"github.com/tenequm/amesh/internal/config"
 	"github.com/tenequm/amesh/internal/control"
-	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/lane"
 	"github.com/tenequm/amesh/internal/mesh"
@@ -100,14 +99,6 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 }
 
 func daemon(ctx context.Context, cfg config.Config) error {
-	if err := envelope.SelfCheck(); err != nil {
-		return fmt.Errorf("native envelope startup check: %w", err)
-	}
-	store := state.New(cfg.StateDir)
-	if err := store.Lock(); err != nil {
-		return err
-	}
-	defer store.Close()
 	sessions := registry.New(cfg.ClaudeConfigDirs)
 	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
 	if runtimeDir == "" {
@@ -116,10 +107,19 @@ func daemon(ctx context.Context, cfg config.Config) error {
 	if runtimeDir == "" {
 		runtimeDir = "/tmp"
 	}
-	relays := relay.New(filepath.Join(runtimeDir, "cc-socks"), store)
+	socketDir := filepath.Join(runtimeDir, "cc-socks")
+	store := state.New(cfg.StateDir)
+	relays := relay.New(socketDir, store)
 	ctx, cancel := context.WithCancel(ctx)
-	laneBackend := lane.New(ctx, sessions, relays, cfg.StateDir)
-	defer func() { cancel(); laneBackend.Wait() }()
+	defer cancel()
 	meshBackend := mesh.New(cfg, sessions, relays, hub.New(cfg))
-	return control.Serve(ctx, cfg, sessions, laneBackend, meshBackend, relays.OwnsRelay)
+	closeMesh, err := meshBackend.Start(ctx, store, socketDir)
+	if err != nil {
+		return err
+	}
+	laneBackend := lane.New(ctx, sessions, relays, cfg.StateDir)
+	serveErr := control.Serve(ctx, cfg, sessions, laneBackend, meshBackend, relays.OwnsRelay)
+	cancel()
+	laneBackend.Wait()
+	return errors.Join(serveErr, closeMesh())
 }
