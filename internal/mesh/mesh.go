@@ -43,6 +43,7 @@ type Backend struct {
 }
 
 type sessionRegistry interface {
+	SelfCheck(context.Context) error
 	List(context.Context) ([]registry.Session, error)
 	Resolve(context.Context, int) (registry.Session, error)
 }

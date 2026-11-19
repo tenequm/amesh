@@ -99,13 +99,15 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 
 func daemon(ctx context.Context, cfg config.Config) error {
 	sessions := registry.New(cfg.ClaudeConfigDirs)
-	relays := relay.New("/tmp/cc-socks", state.New(cfg.StateDir))
+	const socketDir = "/tmp/cc-socks"
+	store := state.New(cfg.StateDir)
+	relays := relay.New(socketDir, store)
 	laneBackend := lane.New(sessions, relays)
 	meshBackend := mesh.New(cfg, sessions, relays, hub.New(cfg))
-	// The relay manager gains its address lookup in the wire lane.
-	var ownsRelay func(string) bool
-	if owner, ok := any(relays).(interface{ OwnsRelay(string) bool }); ok {
-		ownsRelay = owner.OwnsRelay
+	closeMesh, err := meshBackend.Start(ctx, store, socketDir)
+	if err != nil {
+		return err
 	}
-	return control.Serve(ctx, cfg, sessions, laneBackend, meshBackend, ownsRelay)
+	serveErr := control.Serve(ctx, cfg, sessions, laneBackend, meshBackend, relays.OwnsRelay)
+	return errors.Join(serveErr, closeMesh())
 }

@@ -3,6 +3,7 @@ package mesh
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -29,6 +30,8 @@ import (
 )
 
 type testRegistry []registry.Session
+
+func (*testRegistry) SelfCheck(context.Context) error { return nil }
 
 func (r *testRegistry) List(context.Context) ([]registry.Session, error) { return *r, nil }
 func (r *testRegistry) Resolve(_ context.Context, pid int) (registry.Session, error) {
@@ -290,4 +293,69 @@ func TestHumanTurnReregistersOnce(t *testing.T) {
 	if !slices.Equal(calls, []string{"human", "register", "human"}) {
 		t.Fatal(calls)
 	}
+}
+
+func TestDaemonLifecycle(t *testing.T) {
+	dir := meshDir(t)
+	store := state.New(dir)
+	heartbeat := make(chan struct{}, 1)
+	stream := make(chan struct{})
+	server, err := hubtest.New(t, map[string]http.HandlerFunc{
+		"POST /peer/hello": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.HelloRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if !req.Takeover || req.Amesh.Version == "" || req.ClaudeCode.NativeCheck != "ok" || req.ClaudeCode.PeerProtocol != 1 {
+				t.Error("hello before native checks")
+			}
+			hubtest.Reply(t, "helloResponse")(w, r)
+		},
+		"GET /peer/events": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "event: synchronized\ndata: {\"kind\":\"synchronized\",\"seq\":0}\n\n")
+			w.(http.Flusher).Flush()
+			close(stream)
+			<-r.Context().Done()
+		},
+		"POST /peer/heartbeat": func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "{}")
+			select {
+			case heartbeat <- struct{}{}:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{MachineName: "mac", StateDir: dir, HubURL: server.URL + "/peer", ClaudeConfigDirs: []string{dir}}
+	if err = hub.Enroll(t.Context(), cfg, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	b := New(cfg, registry.New(cfg.ClaudeConfigDirs), relay.New(dir, store), hub.New(cfg))
+	stop, err := b.Start(t.Context(), store, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	lock := state.New(dir)
+	if err = lock.Lock(); err == nil {
+		t.Fatal("daemon did not take state lock")
+	}
+	select {
+	case <-heartbeat:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no heartbeat")
+	}
+	select {
+	case <-stream:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no event stream")
+	}
+	if err = stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err = lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	_ = lock.Close()
 }
