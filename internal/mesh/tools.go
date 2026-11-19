@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"slices"
 	"strings"
@@ -11,9 +12,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tenequm/amesh/internal/contract"
+	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/mcpserver"
 	"github.com/tenequm/amesh/internal/registry"
+	"github.com/tenequm/amesh/internal/relay"
 )
 
 const label = "[a-z0-9][a-z0-9._-]{0,39}"
@@ -145,6 +148,48 @@ func (b *Backend) send(ctx context.Context, req contract.SendRequest) (contract.
 	return response, err
 }
 
+func (b *Backend) localTarget(to string) (member, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, m := range b.members {
+		if m.hosted && m.address != "" && matches(to, m.address) {
+			return m, true
+		}
+	}
+	return member{}, false
+}
+
+func (b *Backend) liveSession(ctx context.Context, key string) (registry.Session, bool, error) {
+	m, ok := b.member(key)
+	if !ok {
+		return registry.Session{}, false, nil
+	}
+	s, err := b.sessions.Resolve(ctx, m.session.PID)
+	if errors.Is(err, os.ErrNotExist) {
+		return registry.Session{}, false, nil
+	}
+	if err != nil {
+		return registry.Session{}, false, err
+	}
+	return s, s.Key == m.session.Key && b.eligible(s), nil
+}
+
+func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target member, message string) (mcpserver.SendResult, error) {
+	receiver, ok, err := b.liveSession(ctx, sessionKey(target.session.Key))
+	if err != nil {
+		return mcpserver.SendResult{}, err
+	}
+	if !ok {
+		return refused(target.address+" is not running anymore.", nil), nil
+	}
+	id := uuid.NewString()
+	err = b.relays.Write(ctx, relay.Delivery{ID: id, Inbox: receiver.SocketPath, Message: envelope.Message{From: envelope.Address(s.SocketPath), FromName: s.Name, FromMode: s.FromMode, Body: message}})
+	if err != nil {
+		return refused("The message could not be written to "+target.address+".", nil), nil //nolint:nilerr // MCP delivery refusals are ordinary tool results.
+	}
+	return mcpserver.SendResult{Accepted: true, ID: id, To: target.address, Note: "Sent. A reply, if any, arrives later as a message from " + target.address + "."}, nil
+}
+
 func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcpserver.SendArgs) (mcpserver.SendResult, error) {
 	conn, halt := b.client.Connection()
 	if halt != nil {
@@ -170,6 +215,9 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 			limit = fmt.Sprintf("%d KiB", conn.Limits.MaxTextBytes/1024)
 		}
 		return refused("The message is longer than "+limit+". Shorten it or split it.", nil), nil
+	}
+	if target, found := b.localTarget(to); found {
+		return b.sendLocal(ctx, s, target, args.Message)
 	}
 	peers, err := b.ListPeers(ctx, s, "")
 	if err != nil {

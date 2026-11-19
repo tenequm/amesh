@@ -6,12 +6,16 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tenequm/amesh/internal/envelope"
+	"github.com/tenequm/amesh/internal/relay/relaytest"
 
 	"github.com/tenequm/amesh/internal/mcpserver"
 
@@ -197,5 +201,43 @@ func TestDirectoryAndSend(t *testing.T) {
 	req := <-recv
 	if req.ID != got.ID || req.From.Session != key || req.FromMode != nil || req.Origin != "unknown" || req.NotifyWhenIdle {
 		t.Fatal("incorrect remote send metadata")
+	}
+}
+
+func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
+	b, r := fixture(t, map[string]http.HandlerFunc{})
+	inbox, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := testSession()
+	sender.SocketPath = filepath.Join(b.cfg.StateDir, "123.sock")
+	sender.FromMode = "prompting"
+	target := sender
+	target.PID++
+	target.Name = "review"
+	target.SocketPath = inbox
+	*r = append(*r, sender, target)
+	b.members[sessionKey(sender.Key)] = member{session: sender, hosted: true, address: "review@pond:mac"}
+	b.members[sessionKey(target.Key)] = member{session: target, hosted: true, address: "review-2@pond:mac"}
+	got, err := b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond", Message: "hello locally"})
+	if err != nil || !got.Accepted || got.To != "review-2@pond:mac" {
+		t.Fatalf("%#v %v", got, err)
+	}
+	var frame contract.NativeUserFrame
+	if err = json.Unmarshal(<-lines, &frame); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := envelope.Parse(frame.Message.Content)
+	if err != nil || msg.Body != "hello locally" || msg.From != envelope.Address(sender.SocketPath) || msg.FromName != sender.Name || msg.FromMode != sender.FromMode || value(frame.From) != msg.From || frame.MsgID != got.ID {
+		t.Fatal("wrong local native frame")
+	}
+	if n, e := b.client.Pending(""); e != nil || n != 0 {
+		t.Fatal("local send entered outbox")
+	}
+	*r = (*r)[:1]
+	got, err = b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond:mac", Message: "after exit"})
+	if err != nil || got.Accepted {
+		t.Fatal("delivered to a former member")
 	}
 }
