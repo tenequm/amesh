@@ -343,11 +343,15 @@ func (s Session) MeshExcluded(dirs, roots []string) bool {
 }
 
 func (s Session) MeshExclusionRoot(dirs, roots []string) (string, bool) {
+	var resolved string
+	var err error
+	if len(roots) > 0 {
+		resolved, err = filepath.EvalSymlinks(s.CWD)
+	}
 	for _, root := range roots {
 		if s.CWD == root || strings.HasPrefix(s.CWD, strings.TrimRight(root, "/")+"/") {
 			return root, true
 		}
-		resolved, err := filepath.EvalSymlinks(s.CWD)
 		base, e := filepath.EvalSymlinks(root)
 		if err == nil && e == nil && (resolved == base || strings.HasPrefix(resolved, strings.TrimRight(base, "/")+"/")) {
 			return root, true

@@ -202,7 +202,10 @@ type bufferedConn struct {
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
 
-const pipeAdmissionWait = 3 * time.Second
+const (
+	pipeAdmissionWait = 3 * time.Second
+	pipeAdmissionPoll = 100 * time.Millisecond
+)
 
 func (d *daemon) resolvePipe(ctx context.Context, pid int) (registry.Session, error) {
 	deadline := time.Now().Add(pipeAdmissionWait)
@@ -215,7 +218,7 @@ func (d *daemon) resolvePipe(ctx context.Context, pid int) (registry.Session, er
 		select {
 		case <-ctx.Done():
 			return registry.Session{}, errors.Join(err, ctx.Err())
-		case <-time.After(min(100*time.Millisecond, remaining)):
+		case <-time.After(min(pipeAdmissionPoll, remaining)):
 		}
 	}
 }
