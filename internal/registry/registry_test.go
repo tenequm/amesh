@@ -1,0 +1,220 @@
+package registry
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func fixture(t *testing.T, dir string, pid int, start, id, name string) {
+	t.Helper()
+	path := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(map[string]any{"pid": pid, "procStart": start, "sessionId": id, "name": name, "cwd": dir, "status": "idle", "messagingSocketPath": "/tmp/amesh-identity.sock", "peerProtocol": 1})
+	if err := os.WriteFile(filepath.Join(path, strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSeatOrderAndMutableAttributes(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	r := New([]string{a, b})
+	r.lookup = func(p int) (int, string, error) { return p - 1, "start", nil }
+	fixture(t, a, 11, "start", "parent", "parent")
+	fixture(t, b, 12, "start", "child", "before")
+	check := func(id, name string) {
+		t.Helper()
+		s, err := r.Resolve(t.Context(), 13)
+		if err != nil || s.SessionID != id || s.Name != name {
+			t.Fatalf("%+v %v", s, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(a, "sessions", "12.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check("child", "before")
+	if err := os.Remove(filepath.Join(a, "sessions", "12.json")); err != nil {
+		t.Fatal(err)
+	}
+	fixture(t, b, 12, "start", "clear", "renamed")
+	check("clear", "renamed")
+	fixture(t, b, 12, "stale", "clear", "renamed")
+	check("parent", "parent")
+	live, err := r.List(t.Context())
+	if err != nil || len(live) != 1 {
+		t.Fatalf("%+v %v", live, err)
+	}
+	_, err = r.Resolve(t.Context(), 20)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+}
+
+func TestLiveProcessAndFormat(t *testing.T) {
+	t.Setenv("TZ", "Pacific/Honolulu")
+	pid := os.Getpid()
+	p, start, err := process(pid)
+	if err != nil || p != os.Getppid() || start == "" {
+		t.Fatal(p, start, err)
+	}
+	if runtime.GOOS == "darwin" {
+		cmd := exec.CommandContext(t.Context(), "ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+		cmd.Env = append(os.Environ(), "LC_ALL=C", "TZ=UTC")
+		out, e := cmd.Output()
+		if e != nil || strings.TrimSpace(string(out)) != start {
+			t.Fatalf("%q %q %v", out, start, e)
+		}
+	}
+	dir := t.TempDir()
+	fixture(t, dir, pid, start, "id", "")
+	err = New([]string{dir}).SelfCheck(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "missing name") {
+		t.Fatal(err)
+	}
+	if _, _, err = process(99999999); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(fmt.Errorf("missing pid: %w", err))
+	}
+}
+
+func TestStartupChecksNativeInbox(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "amesh-identity")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	pid := os.Getpid()
+	_, start, e := process(pid)
+	if e != nil {
+		t.Fatal(e)
+	}
+	fixture(t, dir, pid, start, "id", "name")
+	path := filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json")
+	b, e := os.ReadFile(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	socket := filepath.Join(dir, strconv.Itoa(pid)+".sock")
+	b = bytes.Replace(b, []byte("/tmp/amesh-identity.sock"), []byte(socket), 1)
+	if e = os.WriteFile(path, b, 0o600); e != nil {
+		t.Fatal(e)
+	}
+	r := New([]string{dir})
+	if err := r.SelfCheck(t.Context()); err == nil {
+		t.Fatal("accepted absent inbox")
+	}
+	ln, e := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Base(socket), Net: "unix"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer ln.Close()
+	if err := r.SelfCheck(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	fixture(t, dir, pid, "stale", "id", "name")
+	if err := r.SelfCheck(t.Context()); !errors.Is(err, errStaleProcess) {
+		t.Fatal(err)
+	}
+}
+
+func TestIncompleteAndMalformedEntries(t *testing.T) {
+	dir, healthyDir := t.TempDir(), t.TempDir()
+	fixture(t, healthyDir, 11, "start", "healthy", "healthy")
+	fixture(t, dir, 12, "start", "child", "child")
+	path := filepath.Join(dir, "sessions", "12.json")
+	complete, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		content  []byte
+		notReady bool
+	}{
+		{"missing status", bytes.Replace(complete, []byte(`,"status":"idle"`), nil, 1), true},
+		{"empty", nil, true},
+		{"truncated", complete[:len(complete)-1], true},
+		{"invalid syntax", []byte(`{"pid":!}`), false},
+		{"incompatible schema", []byte(`{"newFormat":true}`), false},
+		{"invalid status", bytes.Replace(complete, []byte(`"idle"`), []byte("null"), 1), false},
+		{"trailing data", append(bytes.Clone(complete), '{'), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			prior := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(prior) })
+			r := New([]string{dir, healthyDir})
+			r.lookup = func(pid int) (int, string, error) { return pid - 1, "start", nil }
+			if err := os.WriteFile(path, tc.content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				live, err := r.List(t.Context())
+				if err != nil || len(live) != 1 || live[0].SessionID != "healthy" {
+					t.Fatal(live, err)
+				}
+			}
+			if count := strings.Count(logs.String(), "skipping session registry entry"); count != 1 {
+				t.Fatalf("logged %d skips for one entry", count)
+			}
+			if _, err := r.Resolve(t.Context(), 12); !errors.Is(err, ErrEntryUnavailable) {
+				t.Fatalf("incomplete child resolved through its parent: %v", err)
+			}
+			startup := New([]string{dir})
+			startup.lookup = r.lookup
+			if err := startup.SelfCheck(t.Context()); (err == nil) != tc.notReady {
+				t.Fatalf("startup check: %v", err)
+			}
+			if err := os.WriteFile(path, complete, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if live, err := r.List(t.Context()); err != nil || len(live) != 2 {
+				t.Fatal(live, err)
+			}
+		})
+	}
+}
+
+func TestStoredKeyLivenessAndMode(t *testing.T) {
+	dir := t.TempDir()
+	r := New([]string{dir})
+	r.lookup = func(pid int) (int, string, error) { return pid - 1, "start", nil }
+	fixture(t, dir, 12, "start", "id", "name")
+	key := Key{12, "start"}
+	r.RecordPermissionMode(key, "bypassPermissions")
+	if s, err := r.Resolve(t.Context(), 13); err != nil || s.FromMode != "bypass" {
+		t.Fatal(s, err)
+	}
+	if ok, err := r.Live(t.Context(), key); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	for _, gone := range []Key{{12, "different"}, {13, "start"}} {
+		if ok, err := r.Live(t.Context(), gone); err != nil || ok {
+			t.Fatal(gone, ok, err)
+		}
+	}
+	r.RecordPermissionMode(key, "plan")
+	if s, err := r.List(t.Context()); err != nil || s[0].FromMode != "prompting" {
+		t.Fatal(s, err)
+	}
+	fixture(t, dir, 13, "start", "other", "other")
+	if err := os.Rename(filepath.Join(dir, "sessions", "13.json"), filepath.Join(dir, "sessions", "12.json")); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := r.Live(t.Context(), key); ok || err != nil {
+		t.Fatalf("stored entry with a different PID: live=%t err=%v", ok, err)
+	}
+}

@@ -1,6 +1,5 @@
-scratch/
-run.log
-report.md
 dist/
+.golangci-cache/
 .env
 lefthook-local.yml
+scratch/
