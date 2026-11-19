@@ -2,8 +2,8 @@ package relay
 
 import (
 	"context"
-	"errors"
-	"io"
+	"sync"
+	"time"
 
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
@@ -11,17 +11,29 @@ import (
 )
 
 type (
-	Manager  struct{}
+	Manager struct {
+		socketDir string
+		store     *state.Store
+		mu        sync.Mutex
+		inboxes   map[string]*inbox
+		endpoints map[string]*endpoint
+		slots     chan struct{}
+	}
 	Delivery struct {
-		Inbox, ID      string
+		Inbox, ID string
+		// Hub deliveries carry the log ID and receiving session key for startup reports.
+		Log, Session   string
+		AcceptWindow   time.Duration
+		notice         bool
 		Message        envelope.Message
 		NotifyWhenIdle bool
+		IdleFromMode   string // Receiver mode for the optional idle subscription.
 	}
 )
 
 type Event struct {
 	Peer                                                     peercred.Credentials
-	Action, ID, OriginalID                                   string
+	Action, ID, OriginalID, Log, Session                     string
 	From, FromMode, Status, StatusDetail, DropReason, Reason string
 	FinishedAt                                               int64
 	DroppedIDs                                               []string
@@ -29,12 +41,13 @@ type Event struct {
 }
 type Handler func(context.Context, Event) error
 
-func New(socketDir string, store *state.Store) *Manager { return &Manager{} }
-func Path(socketDir, domain, id string) (string, error) { return "", errors.ErrUnsupported }
-func (*Manager) Listen(ctx context.Context, path string, handle Handler) (io.Closer, error) {
-	return nil, errors.ErrUnsupported
+func New(socketDir string, store *state.Store) *Manager {
+	return &Manager{socketDir: socketDir, store: store, inboxes: make(map[string]*inbox), slots: make(chan struct{}, 32), endpoints: make(map[string]*endpoint)}
 }
-func (*Manager) Write(ctx context.Context, delivery Delivery) error { return errors.ErrUnsupported }
-func (*Manager) NotifyWhenIdle(ctx context.Context, inbox, from, fromMode, id string) error {
-	return errors.ErrUnsupported
+
+func (m *Manager) OwnsRelay(addr string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.endpoints[addr]
+	return e != nil && e.ctx.Err() == nil
 }
