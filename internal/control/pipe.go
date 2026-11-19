@@ -42,7 +42,7 @@ func dialPipe(ctx context.Context, socket string, args []string, reconnect bool)
 			}
 			var refusal localError
 			if e := json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&refusal); e == nil && refusal.Message != "" {
-				err = errors.New(refusal.Message)
+				err = &refusal
 			} else {
 				err = fmt.Errorf("daemon refused upgrade (%s)", resp.Status)
 			}
@@ -68,6 +68,9 @@ func redial(ctx context.Context, dial func(context.Context) (*bufferedConn, erro
 			if err == nil {
 				return conn, nil
 			}
+			if _, refused := errors.AsType[*localError](err); refused {
+				return nil, err
+			}
 			last = err
 		}
 	}
@@ -79,13 +82,13 @@ type inputBlock struct {
 }
 
 func readInput(ctx context.Context, in io.Reader, requests <-chan struct{}, blocks chan<- inputBlock) {
+	buf := make([]byte, 32*1024)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-requests:
 		}
-		buf := make([]byte, 32*1024)
 		n, err := in.Read(buf)
 		select {
 		case <-ctx.Done():
@@ -105,12 +108,12 @@ func Pipe(ctx context.Context, socket string, args []string, in io.Reader, out i
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	requests := make(chan struct{}, 1)
+	requests := make(chan struct{})
 	blocks := make(chan inputBlock)
 	go readInput(ctx, in, requests, blocks)
-	requests <- struct{}{}
+	needInput := true
 	for {
-		eof, copyErr := forward(ctx, conn, requests, blocks, out)
+		eof, copyErr := forward(ctx, conn, requests, blocks, out, &needInput)
 		if copyErr != nil || eof {
 			return copyErr
 		}
@@ -121,43 +124,55 @@ func Pipe(ctx context.Context, socket string, args []string, in io.Reader, out i
 	}
 }
 
-func forward(ctx context.Context, conn *bufferedConn, requests chan<- struct{}, blocks <-chan inputBlock, out io.Writer) (bool, error) {
+type outputWriter struct {
+	dest io.Writer
+	err  error
+}
+
+func (w *outputWriter) Write(p []byte) (int, error) {
+	n, err := w.dest.Write(p)
+	if err == nil && n < len(p) {
+		err = io.ErrShortWrite
+	}
+	w.err = err
+	return n, err
+}
+
+func forward(ctx context.Context, conn *bufferedConn, requests chan<- struct{}, blocks <-chan inputBlock, out io.Writer, needInput *bool) (bool, error) {
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	done := make(chan error, 1)
-	go func() { _, err := io.Copy(out, conn); done <- err }()
+	go func() { w := outputWriter{dest: out}; _, _ = io.Copy(&w, conn); done <- w.err }()
 	defer conn.Close()
 	for {
+		var grant chan<- struct{}
+		if *needInput {
+			grant = requests
+		}
 		select {
-		case e := <-done:
-			if e != nil {
-				if _, ok := errors.AsType[net.Error](e); !ok {
-					return false, e
-				}
-			}
-			return false, ctx.Err()
+		case grant <- struct{}{}:
+			*needInput = false
+		case outputErr := <-done:
+			return false, errors.Join(ctx.Err(), outputErr)
 		case block := <-blocks:
-			_, err := conn.Write(block.data)
+			_, writeErr := conn.Write(block.data)
 			if block.err != nil {
-				if !errors.Is(block.err, io.EOF) {
+				if errors.Is(block.err, io.EOF) {
+					if writeErr == nil {
+						writeErr = conn.Conn.(*net.UnixConn).CloseWrite()
+					}
+				} else {
+					writeErr = block.err
+				}
+				if writeErr != nil {
 					_ = conn.Close()
-					return true, errors.Join(block.err, <-done)
 				}
-				if err == nil {
-					err = conn.Conn.(*net.UnixConn).CloseWrite()
-				}
-				if err != nil {
-					_ = conn.Close()
-				}
-				return true, <-done
+				return true, errors.Join(ctx.Err(), writeErr, <-done)
 			}
-			requests <- struct{}{}
-			if err != nil {
+			*needInput = true
+			if writeErr != nil {
 				_ = conn.Close()
-				if copyErr := <-done; copyErr != nil && !errors.Is(copyErr, net.ErrClosed) {
-					return false, copyErr
-				}
-				return false, ctx.Err()
+				return false, errors.Join(ctx.Err(), <-done)
 			}
 		}
 	}

@@ -119,6 +119,8 @@ type localError struct {
 	Message string `json:"message"`
 }
 
+func (e *localError) Error() string { return e.Message }
+
 func reject(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

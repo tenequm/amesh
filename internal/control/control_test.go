@@ -309,3 +309,15 @@ func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
 		}
 	})
 }
+
+func TestReconnectedPipeReturnsRefusal(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		_, err := redial(t.Context(), func(context.Context) (*bufferedConn, error) {
+			return nil, &localError{"excluded", "amesh is turned off for this directory."}
+		})
+		if _, ok := errors.AsType[*localError](err); !ok || time.Since(start) != 250*time.Millisecond {
+			t.Fatal(err)
+		}
+	})
+}
