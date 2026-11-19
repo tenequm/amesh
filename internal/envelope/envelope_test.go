@@ -2,9 +2,10 @@ package envelope
 
 import (
 	"os"
-	"regexp"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v3"
 )
 
 func TestContractEnvelopes(t *testing.T) {
@@ -15,35 +16,64 @@ func TestContractEnvelopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	examples := strings.Split(string(source), "\n  examples:\n")
-	if len(examples) != 2 {
-		t.Fatal("missing contract example section")
+	var spec struct {
+		Components struct {
+			Examples map[string]yaml.Node `yaml:"examples"`
+		} `yaml:"components"`
 	}
-	blocks := regexp.MustCompile(`(?m)^    (\w+):\n`).Split(examples[1], -1)
-	for _, block := range blocks {
-		if !strings.Contains(block, "x-amesh-schema: NativeUserFrame\n") && !strings.Contains(block, "x-amesh-schema: EnvelopeVector\n") {
+	if err = yaml.Unmarshal(source, &spec); err != nil {
+		t.Fatal(err)
+	}
+	checked := make(map[string]string)
+	for name, node := range spec.Components.Examples {
+		var header struct {
+			Schema string `yaml:"x-amesh-schema"`
+		}
+		if err := node.Decode(&header); err != nil {
+			t.Fatal(err)
+		}
+		if header.Schema != "NativeUserFrame" && header.Schema != "EnvelopeVector" {
 			continue
 		}
-		t.Run(strings.SplitN(block, "\n", 2)[0], func(t *testing.T) {
-			_, rest, ok := strings.Cut(block, "content: |-\n")
-			if !ok {
-				t.Fatal("missing content")
+		t.Run(name, func(t *testing.T) {
+			type input struct {
+				Body        string   `yaml:"body"`
+				From        string   `yaml:"from"`
+				FromSession string   `yaml:"fromSession"`
+				FromName    string   `yaml:"fromName"`
+				FromMode    string   `yaml:"fromMode"`
+				HopChain    []string `yaml:"hopChain"`
 			}
-			lines := strings.Split(rest, "\n")
-			indent := lines[0][:len(lines[0])-len(strings.TrimLeft(lines[0], " "))]
-			var body []string
-			for _, line := range lines {
-				value, ok := strings.CutPrefix(line, indent)
-				if !ok {
-					break
-				}
-				body = append(body, value)
+			var example struct {
+				Envelope input `yaml:"x-amesh-envelope"`
+				Value    struct {
+					Input   input  `yaml:"input"`
+					Content string `yaml:"content"`
+					From    string `yaml:"from"`
+					Message struct {
+						Content string `yaml:"content"`
+					} `yaml:"message"`
+				} `yaml:"dataValue"`
 			}
-			checkRoundTrip(t, strings.Join(body, "\n"))
+			if err := node.Decode(&example); err != nil {
+				t.Fatal(err)
+			}
+			in, wire := example.Envelope, example.Value.Message.Content
+			if header.Schema == "EnvelopeVector" {
+				in, wire = example.Value.Input, example.Value.Content
+			} else if in.From != example.Value.From {
+				t.Fatal("envelope and frame addresses differ")
+			}
+			got, err := Render(Message{From: in.From, FromSession: in.FromSession, FromName: in.FromName, FromMode: in.FromMode, HopChain: in.HopChain, Body: in.Body})
+			if err != nil || got != wire {
+				t.Fatalf("render from contract input: %q, %v", got, err)
+			}
+			checkRoundTrip(t, wire)
+			checked[name] = wire
 		})
 	}
 	for _, v := range vectors {
-		if !strings.Contains(strings.ReplaceAll(string(source), "\n          ", "\n"), v.Content) && !strings.Contains(strings.ReplaceAll(string(source), "\n            ", "\n"), v.Content) {
+		if checked[v.Name] != v.Content {
 			t.Fatalf("startup vector drift: %s", v.Name)
 		}
 	}
