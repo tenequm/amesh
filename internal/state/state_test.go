@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
@@ -73,7 +74,7 @@ func TestExpiryAndBound(t *testing.T) {
 			t.Fatal(ok, err)
 		}
 		for i := range maxClaims - 1 {
-			s.ids[string(rune(0x1000+i))] = now.Add(2 * time.Hour).UnixNano()
+			s.data.IDs[string(rune(0x1000+i))] = Entry{Phase: Written, Expires: now.Add(2 * time.Hour).UnixNano()}
 		}
 		if _, err := s.Claim("new", now.Add(3*time.Hour)); err == nil {
 			t.Fatal("evicted live claim")
@@ -96,5 +97,93 @@ func TestCorruptRecordBlocksStartup(t *testing.T) {
 	}
 	if _, err := s.Claim("id", time.Now().Add(time.Hour)); err == nil {
 		t.Fatal("claim without lock")
+	}
+}
+
+func TestRecoveryAndLogReplacement(t *testing.T) {
+	s := New(t.TempDir())
+	check := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(s.Lock())
+	defer s.Close()
+	check(s.SetLog("old"))
+	member := Member{Key: "7-d8e20301", PID: 7, ProcStart: "83", Address: "peer@project"}
+	check(s.PutMember(member))
+	expiry := time.Now().Add(time.Hour)
+	for _, id := range []string{"partial", "complete", "final", "notice"} {
+		session := member.Key
+		if id == "notice" {
+			session = ""
+		}
+		ok, err := s.BeginWrite("old", id, session, expiry, false)
+		if !ok || err != nil {
+			t.Fatal(id, ok, err)
+		}
+	}
+	check(s.MarkWritten("old", "complete"))
+	check(s.MarkWritten("old", "final"))
+	check(s.MarkReported("old", "final"))
+	check(s.Close())
+	check(s.Lock())
+	check(s.SetLog("old"))
+	entries, err := s.OpenEntries("old")
+	check(err)
+	if len(entries) != 2 || entries["complete"].Phase != Written || entries["partial"].Phase != Writing || entries["partial"].Session != member.Key {
+		t.Fatal(entries)
+	}
+	ok, err := s.BeginWrite("old", "final", member.Key, expiry, true)
+	if !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	check(s.MarkWritten("old", "final"))
+	if s.data.IDs["final"].Phase != Reported {
+		t.Fatal(s.data.IDs["final"])
+	}
+	check(s.SetLog("new"))
+	ok, err = s.BeginWrite("new", "partial", member.Key, expiry, false)
+	if !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	if s.MarkReported("old", "partial") == nil || s.ForgetWrite("old", "partial") == nil {
+		t.Fatal("stale log mutated new record")
+	}
+	check(s.Close())
+	check(s.Lock())
+	members, err := s.Members()
+	check(err)
+	if len(members) != 1 || members[0] != member || len(s.data.IDs) != 1 {
+		t.Fatal(members, s.data.IDs)
+	}
+	check(s.DeleteMember(member.Key))
+	check(s.Close())
+	check(s.Lock())
+	members, err = s.Members()
+	check(err)
+	if len(members) != 0 {
+		t.Fatal(members)
+	}
+}
+
+func TestLegacyClaimsStillSuppressReplay(t *testing.T) {
+	dir := t.TempDir()
+	expiry := time.Now().Add(time.Hour)
+	raw, err := json.Marshal(map[string]int64{"legacy": expiry.UnixNano()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, recordFile), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(dir)
+	if err = s.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if ok, err := s.Claim("legacy", expiry); ok || err != nil {
+		t.Fatal(ok, err)
 	}
 }
