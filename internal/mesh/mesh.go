@@ -16,6 +16,13 @@ import (
 )
 
 type Backend struct {
+	ctx              context.Context
+	socketDir        string
+	endpointMu       sync.Mutex
+	endpoints        map[string]endpoint
+	logMu            sync.Mutex
+	log              string
+	ack              func(context.Context, int64) error
 	cfg              config.Config
 	sessions         sessionRegistry
 	relays           *relay.Manager
@@ -41,7 +48,7 @@ type sessionRegistry interface {
 var _ mcpserver.MeshBackend = (*Backend)(nil)
 
 func New(cfg config.Config, sessions *registry.Registry, relays *relay.Manager, client *hub.Client) *Backend {
-	return &Backend{cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), wake: make(chan struct{}, 1)}
+	return &Backend{endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), wake: make(chan struct{}, 1)}
 }
 
 func (*Backend) HumanTurn(ctx context.Context, session registry.Session) error {
