@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 type Key struct {
@@ -42,7 +43,7 @@ func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {
 		}
 		for _, dir := range r.dirs {
 			session, err := read(dir, pid, start)
-			if errors.Is(err, os.ErrNotExist) {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errStaleProcess) {
 				continue
 			}
 			return session, err
@@ -51,6 +52,8 @@ func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {
 	}
 	return Session{}, fmt.Errorf("no live Claude session for caller: %w", os.ErrNotExist)
 }
+
+var errStaleProcess = errors.New("registry procStart differs from live process")
 
 func read(dir string, pid int, start string) (Session, error) {
 	path := filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json")
@@ -75,7 +78,7 @@ func read(dir string, pid int, start string) (Session, error) {
 		return Session{}, fmt.Errorf("session registry %s: invalid pid or procStart", path)
 	}
 	if entry.ProcStart != start {
-		return Session{}, os.ErrNotExist
+		return Session{}, errStaleProcess
 	}
 	for _, field := range []struct{ name, value string }{
 		{"sessionId", entry.SessionID}, {"name", entry.Name}, {"status", entry.Status}, {"cwd", entry.CWD}, {"messagingSocketPath", entry.SocketPath},
@@ -120,6 +123,10 @@ func project(cwd string) string {
 }
 
 func (r *Registry) List(ctx context.Context) ([]Session, error) {
+	return r.scan(ctx, false)
+}
+
+func (r *Registry) scan(ctx context.Context, check bool) ([]Session, error) {
 	var live []Session
 	for _, dir := range r.dirs {
 		entries, err := os.ReadDir(filepath.Join(dir, "sessions"))
@@ -146,11 +153,19 @@ func (r *Registry) List(ctx context.Context) ([]Session, error) {
 				return nil, err
 			}
 			session, err := read(dir, pid, start)
-			if errors.Is(err, os.ErrNotExist) {
+			if errors.Is(err, os.ErrNotExist) || (!check && errors.Is(err, errStaleProcess)) {
 				continue
 			}
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("registry entry %s: %w", filepath.Join(dir, "sessions", entry.Name()), err)
+			}
+			if check {
+				if e := checkInbox(session); e != nil {
+					if _, now, lookupErr := r.lookup(pid); errors.Is(lookupErr, os.ErrNotExist) || (lookupErr == nil && now != start) {
+						continue
+					}
+					return nil, e
+				}
 			}
 			live = append(live, session)
 		}
@@ -159,6 +174,23 @@ func (r *Registry) List(ctx context.Context) ([]Session, error) {
 }
 
 func (r *Registry) SelfCheck(ctx context.Context) error {
-	_, err := r.List(ctx)
+	_, err := r.scan(ctx, true)
 	return err
+}
+
+func checkInbox(s Session) error {
+	if filepath.Base(s.SocketPath) != strconv.Itoa(s.PID)+".sock" {
+		return fmt.Errorf("registry messagingSocketPath for pid %d: expected <pid>.sock", s.PID)
+	}
+	dir := filepath.Dir(s.SocketPath)
+	for _, path := range []string{dir, s.SocketPath} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("registry messagingSocketPath: %w", err)
+		}
+		if (path == dir && !info.IsDir()) || (path != dir && info.Mode()&os.ModeSocket == 0) || int(info.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() {
+			return fmt.Errorf("registry messagingSocketPath %s: unexpected type or owner", path)
+		}
+	}
+	return nil
 }

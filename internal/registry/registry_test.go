@@ -1,9 +1,11 @@
 package registry
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,5 +77,45 @@ func TestLiveProcessAndFormat(t *testing.T) {
 	}
 	if _, _, err = process(99999999); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(fmt.Errorf("missing pid: %w", err))
+	}
+}
+
+func TestStartupChecksNativeInbox(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "amesh-identity")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	pid := os.Getpid()
+	_, start, e := process(pid)
+	if e != nil {
+		t.Fatal(e)
+	}
+	fixture(t, dir, pid, start, "id", "name")
+	path := filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json")
+	b, e := os.ReadFile(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	socket := filepath.Join(dir, strconv.Itoa(pid)+".sock")
+	b = bytes.Replace(b, []byte("/tmp/amesh-identity.sock"), []byte(socket), 1)
+	if e = os.WriteFile(path, b, 0o600); e != nil {
+		t.Fatal(e)
+	}
+	r := New([]string{dir})
+	if err := r.SelfCheck(t.Context()); err == nil {
+		t.Fatal("accepted absent inbox")
+	}
+	ln, e := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Base(socket), Net: "unix"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer ln.Close()
+	if err := r.SelfCheck(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	fixture(t, dir, pid, "stale", "id", "name")
+	if err := r.SelfCheck(t.Context()); !errors.Is(err, errStaleProcess) {
+		t.Fatal(err)
 	}
 }
