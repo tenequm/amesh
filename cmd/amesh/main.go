@@ -100,7 +100,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 func daemon(ctx context.Context, cfg config.Config) error {
 	sessions := registry.New(cfg.ClaudeConfigDirs)
 	relays := relay.New("/tmp/cc-socks", state.New(cfg.StateDir))
-	laneBackend := lane.New(sessions, relays)
+	laneBackend := lane.New(ctx, sessions, relays, "local")
 	meshBackend := mesh.New(cfg, sessions, relays, hub.New(cfg))
 	// The relay manager gains its address lookup in the wire lane.
 	var ownsRelay func(string) bool
