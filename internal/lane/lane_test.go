@@ -21,6 +21,8 @@ import (
 	"github.com/tenequm/amesh/internal/peercred"
 	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/relay"
+	"github.com/tenequm/amesh/internal/relay/relaytest"
+	"github.com/tenequm/amesh/internal/state"
 )
 
 type seat struct {
@@ -149,6 +151,52 @@ func TestLaneRouting(t *testing.T) {
 	if _, err = b.Connect(ctx, child, parentID); err != nil || r.path != oldPath {
 		t.Fatal(r.path, err)
 	}
+}
+
+func TestLaneReplyTrailers(t *testing.T) {
+	parentPath, parentLines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPath, childLines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := registry.Session{PID: 101, SessionID: "p", Name: "parent", SocketPath: parentPath}
+	child := registry.Session{PID: 102, SessionID: "c", Name: "child", SocketPath: childPath}
+	s := &seat{rows: map[int]registry.Session{101: parent, 102: child}}
+	store := state.New(t.TempDir())
+	if err = store.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	b := newBackend(ctx, s, relay.New(filepath.Dir(childPath), store), func() (string, error) { return "local", nil })
+	defer func() { cancel(); b.Wait() }()
+	if _, err = b.Connect(ctx, child, parent.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	c := b.lanes[pair{parent.SessionID, child.SessionID}]
+	checkBody := func(lines <-chan []byte, want string) {
+		t.Helper()
+		var f contract.NativeUserFrame
+		if decodeErr := json.Unmarshal(<-lines, &f); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		msg, parseErr := envelope.Parse(f.Message.Content)
+		if parseErr != nil || msg.From != c.address || msg.Body != want {
+			t.Fatalf("lane inbox body %q, want %q (%v)", msg.Body, want, parseErr)
+		}
+	}
+	if err = c.handle(ctx, relay.Event{Action: "user", Peer: peercred.Credentials{PID: parent.PID}, ID: uuid.NewString(), Message: envelope.Message{Body: "Ready?"}}); err != nil {
+		t.Fatal(err)
+	}
+	checkBody(childLines, "Ready?\n\n(amesh: parent cannot see what you write here. To answer, call send_to_parent.)")
+	got, err := b.SendToParent(ctx, child, parent.SessionID, "Ready.")
+	if err != nil || !got.Accepted {
+		t.Fatal(got, err)
+	}
+	checkBody(parentLines, "Ready.\n\n"+`(amesh: child cannot see what you write here. To answer, call SendMessage with to="`+c.address+`".)`)
 }
 
 func TestLaneNotices(t *testing.T) {

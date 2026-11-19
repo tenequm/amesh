@@ -207,7 +207,7 @@ func TestDirectoryAndSend(t *testing.T) {
 		t.Fatalf("send %#v %v", got, err)
 	}
 	req := <-recv
-	if req.ID != value(got.ID) || req.From.Session != key || req.FromMode != nil || req.Origin != "unknown" || req.NotifyWhenIdle {
+	if req.Text != "hello" || req.ID != value(got.ID) || req.From.Session != key || req.FromMode != nil || req.Origin != "unknown" || req.NotifyWhenIdle {
 		t.Fatal("incorrect remote send metadata")
 	}
 }
@@ -228,7 +228,8 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	*r = append(*r, sender, target)
 	b.members[sessionKey(sender.Key)] = member{session: sender, hosted: true, address: "review@pond:mac"}
 	b.members[sessionKey(target.Key)] = member{session: target, hosted: true, address: "review-2@pond:mac"}
-	got, err := b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond", Message: "hello locally"})
+	body := strings.Repeat("x", 32*1024)
+	got, err := b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond", Message: body})
 	if err != nil || !got.Accepted || value(got.To) != "review-2@pond:mac" {
 		t.Fatalf("%#v %v", got, err)
 	}
@@ -237,7 +238,8 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg, err := envelope.Parse(frame.Message.Content)
-	if err != nil || msg.Body != "hello locally" || msg.From != envelope.Address(sender.SocketPath) || msg.FromName != sender.Name || msg.FromMode != sender.FromMode || value(frame.From) != msg.From || frame.MsgID != value(got.ID) {
+	wantBody := body + "\n\n" + `(amesh: review cannot see what you write here. To answer, call SendMessage with to="` + envelope.Address(sender.SocketPath) + `".)`
+	if err != nil || msg.Body != wantBody || msg.From != envelope.Address(sender.SocketPath) || msg.FromName != sender.Name || msg.FromMode != sender.FromMode || value(frame.From) != msg.From || frame.MsgID != value(got.ID) {
 		t.Fatal("wrong local native frame")
 	}
 	if n, e := b.client.Pending(""); e != nil || n != 0 {

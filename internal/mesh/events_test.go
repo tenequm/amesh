@@ -319,7 +319,8 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsed, err := envelope.Parse(frame.Message.Content)
-	if err != nil || parsed.FromSession != end.ID || parsed.Body != msg.Text || frame.MsgID != msg.ID || !slices.Equal(parsed.HopChain, msg.HopChain) {
+	wantBody := msg.Text + "\n\n" + fmt.Sprintf(`(amesh: %s cannot see what you write here. To answer, call SendMessage with to="%s".)`, end.Name, value(frame.From))
+	if err != nil || parsed.FromSession != end.ID || parsed.From != value(frame.From) || parsed.Body != wantBody || frame.MsgID != msg.ID || !slices.Equal(parsed.HopChain, msg.HopChain) {
 		t.Fatal("incorrect inbound native frame")
 	}
 	b.client = hub.New(b.cfg)
@@ -468,7 +469,7 @@ func TestRelayReplyReceiptAndNotice(t *testing.T) {
 	postNative(t, ep.from, hubtest.Example(t, "nativeReplyFrame"))
 	select {
 	case req := <-received:
-		if req.From.Session != key || value(req.To.Endpoint) != ep.ref.ID || req.ID != "1a616f5d-ad9d-4185-a462-0bf442288517" || req.Origin != "peer" || value(req.FromMode) != "bypass" || len(req.HopChain) != 1 {
+		if req.Text != "Yes: the deploy finished at 11:58 UTC and the health check is green." || req.From.Session != key || value(req.To.Endpoint) != ep.ref.ID || req.ID != "1a616f5d-ad9d-4185-a462-0bf442288517" || req.Origin != "peer" || value(req.FromMode) != "bypass" || len(req.HopChain) != 1 {
 			t.Fatal("incorrect native reply request")
 		}
 	default:

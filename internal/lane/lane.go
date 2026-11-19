@@ -257,7 +257,7 @@ func (b *Backend) SendToParent(ctx context.Context, child registry.Session, pare
 func (c *conversation) write(ctx context.Context, to registry.Session, id string, msg envelope.Message) error {
 	msg.From = c.address
 	msg.FromSession = c.id
-	return c.backend.relays.Write(ctx, relay.Delivery{Inbox: to.SocketPath, ID: id, Message: msg})
+	return c.backend.relays.Write(ctx, relay.Delivery{Inbox: to.SocketPath, ID: id, Message: msg, ToLaneChild: to.Key == c.child.Key})
 }
 
 func (c *conversation) handle(ctx context.Context, e relay.Event) error {

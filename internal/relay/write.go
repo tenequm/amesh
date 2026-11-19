@@ -209,6 +209,31 @@ func (m *Manager) send(ctx context.Context, path string, line []byte, before fun
 	return n, written, err
 }
 
+func (d Delivery) replyTrailer() string {
+	name := envelope.NormalizeName(d.Message.FromName)
+	if name == "" || strings.ContainsFunc(name, func(r rune) bool { return r > '~' }) {
+		name = "The sender"
+	}
+	if d.ToLaneChild {
+		return "(amesh: " + name + " cannot see what you write here. To answer, call send_to_parent.)"
+	}
+	return `(amesh: ` + name + ` cannot see what you write here. To answer, call SendMessage with to="` + d.Message.From + `".)`
+}
+
+func (d Delivery) inboxLine(content string) ([]byte, error) {
+	f := frame{Type: "user", Message: &wireMessage{Role: "user", Content: content}, Priority: "next", From: d.Message.From, Version: 1, ID: d.ID}
+	if !d.Notice {
+		end := strings.LastIndexByte(content, '\n') // The renderer puts the closing tag on its own line.
+		f.Message.Content = content[:end] + "\n\n" + d.replyTrailer() + content[end:]
+		line, err := f.line()
+		if !errors.Is(err, ErrOversized) {
+			return line, err
+		}
+		f.Message.Content = content
+	}
+	return f.line()
+}
+
 var errReplay = errors.New("native frame already claimed")
 
 func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(peercred.Credentials) error) (time.Time, error) {
@@ -216,12 +241,11 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 	if err != nil {
 		return time.Time{}, err
 	}
-	f := frame{Type: "user", Message: &wireMessage{Role: "user", Content: content}, Priority: "next", From: d.Message.From, Version: 1, ID: d.ID}
-	line, err := f.line()
+	line, err := d.inboxLine(content)
 	if err != nil {
 		return time.Time{}, err
 	}
-	pair, release, err := m.acquire(ctx, d.Inbox+"\x00"+f.From)
+	pair, release, err := m.acquire(ctx, d.Inbox+"\x00"+d.Message.From)
 	if err != nil {
 		return time.Time{}, err
 	}

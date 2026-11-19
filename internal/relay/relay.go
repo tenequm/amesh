@@ -27,6 +27,7 @@ type (
 		Log, Session   string
 		AcceptWindow   time.Duration
 		Notice         bool
+		ToLaneChild    bool
 		Message        envelope.Message
 		NotifyWhenIdle bool
 		IdleFromMode   string // Receiver mode for the optional idle subscription.

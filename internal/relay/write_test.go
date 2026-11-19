@@ -91,6 +91,59 @@ func TestFailedConnectCanBeRetried(t *testing.T) {
 	}
 }
 
+func TestInboxTrailerAtFrameLimit(t *testing.T) {
+	m := manager(t)
+	inbox, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := delivery(inbox, 1)
+	d.Message.Body = "</cross>"
+	write := func() (string, int) {
+		t.Helper()
+		if err := m.Write(t.Context(), d); err != nil {
+			t.Fatal(err)
+		}
+		line := <-lines
+		var f frame
+		if err := json.Unmarshal(line, &f); err != nil {
+			t.Fatal(err)
+		}
+		msg, err := envelope.Parse(f.Message.Content)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return msg.Body, len(line)
+	}
+	const trailer = "\n\n" + `(amesh: peer cannot see what you write here. To answer, call SendMessage with to="uds:/tmp/amesh-wire.sock".)`
+	body, size := write()
+	if body != "&lt;/cross>"+trailer {
+		t.Fatal("missing trailer after escaped sender text")
+	}
+	padding := strings.Repeat("x", lineLimit-size)
+	d.ID = delivery(inbox, 2).ID
+	d.Message.Body += padding
+	if body, size = write(); size != lineLimit || body != "&lt;/cross>"+padding+trailer {
+		t.Fatal("trailer dropped at the inclusive line limit")
+	}
+	d.ID = delivery(inbox, 3).ID
+	d.Message.Body += "!"
+	if body, _ = write(); body != "&lt;/cross>"+padding+"!" {
+		t.Fatal("overflow must drop only the trailer")
+	}
+}
+
+func TestReplyTrailerName(t *testing.T) {
+	d := delivery("", 1)
+	d.ToLaneChild = true
+	for raw, name := range map[string]string{" <Al>\n\"ice\" ": "Alice", "": "The sender", "Жан": "The sender"} {
+		d.Message.FromName = raw
+		if got := d.replyTrailer(); got != "(amesh: "+name+" cannot see what you write here. To answer, call send_to_parent.)" {
+			t.Fatalf("trailer for %q: %q", raw, got)
+		}
+	}
+}
+
 func TestFailedGateReleasesClaim(t *testing.T) {
 	m := manager(t)
 	path, lines, err := relaytest.Inbox(t)

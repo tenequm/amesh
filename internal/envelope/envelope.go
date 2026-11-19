@@ -30,7 +30,7 @@ var (
 	closeRE   = regexp.MustCompile(`(?i)<[\s\p{Z}\x0b\x{85}]*/[\s\p{Z}\x0b\x{85}]*cross`)
 )
 
-func cleanName(s string) string {
+func NormalizeName(s string) string {
 	s = strings.TrimSpace(strings.Map(func(r rune) rune {
 		if r == '"' || r == '<' || r == '>' || unicode.In(r, unicode.Cc, unicode.Cf, unicode.Cs, unicode.Zl, unicode.Zp) {
 			return -1
@@ -86,7 +86,7 @@ func Render(message Message) (string, error) {
 	} else if len(message.HopChain) != 0 {
 		return "", errors.New("invalid hop chain")
 	}
-	attr("from-name", cleanName(message.FromName))
+	attr("from-name", NormalizeName(message.FromName))
 	if message.FromMode != "" && message.FromMode != "bypass" && message.FromMode != "prompting" {
 		return "", errors.New("invalid sender permission class")
 	}
