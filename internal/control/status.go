@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"slices"
@@ -34,6 +35,9 @@ type memberStatus struct {
 	Role    string `json:"role"`
 }
 
+// Populated when the native end-to-end delivery proof passes for a Claude Code release.
+var verifiedNativeVersions []string
+
 func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	live, err := d.registry.List(r.Context())
 	if err != nil {
@@ -52,12 +56,16 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	}
 	pipes := []pipeStatus{}
 	members := []memberStatus{}
+	warnings := map[string]bool{}
 	seen := map[registry.Key]bool{}
 	d.mu.Lock()
 	for reg := range d.pipes {
 		s := byKey[reg.key]
 		digest := sha256.Sum256([]byte(reg.key.ProcStart))
 		key := fmt.Sprintf("%d-%x", reg.key.PID, digest[:4])
+		if s.Version != "" && !slices.Contains(verifiedNativeVersions, s.Version) {
+			warnings[fmt.Sprintf("%s runs Claude Code %s without a recorded native delivery check.", s.Name, s.Version)] = true
+		}
 		pipes = append(pipes, pipeStatus{key, s.Name, s.SessionID, s.ConfigDir, reg.parent})
 		if reg.parent != "" || seen[reg.key] || s.Key != reg.key {
 			continue
@@ -83,6 +91,9 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 		"machine": nil, "hub": map[string]any{"state": "connecting", "since": started, "epoch": nil, "cursor": 0, "halt": nil},
 		"configDirs": dirs, "pipes": pipes, "sessions": members, "lanes": []any{},
 		"outbox": map[string]any{"count": 0, "oldestAt": nil}, "open": map[string]int{"count": 0},
+	}
+	if len(warnings) > 0 {
+		status["warnings"] = slices.Sorted(maps.Keys(warnings))
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)

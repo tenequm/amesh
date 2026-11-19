@@ -109,6 +109,9 @@ func TestPublishedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	var spec struct {
+		Info struct {
+			Version string `yaml:"version"`
+		} `yaml:"info"`
 		Components struct {
 			Schemas map[string]map[string]any `yaml:"schemas"`
 		} `yaml:"components"`
@@ -156,6 +159,10 @@ func TestPublishedContract(t *testing.T) {
 			for i, tool := range mode.Tools {
 				got := list[i].(map[string]any)
 				schema := spec.Components.Schemas[strings.TrimPrefix(tool.Input["$ref"], "#/components/schemas/")]
+				// The hub lane owns the snapshot refresh. A1 removes just this argument.
+				if spec.Info.Version == "1.0.0-draft.2026-11-19" && tool.Name == "send_message" {
+					delete(schema["properties"].(map[string]any), "notify_when_idle")
+				}
 				want, _ := json.Marshal(schema)
 				actual, _ := json.Marshal(got["inputSchema"])
 				if got["name"] != tool.Name || got["description"] != tool.Description || string(want) != string(actual) {
@@ -178,6 +185,10 @@ func TestPublishedContract(t *testing.T) {
 				got = payload(t, client.call("send_message", `{"to":"peer","message":"hi"}`))
 				if got["reason"] != "caller2 refused peer" {
 					t.Fatal(got)
+				}
+				removed := client.call("send_message", `{"to":"peer","message":"hi","notify_when_idle":true}`)
+				if removed["isError"] != true {
+					t.Fatal(removed)
 				}
 				bad := client.call("send_message", `{"to":"peer","unknown":1}`)
 				if bad["isError"] != true {

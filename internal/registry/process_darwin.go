@@ -17,5 +17,7 @@ func process(pid int) (int, string, error) {
 		return 0, "", err
 	}
 	info := infos[0]
-	return int(info.Eproc.Ppid), time.Unix(info.Proc.P_starttime.Sec, 0).UTC().Format(time.ANSIC), nil
+	return int(info.Eproc.Ppid), darwinStart(info.Proc.P_starttime.Sec), nil
 }
+
+func darwinStart(seconds int64) string { return time.Unix(seconds, 0).UTC().Format(time.ANSIC) }

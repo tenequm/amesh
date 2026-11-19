@@ -25,15 +25,16 @@ import (
 )
 
 type daemon struct {
-	cfg      config.Config
-	registry *registry.Registry
-	lane     mcpserver.LaneBackend
-	mesh     mcpserver.MeshBackend
-	ctx      context.Context
-	started  time.Time
-	mu       sync.Mutex
-	pipes    map[*registration]struct{}
-	work     sync.WaitGroup
+	ownsRelay func(string) bool
+	cfg       config.Config
+	registry  *registry.Registry
+	lane      mcpserver.LaneBackend
+	mesh      mcpserver.MeshBackend
+	ctx       context.Context
+	started   time.Time
+	mu        sync.Mutex
+	pipes     map[*registration]struct{}
+	work      sync.WaitGroup
 }
 
 type registration struct {
@@ -85,7 +86,7 @@ func listen(ctx context.Context, path string) (net.Listener, error) {
 	return l, nil
 }
 
-func Serve(ctx context.Context, cfg config.Config, sessions *registry.Registry, lane mcpserver.LaneBackend, mesh mcpserver.MeshBackend) error {
+func Serve(ctx context.Context, cfg config.Config, sessions *registry.Registry, lane mcpserver.LaneBackend, mesh mcpserver.MeshBackend, ownsRelay func(string) bool) error {
 	if err := sessions.SelfCheck(ctx); err != nil {
 		return fmt.Errorf("registry startup check: %w", err)
 	}
@@ -95,7 +96,7 @@ func Serve(ctx context.Context, cfg config.Config, sessions *registry.Registry, 
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	d := &daemon{cfg: cfg, registry: sessions, lane: lane, mesh: mesh, ctx: ctx, started: time.Now(), pipes: make(map[*registration]struct{})}
+	d := &daemon{ownsRelay: ownsRelay, cfg: cfg, registry: sessions, lane: lane, mesh: mesh, ctx: ctx, started: time.Now(), pipes: make(map[*registration]struct{})}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /amesh/mcp", d.upgrade)
 	mux.HandleFunc("POST /amesh/hooks", d.hook)
@@ -122,6 +123,10 @@ func reject(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(localError{code, message})
+}
+
+func (d *daemon) meshExcluded(s registry.Session) bool {
+	return (len(d.cfg.ClaudeConfigDirs) > 0 && s.ConfigDir != d.cfg.ClaudeConfigDirs[0]) || excluded(s.CWD, d.cfg.ExcludeRoots)
 }
 
 func excluded(cwd string, roots []string) bool {
@@ -194,7 +199,7 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 		reject(w, 403, "not_in_session", "This only works inside a Claude Code session.")
 		return
 	}
-	if parent == "" && excluded(s.CWD, d.cfg.ExcludeRoots) {
+	if parent == "" && d.meshExcluded(s) {
 		reject(w, 403, "excluded", "amesh is turned off for this directory.")
 		return
 	}
@@ -234,7 +239,7 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			return registry.Session{}, e
 		}
-		if current.Key != s.Key || (parent == "" && excluded(current.CWD, d.cfg.ExcludeRoots)) {
+		if current.Key != s.Key || (parent == "" && d.meshExcluded(current)) {
 			return registry.Session{}, errors.New("registered caller changed")
 		}
 		return current, nil

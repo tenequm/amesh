@@ -56,6 +56,7 @@ func TestSeatOrderAndMutableAttributes(t *testing.T) {
 }
 
 func TestLiveProcessAndFormat(t *testing.T) {
+	t.Setenv("TZ", "Pacific/Honolulu")
 	pid := os.Getpid()
 	p, start, err := process(pid)
 	if err != nil || p != os.Getppid() || start == "" {
@@ -117,5 +118,29 @@ func TestStartupChecksNativeInbox(t *testing.T) {
 	fixture(t, dir, pid, "stale", "id", "name")
 	if err := r.SelfCheck(t.Context()); !errors.Is(err, errStaleProcess) {
 		t.Fatal(err)
+	}
+}
+
+func TestStoredKeyLivenessAndMode(t *testing.T) {
+	dir := t.TempDir()
+	r := New([]string{dir})
+	r.lookup = func(pid int) (int, string, error) { return pid - 1, "start", nil }
+	fixture(t, dir, 12, "start", "id", "name")
+	key := Key{12, "start"}
+	r.RecordPermissionMode(key, "bypassPermissions")
+	if s, err := r.Resolve(t.Context(), 13); err != nil || s.FromMode != "bypass" {
+		t.Fatal(s, err)
+	}
+	if ok, err := r.Live(t.Context(), key); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	for _, gone := range []Key{{12, "different"}, {13, "start"}} {
+		if ok, err := r.Live(t.Context(), gone); err != nil || ok {
+			t.Fatal(gone, ok, err)
+		}
+	}
+	r.RecordPermissionMode(key, "plan")
+	if s, err := r.List(t.Context()); err != nil || s[0].FromMode != "prompting" {
+		t.Fatal(s, err)
 	}
 }

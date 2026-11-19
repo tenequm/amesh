@@ -119,17 +119,23 @@ type humanBackend struct {
 	human chan registry.Session
 }
 
+func (humanBackend) OwnsRelay(addr string) bool { return addr == "uds:/tmp/amesh-identity-relay.sock" }
+
 func (b humanBackend) HumanTurn(_ context.Context, s registry.Session) error {
 	b.human <- s
 	return nil
 }
 
 func TestHookGuardAndHumanTurns(t *testing.T) {
-	key := registry.Key{PID: 123, ProcStart: "start"}
-	s := registry.Session{Key: key, SessionID: "resolved"}
+	dir, key := liveEntry(t)
+	sessions := registry.New([]string{dir})
+	s, err := sessions.Resolve(t.Context(), key.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	backend := humanBackend{human: make(chan registry.Session, 1)}
 	reg := &registration{key: s.Key}
-	d := daemon{ctx: t.Context(), mesh: backend, pipes: map[*registration]struct{}{reg: {}}}
+	d := daemon{ctx: t.Context(), mesh: backend, ownsRelay: backend.OwnsRelay, registry: sessions, pipes: map[*registration]struct{}{reg: {}}}
 	call := func(input string, code int) {
 		t.Helper()
 		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/amesh/hooks", strings.NewReader(input))
@@ -151,9 +157,27 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	}
 	call(prompt("hello"), 202)
 	d.work.Wait()
-	if got := <-backend.human; got.SessionID != "resolved" {
+	if len(backend.human) != 0 {
+		t.Fatal("reported without transcript")
+	}
+	transcript := filepath.Join(dir, "projects", "amesh-identity", "id.jsonl")
+	if e := os.MkdirAll(filepath.Dir(transcript), 0o700); e != nil {
+		t.Fatal(e)
+	}
+	row := `{"type":"user","sessionId":"id","promptId":"candidate","message":{"content":"hello"},"origin":{"kind":"human"}}` + "\n"
+	if e := os.WriteFile(transcript, []byte(row), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	call(fmt.Sprintf(`{"session_id":"claimed","hook_event_name":"UserPromptSubmit","prompt":"hello","prompt_id":"candidate","transcript_path":%q,"permission_mode":"bypassPermissions"}`, transcript), 202)
+	d.work.Wait()
+	if got := <-backend.human; got.SessionID != "id" || got.FromMode != "bypass" {
 		t.Fatal(got)
 	}
+	call(`{"hook_event_name":"PreToolUse","session_id":"id","tool_name":"SendMessage","agent_id":"sub","tool_input":{"to":"uds:/tmp/amesh-identity-relay.sock"}}`, 200)
+	call(`{"hook_event_name":"PreToolUse","session_id":"id","tool_name":"SendMessage","agent_id":"sub","tool_input":{"to":"uds:/tmp/amesh-identity-other.sock"}}`, 204)
+	d.cfg.ClaudeConfigDirs = []string{dir + "/other", dir}
+	call(prompt("hello"), 204)
+	d.cfg.ClaudeConfigDirs = []string{dir}
 	reg.parent = "parent"
 	call(prompt("hello"), 204)
 	delete(d.pipes, reg)
@@ -161,7 +185,8 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	call("{}", 400)
 }
 
-func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
+func liveEntry(t *testing.T) (string, registry.Key) {
+	t.Helper()
 	ctx := t.Context()
 	dir := t.TempDir()
 	pid := os.Getpid()
@@ -181,7 +206,7 @@ func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 		}
 		start = strings.Fields(string(b[strings.LastIndexByte(string(b), ')')+1:]))[19]
 	}
-	dirs := []string{dir, filepath.Join(dir, "empty")}
+
 	if err := os.Mkdir(filepath.Join(dir, "sessions"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +215,12 @@ func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	key := registry.Key{PID: pid, ProcStart: start}
+	return dir, registry.Key{PID: pid, ProcStart: start}
+}
+
+func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
+	dir, key := liveEntry(t)
+	dirs := []string{dir, filepath.Join(dir, "empty")}
 	d := daemon{registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs, MachineName: "mac"}, started: time.Now(), pipes: map[*registration]struct{}{{key: key}: {}, {key: key, parent: "parent"}: {}}}
 	w := httptest.NewRecorder()
 	d.status(w, request(t, ""))
@@ -205,4 +235,77 @@ func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 	if len(got.Dirs) != 2 || got.Dirs[0].Sessions != 1 || got.Dirs[1].Sessions != 0 || len(got.Pipes) != 2 || got.Pipes[1].Parent != "parent" || len(got.Members) != 1 {
 		t.Fatal(got)
 	}
+}
+
+func TestTranscriptRequiresMatchingCompleteRow(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	text := "same text"
+	h := hookInput{PromptID: "right", Prompt: &text}
+	row := func(id, prompt, kind string) string {
+		return fmt.Sprintf(`{"type":"attachment","sessionId":%q,"promptId":%q,"attachment":{"type":"queued_command","prompt":"same text","origin":{"kind":%q}}}`, id, prompt, kind)
+	}
+	old := row("other", "right", "human") + "\n" + row("id", "wrong", "human") + "\n"
+	target := row("id", "right", "peer")
+	file := filepath.Join(dir, "amesh-identity.jsonl")
+	if err = os.WriteFile(file, []byte(old+target), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n, kind, err := scanTranscript(root, filepath.Base(file), 0, "id", h, time.Now())
+	if err != nil || n != int64(len(old)) || kind != "" {
+		t.Fatal(n, kind, err)
+	}
+	if err = os.WriteFile(file, []byte(old+target+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, kind, err = scanTranscript(root, filepath.Base(file), n, "id", h, time.Now())
+	if err != nil || kind != "peer" {
+		t.Fatal(kind, err)
+	}
+}
+
+func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
+	dir, key := liveEntry(t)
+	r := registry.New([]string{dir})
+	s, err := r.Resolve(t.Context(), key.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := humanBackend{human: make(chan registry.Session, 1)}
+	transcript := filepath.Join(dir, "projects", "amesh-identity", "id.jsonl")
+	if err = os.MkdirAll(filepath.Dir(transcript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	text := "queued"
+	h := hookInput{Prompt: &text, PromptID: "p", Transcript: transcript}
+	synctest.Test(t, func(t *testing.T) {
+		d := daemon{ctx: t.Context(), registry: r, mesh: backend, pipes: map[*registration]struct{}{{key: key}: {}}}
+		d.work.Go(func() { d.confirmTurn(s, h) })
+		synctest.Wait()
+		if len(backend.human) != 0 {
+			t.Fatal("early report")
+		}
+		line := `{"type":"user","sessionId":"id","promptId":"p","origin":{"kind":"human"},"message":{"content":[{"type":"text","text":"queued"}]}}` + "\n"
+		if err := os.WriteFile(transcript, []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		d.work.Wait()
+		if len(backend.human) != 1 {
+			t.Fatal("missing report")
+		}
+		h.PromptID = "absent"
+		d.work.Go(func() { d.confirmTurn(s, h) })
+		synctest.Wait()
+		if err := os.Remove(filepath.Join(dir, "sessions", strconv.Itoa(key.PID)+".json")); err != nil {
+			t.Fatal(err)
+		}
+		d.work.Wait()
+		if len(backend.human) != 1 {
+			t.Fatal("reported after end")
+		}
+	})
 }

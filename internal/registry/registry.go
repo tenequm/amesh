@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -20,16 +21,18 @@ type Key struct {
 
 type Session struct {
 	Key
-	SessionID, Name, Project, CWD, ConfigDir, SocketPath, Status, FromMode string
+	SessionID, Name, Project, CWD, ConfigDir, SocketPath, Status, FromMode, Version string
 }
 
 type Registry struct {
 	dirs   []string
 	lookup func(int) (int, string, error)
+	mu     sync.Mutex
+	modes  map[int]permissionClass
 }
 
 func New(configDirs []string) *Registry {
-	return &Registry{dirs: slices.Clone(configDirs), lookup: process}
+	return &Registry{dirs: slices.Clone(configDirs), lookup: process, modes: make(map[int]permissionClass)}
 }
 
 func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {
@@ -46,7 +49,7 @@ func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errStaleProcess) {
 				continue
 			}
-			return session, err
+			return r.withMode(session), err
 		}
 		pid = parent
 	}
@@ -62,6 +65,7 @@ func read(dir string, pid int, start string) (Session, error) {
 		return Session{}, err
 	}
 	var entry struct {
+		Version    string `json:"version"`
 		PID        int    `json:"pid"`
 		ProcStart  string `json:"procStart"`
 		SessionID  string `json:"sessionId"`
@@ -95,7 +99,7 @@ func read(dir string, pid int, start string) (Session, error) {
 	}
 	return Session{
 		Key: Key{pid, start}, SessionID: entry.SessionID, Name: entry.Name, CWD: entry.CWD,
-		Project: project(entry.CWD), ConfigDir: dir, SocketPath: entry.SocketPath, Status: entry.Status,
+		Version: entry.Version, Project: project(entry.CWD), ConfigDir: dir, SocketPath: entry.SocketPath, Status: entry.Status,
 	}, nil
 }
 
@@ -167,7 +171,7 @@ func (r *Registry) scan(ctx context.Context, check bool) ([]Session, error) {
 					return nil, e
 				}
 			}
-			live = append(live, session)
+			live = append(live, r.withMode(session))
 		}
 	}
 	return live, nil
@@ -193,4 +197,50 @@ func checkInbox(s Session) error {
 		}
 	}
 	return nil
+}
+
+type permissionClass struct{ start, mode string }
+
+func (r *Registry) RecordPermissionMode(key Key, permission string) {
+	mode := "prompting"
+	if permission == "bypassPermissions" {
+		mode = "bypass"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.modes[key.PID] = permissionClass{key.ProcStart, mode}
+}
+
+func (r *Registry) withMode(s Session) Session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if class := r.modes[s.PID]; class.start == s.ProcStart {
+		s.FromMode = class.mode
+	}
+	return s
+}
+
+// Live checks the exact stored process, without walking to another session.
+func (r *Registry) Live(ctx context.Context, key Key) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if key.PID <= 0 || key.ProcStart == "" {
+		return false, nil
+	}
+	_, start, err := r.lookup(key.PID)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || start != key.ProcStart {
+		return false, err
+	}
+	for _, dir := range r.dirs {
+		_, err = read(dir, key.PID, start)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errStaleProcess) {
+			continue
+		}
+		return err == nil, err
+	}
+	return false, nil
 }

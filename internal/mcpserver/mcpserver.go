@@ -26,9 +26,8 @@ type MeshBackend interface {
 }
 
 type SendArgs struct {
-	To             string `json:"to"`
-	Message        string `json:"message"`
-	NotifyWhenIdle bool   `json:"notify_when_idle,omitempty"`
+	To      string `json:"to"`
+	Message string `json:"message"`
 }
 
 type ParentResult struct {
@@ -103,11 +102,6 @@ var sendMessage = mcp.Tool{
       "type": "string",
       "description": "Plain text, at most 32 KiB.",
       "minLength": 1
-    },
-    "notify_when_idle": {
-      "type": "boolean",
-      "description": "Also tell me when the peer finishes the turn this message starts.",
-      "default": false
     }
   },
   "required": [

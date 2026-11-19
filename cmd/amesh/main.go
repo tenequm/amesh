@@ -102,5 +102,10 @@ func daemon(ctx context.Context, cfg config.Config) error {
 	relays := relay.New("/tmp/cc-socks", state.New(cfg.StateDir))
 	laneBackend := lane.New(sessions, relays)
 	meshBackend := mesh.New(cfg, sessions, relays, hub.New(cfg))
-	return control.Serve(ctx, cfg, sessions, laneBackend, meshBackend)
+	// The relay manager gains its address lookup in the wire lane.
+	var ownsRelay func(string) bool
+	if owner, ok := any(relays).(interface{ OwnsRelay(string) bool }); ok {
+		ownsRelay = owner.OwnsRelay
+	}
+	return control.Serve(ctx, cfg, sessions, laneBackend, meshBackend, ownsRelay)
 }
