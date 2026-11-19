@@ -24,6 +24,8 @@ func (*Backend) Connect(ctx context.Context, session registry.Session) (io.Close
 	return nil, errors.ErrUnsupported
 }
 
+func (*Backend) IsMember(registry.Key) bool { return false }
+
 func (*Backend) HumanTurn(ctx context.Context, session registry.Session) error {
 	return errors.ErrUnsupported
 }
