@@ -2,7 +2,6 @@ package mesh
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
@@ -54,6 +53,18 @@ func New(cfg config.Config, sessions *registry.Registry, relays *relay.Manager, 
 	return &Backend{attempts: make(map[string][]*attempt), endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), wake: make(chan struct{}, 1)}
 }
 
-func (*Backend) HumanTurn(ctx context.Context, session registry.Session) error {
-	return errors.ErrUnsupported
+func (b *Backend) HumanTurn(ctx context.Context, s registry.Session) error {
+	key := sessionKey(s.Key)
+	current, live, err := b.liveSession(ctx, key)
+	if err != nil || !live || current.SessionID != s.SessionID {
+		return err
+	}
+	req := contract.HumanTurnRequest{At: time.Now().UnixMilli(), Source: "prompt"}
+	_, err = b.client.HumanTurn(ctx, key, req)
+	if unknownSession(err) {
+		if err = b.reregister(ctx, key); err == nil {
+			_, err = b.client.HumanTurn(ctx, key, req)
+		}
+	}
+	return err
 }

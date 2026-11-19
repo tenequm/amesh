@@ -244,3 +244,50 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 		t.Fatal("delivered to a former member")
 	}
 }
+
+func TestHumanTurnReregistersOnce(t *testing.T) {
+	s := testSession()
+	key := sessionKey(s.Key)
+	var calls []string
+	var at int64
+	b, r := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/sessions/{key}/human": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.HumanTurnRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Source != "prompt" || req.At <= 0 || req.Epoch != 7 || r.PathValue("key") != key {
+				t.Error("invalid human turn")
+			}
+			calls = append(calls, "human")
+			if len(calls) == 1 {
+				at = req.At
+				hubtest.Reply(t, "errUnknownSession")(w, r)
+				return
+			}
+			if at != req.At {
+				t.Error("human turn timestamp changed")
+			}
+			hubtest.Reply(t, "humanTurnResponse")(w, r)
+		},
+		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
+			calls = append(calls, "register")
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+		},
+	})
+	*r = append(*r, s)
+	if err := b.HumanTurn(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Connect(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HumanTurn(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	(*r)[0].SessionID = "cleared"
+	if err := b.HumanTurn(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(calls, []string{"human", "register", "human"}) {
+		t.Fatal(calls)
+	}
+}
