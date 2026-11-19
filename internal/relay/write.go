@@ -25,6 +25,9 @@ const (
 	retention = 25 * time.Hour
 	refill    = 2 * time.Second
 	burst     = 30
+	// A repeated body inside the window waits past it, so the inbox does not fold it as a duplicate.
+	duplicateWindow = 30 * time.Second
+	duplicateDelay  = 31 * time.Second
 )
 
 var uuidRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -63,7 +66,7 @@ func (f frame) line() ([]byte, error) {
 		return nil, err
 	}
 	if oversized(b) {
-		return nil, errors.New("oversized native frame")
+		return nil, ErrOversized
 	}
 	return append(b, '\n'), nil
 }
@@ -94,8 +97,8 @@ type bucket struct {
 
 func (b bucket) delay(now time.Time, body string) time.Duration {
 	ready := b.available.Add(-(burst - 1) * refill)
-	if body == b.body && !b.last.IsZero() && now.Sub(b.last) < 30*time.Second && b.last.Add(31*time.Second).After(ready) {
-		ready = b.last.Add(31 * time.Second)
+	if body == b.body && !b.last.IsZero() && now.Sub(b.last) < duplicateWindow && b.last.Add(duplicateDelay).After(ready) {
+		ready = b.last.Add(duplicateDelay)
 	}
 	return max(0, ready.Sub(now))
 }
@@ -237,6 +240,7 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 		return time.Time{}, err
 	}
 	defer unlockInbox()
+	claimed := false
 	n, written, err := m.send(ctx, d.Inbox, line, func(peer peercred.Credentials) error {
 		if retry {
 			known, checkErr := m.store.Contains(d.Log, d.ID)
@@ -251,7 +255,8 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 			if d.Notice {
 				kind = "notice"
 			}
-			claimed, checkErr := m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), kind)
+			var checkErr error
+			claimed, checkErr = m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), kind)
 			if checkErr != nil {
 				return checkErr
 			}
@@ -265,6 +270,10 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 		return nil
 	})
 	if err != nil && n == 0 {
+		if claimed {
+			// Nothing reached the inbox, so a retry must not see this claim as a replay.
+			err = errors.Join(err, m.store.ForgetWrite(d.Log, d.ID))
+		}
 		return time.Time{}, err
 	}
 	pair.pacing.sent(written, body)
@@ -383,6 +392,9 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSour
 }
 
 const maxRewrites = 3
+
+// ErrOversized is a frame that Claude Code's inbox would refuse.
+var ErrOversized = errors.New("oversized native frame")
 
 func (m *Manager) rewrite(ctx context.Context, d Delivery, peer peercred.Credentials) (time.Time, error) {
 	return m.post(ctx, d, true, func(next peercred.Credentials) error {

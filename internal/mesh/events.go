@@ -201,7 +201,7 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 	if errors.As(err, &netErr) || errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrNotExist) {
 		return b.report(ctx, conn.Log, msg.ID, key, "dropped", "session_gone")
 	}
-	if err.Error() == "oversized native frame" {
+	if errors.Is(err, relay.ErrOversized) {
 		return b.report(ctx, conn.Log, msg.ID, key, "dropped", "oversized")
 	}
 	return err

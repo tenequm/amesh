@@ -90,6 +90,26 @@ func TestFailedConnectCanBeRetried(t *testing.T) {
 	}
 }
 
+func TestFailedGateReleasesClaim(t *testing.T) {
+	m := manager(t)
+	path, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := delivery(path, 1)
+	if _, err = m.post(t.Context(), d, false, func(peercred.Credentials) error { return context.Canceled }); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	known, err := m.store.Contains(d.Log, d.ID)
+	if err != nil || known {
+		t.Fatal("abandoned claim kept", known, err)
+	}
+	if err = m.Write(t.Context(), d); err != nil {
+		t.Fatal(err)
+	}
+	<-lines
+}
+
 func TestPacing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var b bucket

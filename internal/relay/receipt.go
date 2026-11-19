@@ -169,6 +169,10 @@ func (p *pending) run(written time.Time) {
 				retried, err := p.rewrite(rewrites, accepted)
 				if err != nil {
 					if p.e.ctx.Err() == nil && !accepted {
+						// A final drop must not leave a payload for ResumeRewrites to write after restart.
+						if clearErr := p.e.manager.store.SetRewrite(p.d.ID, nil); clearErr != nil {
+							slog.Error("clear pending rewrite", "id", p.d.ID, "err", clearErr)
+						}
 						event.DropReason = "session_gone"
 						p.report(event)
 					}
@@ -223,7 +227,7 @@ func (p *pending) rewrite(count int, accepted bool) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, err
 	}
-	record := rewriteRecord{Inbox: p.d.Inbox, Content: content, PID: p.peer.PID, UID: p.peer.UID, Window: p.d.AcceptWindow, Start: start, Rewrites: count, Accepted: accepted, Ready: time.Now().Add(31 * time.Second)}
+	record := rewriteRecord{Inbox: p.d.Inbox, Content: content, PID: p.peer.PID, UID: p.peer.UID, Window: p.d.AcceptWindow, Start: start, Rewrites: count, Accepted: accepted, Ready: time.Now().Add(duplicateDelay)}
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return time.Time{}, err
