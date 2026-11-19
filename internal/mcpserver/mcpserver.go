@@ -3,7 +3,10 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
+	"syscall"
 
 	"github.com/tenequm/amesh/internal/contract"
 
@@ -144,6 +147,35 @@ func contractResults(next mcp.MethodHandler) mcp.MethodHandler {
 	}
 }
 
+// IgnorePeerClose reports only failures other than an orderly or broken stream.
+func IgnorePeerClose(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return nil
+	}
+	return err
+}
+
+// The SDK checks read and write errors separately and treats EOF on either as clean.
+type sessionStream struct{ io.ReadWriteCloser }
+
+func transportEOF(err error) error {
+	if err != nil && IgnorePeerClose(err) == nil {
+		return io.EOF
+	}
+	return err
+}
+
+func (s sessionStream) Read(p []byte) (int, error) {
+	n, err := s.ReadWriteCloser.Read(p)
+	return n, transportEOF(err)
+}
+
+func (s sessionStream) Write(p []byte) (int, error) {
+	n, err := s.ReadWriteCloser.Write(p)
+	return n, transportEOF(err)
+}
+
 //nolint:nilerr // Delivery refusals are successful MCP results with a reason.
 func Serve(ctx context.Context, stream io.ReadWriteCloser, caller Caller, parentID string, reconnect bool, lane LaneBackend, mesh MeshBackend) error {
 	instructions := meshInstructions
@@ -203,11 +235,12 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, caller Caller, parent
 	if reconnect {
 		opts.State = &mcp.ServerSessionState{InitializeParams: &mcp.InitializeParams{ProtocolVersion: protocol, Capabilities: &mcp.ClientCapabilities{}, ClientInfo: &mcp.Implementation{Name: "claude-code"}}, InitializedParams: &mcp.InitializedParams{}, NegotiatedProtocolVersion: protocol}
 	}
-	session, err := server.Connect(ctx, &mcp.IOTransport{Reader: io.NopCloser(stream), Writer: stream}, &opts)
+	transport := sessionStream{stream}
+	session, err := server.Connect(ctx, &mcp.IOTransport{Reader: io.NopCloser(transport), Writer: transport}, &opts)
 	if err != nil {
-		return err
+		return IgnorePeerClose(err)
 	}
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
-	return session.Wait()
+	return IgnorePeerClose(session.Wait())
 }

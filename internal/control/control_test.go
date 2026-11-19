@@ -257,6 +257,32 @@ func TestPipeForwardsArgvAndBytes(t *testing.T) {
 	}
 }
 
+func TestPipeStopsOnOutputError(t *testing.T) {
+	for _, tc := range []struct {
+		err, want error
+	}{
+		{io.EOF, nil},
+		{io.ErrClosedPipe, nil},
+		{net.ErrClosed, nil},
+		{syscall.EPIPE, nil},
+		{io.ErrShortWrite, io.ErrShortWrite},
+	} {
+		t.Run(tc.err.Error(), func(t *testing.T) {
+			conn, daemon := net.Pipe()
+			defer daemon.Close()
+			reader, stdout := io.Pipe()
+			defer stdout.Close()
+			reader.CloseWithError(fmt.Errorf("stdout: %w", tc.err))
+			go func() { _, _ = io.WriteString(daemon, "response\n") }()
+			needInput := true
+			stop, err := forward(t.Context(), &bufferedConn{conn, bufio.NewReader(conn)}, nil, nil, stdout, &needInput)
+			if !stop || !errors.Is(err, tc.want) {
+				t.Fatalf("forward returned stop=%t err=%v, want stop=true err=%v", stop, err, tc.want)
+			}
+		})
+	}
+}
+
 type humanBackend struct {
 	mcpserver.MeshBackend
 	human  chan registry.Session

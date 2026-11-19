@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tenequm/amesh/internal/contract"
+	"github.com/tenequm/amesh/internal/mcpserver"
 )
 
 func dialPipe(ctx context.Context, socket string, args []string, reconnect bool) (*bufferedConn, error) {
@@ -155,26 +156,24 @@ func forward(ctx context.Context, conn *bufferedConn, requests chan<- struct{}, 
 		case grant <- struct{}{}:
 			*needInput = false
 		case outputErr := <-done:
-			return false, errors.Join(ctx.Err(), outputErr)
+			return outputErr != nil, errors.Join(ctx.Err(), mcpserver.IgnorePeerClose(outputErr))
 		case block := <-blocks:
 			_, writeErr := conn.Write(block.data)
 			if block.err != nil {
-				if errors.Is(block.err, io.EOF) {
-					if writeErr == nil {
-						writeErr = conn.Conn.(*net.UnixConn).CloseWrite()
-					}
-				} else {
-					writeErr = block.err
+				inputErr := mcpserver.IgnorePeerClose(block.err)
+				if inputErr == nil && writeErr == nil {
+					writeErr = conn.Conn.(*net.UnixConn).CloseWrite()
 				}
-				if writeErr != nil {
+				if inputErr != nil || writeErr != nil {
 					_ = conn.Close()
 				}
-				return true, errors.Join(ctx.Err(), writeErr, <-done)
+				return true, errors.Join(ctx.Err(), inputErr, mcpserver.IgnorePeerClose(writeErr), mcpserver.IgnorePeerClose(<-done))
 			}
 			*needInput = true
 			if writeErr != nil {
 				_ = conn.Close()
-				return false, errors.Join(ctx.Err(), <-done)
+				outputErr := <-done
+				return outputErr != nil, errors.Join(ctx.Err(), mcpserver.IgnorePeerClose(outputErr))
 			}
 		}
 	}

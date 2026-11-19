@@ -80,6 +80,10 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 			return err
 		}
 		if command == "mcp" {
+			// Let Pipe handle EPIPE when the MCP client closes stdout during a response.
+			brokenPipe := make(chan os.Signal, 1)
+			signal.Notify(brokenPipe, syscall.SIGPIPE)
+			defer signal.Stop(brokenPipe)
 			return control.Pipe(ctx, socket, rest, in, out)
 		}
 		return control.Status(ctx, socket, out)

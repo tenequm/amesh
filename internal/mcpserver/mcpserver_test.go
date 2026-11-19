@@ -4,13 +4,17 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
+	"testing/synctest"
 
 	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/registry"
@@ -55,6 +59,62 @@ func newRPC(t *testing.T, parent string, reconnect bool) *rpc {
 		}
 	})
 	return &rpc{t, client, bufio.NewReader(client)}
+}
+
+func TestServePeerClose(t *testing.T) {
+	for _, phase := range []string{"idle", "after request", "during response"} {
+		t.Run(phase, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				server, client := net.Pipe()
+				defer client.Close()
+				done := make(chan error, 1)
+				go func() { done <- Serve(t.Context(), server, nil, "parent", true, nil, nil) }()
+				synctest.Wait()
+				if phase != "idle" {
+					if _, err := fmt.Fprintln(client, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if phase == "during response" {
+					// net.Pipe holds the response writer until the rest is read or the peer closes.
+					if _, err := io.ReadFull(client, make([]byte, 1)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := client.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+			})
+		})
+	}
+}
+
+type testStream struct {
+	io.Reader
+	io.WriteCloser
+}
+
+func TestServeReadError(t *testing.T) {
+	for _, tc := range []struct {
+		err, want error
+	}{
+		{io.EOF, nil},
+		{io.ErrClosedPipe, nil},
+		{net.ErrClosed, nil},
+		{io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+	} {
+		t.Run(tc.err.Error(), func(t *testing.T) {
+			server, client := net.Pipe()
+			defer client.Close()
+			stream := testStream{iotest.ErrReader(fmt.Errorf("read: %w", tc.err)), server}
+			if err := Serve(t.Context(), stream, nil, "parent", true, nil, nil); !errors.Is(err, tc.want) {
+				t.Fatalf("Serve returned %v, want %v", err, tc.want)
+			}
+		})
+	}
 }
 
 func (c *rpc) request(method, params string) map[string]any {
