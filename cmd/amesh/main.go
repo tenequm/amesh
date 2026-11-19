@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/tenequm/amesh/internal/config"
 	"github.com/tenequm/amesh/internal/control"
+	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/lane"
 	"github.com/tenequm/amesh/internal/mesh"
@@ -98,14 +100,26 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 }
 
 func daemon(ctx context.Context, cfg config.Config) error {
-	sessions := registry.New(cfg.ClaudeConfigDirs)
-	relays := relay.New("/tmp/cc-socks", state.New(cfg.StateDir))
-	laneBackend := lane.New(ctx, sessions, relays, "local")
-	meshBackend := mesh.New(cfg, sessions, relays, hub.New(cfg))
-	// The relay manager gains its address lookup in the wire lane.
-	var ownsRelay func(string) bool
-	if owner, ok := any(relays).(interface{ OwnsRelay(string) bool }); ok {
-		ownsRelay = owner.OwnsRelay
+	if err := envelope.SelfCheck(); err != nil {
+		return fmt.Errorf("native envelope startup check: %w", err)
 	}
-	return control.Serve(ctx, cfg, sessions, laneBackend, meshBackend, ownsRelay)
+	store := state.New(cfg.StateDir)
+	if err := store.Lock(); err != nil {
+		return err
+	}
+	defer store.Close()
+	sessions := registry.New(cfg.ClaudeConfigDirs)
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	if runtimeDir == "" {
+		runtimeDir = os.Getenv("CLAUDE_CODE_TMPDIR")
+	}
+	if runtimeDir == "" {
+		runtimeDir = "/tmp"
+	}
+	relays := relay.New(filepath.Join(runtimeDir, "cc-socks"), store)
+	ctx, cancel := context.WithCancel(ctx)
+	laneBackend := lane.New(ctx, sessions, relays, cfg.StateDir)
+	defer func() { cancel(); laneBackend.Wait() }()
+	meshBackend := mesh.New(cfg, sessions, relays, hub.New(cfg))
+	return control.Serve(ctx, cfg, sessions, laneBackend, meshBackend, relays.OwnsRelay)
 }

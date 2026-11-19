@@ -37,13 +37,13 @@ type native interface {
 }
 
 type Backend struct {
-	ctx       context.Context
-	sessions  sessions
-	relays    native
-	machineID string
-	mu        sync.Mutex
-	work      sync.WaitGroup
-	lanes     map[pair]*conversation
+	ctx      context.Context
+	sessions sessions
+	relays   native
+	identity func() (string, error)
+	mu       sync.Mutex
+	work     sync.WaitGroup
+	lanes    map[pair]*conversation
 }
 
 type pair struct{ parent, child string }
@@ -77,8 +77,12 @@ type turn struct {
 
 var _ mcpserver.LaneBackend = (*Backend)(nil)
 
-func New(ctx context.Context, sessions sessions, relays native, machineID string) *Backend {
-	return &Backend{ctx: ctx, sessions: sessions, relays: relays, machineID: machineID, lanes: make(map[pair]*conversation)}
+func New(ctx context.Context, sessions *registry.Registry, relays *relay.Manager, stateDir string) *Backend {
+	return newBackend(ctx, sessions, relays, sync.OnceValues(func() (string, error) { return machineID(stateDir) }))
+}
+
+func newBackend(ctx context.Context, sessions sessions, relays native, identity func() (string, error)) *Backend {
+	return &Backend{ctx: ctx, sessions: sessions, relays: relays, identity: identity, lanes: make(map[pair]*conversation)}
 }
 
 func (b *Backend) current(ctx context.Context, key registry.Key) (registry.Session, bool, error) {
@@ -181,7 +185,11 @@ func (b *Backend) open(ctx context.Context, key pair, child registry.Session) er
 	if _, err := c.resolveParent(ctx); err != nil {
 		return err
 	}
-	path, err := relay.Path(filepath.Dir(child.SocketPath), "amesh-ln\n"+b.machineID, c.id)
+	id, err := b.identity()
+	if err != nil {
+		return err
+	}
+	path, err := relay.Path(filepath.Dir(child.SocketPath), "amesh-ln\n"+id, c.id)
 	if err != nil {
 		return err
 	}

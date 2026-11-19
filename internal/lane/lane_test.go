@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -75,7 +76,7 @@ func TestLaneRouting(t *testing.T) {
 	s := &seat{rows: map[int]registry.Session{}}
 	s.put(child)
 	r := new(recorder)
-	b := New(ctx, s, r, "pm_PCly-PiMxyo5IXRSo4i70g")
+	b := newBackend(ctx, s, r, func() (string, error) { return "pm_PCly-PiMxyo5IXRSo4i70g", nil })
 	checkRefusal := func(id, reason string) {
 		t.Helper()
 		_, err := b.Connect(ctx, child, id)
@@ -151,7 +152,7 @@ func TestLaneNotices(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		s := &seat{rows: map[int]registry.Session{}}
 		r := new(recorder)
-		b := New(ctx, s, r, "local")
+		b := newBackend(ctx, s, r, func() (string, error) { return "local", nil })
 		defer func() { cancel(); b.Wait() }()
 		p := registry.Session{PID: 11, ProcStart: "p", SessionID: "p", Name: "parent", FromMode: "bypass", SocketPath: "/tmp/cc-socks/11.sock"}
 		child := registry.Session{PID: 12, ProcStart: "c", SessionID: "c", Name: "child", CWD: "/project", SocketPath: "/tmp/cc-socks/12.sock", Status: "idle"}
@@ -229,4 +230,22 @@ func TestLaneNotices(t *testing.T) {
 			t.Fatal("busy child should announce immediately")
 		}
 	})
+}
+
+func TestLocalMachineIdentity(t *testing.T) {
+	d := t.TempDir()
+	first, err := machineID(d)
+	if err != nil || !strings.HasPrefix(first, "pm_") {
+		t.Fatal(first, err)
+	}
+	again, err := machineID(d)
+	if err != nil || again != first {
+		t.Fatal(again, err)
+	}
+	if err = os.Chmod(filepath.Join(d, "machine.key"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = machineID(d); err == nil {
+		t.Fatal("accepted group-readable key")
+	}
 }
