@@ -6,10 +6,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tenequm/amesh/internal/mcpserver"
 
 	"github.com/tenequm/amesh/internal/config"
 	"github.com/tenequm/amesh/internal/contract"
@@ -143,4 +147,55 @@ func TestMembership(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	b.runPresence(ctx)
+}
+
+func TestDirectoryAndSend(t *testing.T) {
+	s := testSession()
+	key := sessionKey(s.Key)
+	recv := make(chan contract.SendRequest, 1)
+	b, _ := fixture(t, map[string]http.HandlerFunc{
+		"GET /peer/peers": hubtest.Reply(t, "peersResponse"),
+		"POST /peer/messages": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.SendRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			recv <- req
+			var res contract.SendResponse
+			_ = json.Unmarshal(hubtest.Example(t, "sendResponse"), &res)
+			res.Message.ID = req.ID
+			_ = json.NewEncoder(w).Encode(res)
+		},
+	})
+	b.members[key] = member{session: s, hosted: true, address: "review@pond:mac"}
+	dir, err := b.ListPeers(t.Context(), s, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want mcpserver.Directory
+	_ = json.Unmarshal(hubtest.Example(t, "mcpListPeers"), &want)
+	if !reflect.DeepEqual(dir, want) {
+		t.Fatalf("directory %#v", dir)
+	}
+	for _, tc := range []struct{ to, text, example string }{{"stna", "hi", "mcpSendRefusedNotFound"}, {"stan", strings.Repeat("a", 32769), "mcpSendRefusedTooLarge"}} {
+		got, e := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: tc.to, Message: tc.text})
+		var expected mcpserver.SendResult
+		_ = json.Unmarshal(hubtest.Example(t, tc.example), &expected)
+		if e != nil || !reflect.DeepEqual(got, expected) {
+			t.Fatalf("%s: %#v %v", tc.example, got, e)
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- b.client.RunOutbox(ctx, nil) }()
+	defer func() { cancel(); <-done }()
+	got, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "stan", Message: "hello"})
+	var expected mcpserver.SendResult
+	_ = json.Unmarshal(hubtest.Example(t, "mcpSendAccepted"), &expected)
+	expected.ID = got.ID
+	if err != nil || got.ID == "" || !reflect.DeepEqual(got, expected) {
+		t.Fatalf("send %#v %v", got, err)
+	}
+	req := <-recv
+	if req.ID != got.ID || req.From.Session != key || req.FromMode != nil || req.Origin != "unknown" || req.NotifyWhenIdle {
+		t.Fatal("incorrect remote send metadata")
+	}
 }

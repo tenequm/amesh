@@ -274,6 +274,7 @@ func (b *Backend) reconcile(ctx context.Context) error {
 	}
 	b.mu.RUnlock()
 	res, err := b.client.Heartbeat(ctx, req)
+	b.connectivity(err)
 	if err != nil {
 		return err
 	}
