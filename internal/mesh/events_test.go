@@ -204,8 +204,12 @@ func TestDeliveryRetriesAnIncompleteEntry(t *testing.T) {
 		if err := os.WriteFile(path, []byte("!"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		start := time.Now()
 		if _, _, err := b.deliverySession(t.Context(), key); !errors.Is(err, registry.ErrEntryUnavailable) {
 			t.Fatalf("bad entry did not release the delivery worker: %v", err)
+		}
+		if waited := time.Since(start); waited != 0 {
+			t.Fatalf("malformed entry waited %v for a registry write", waited)
 		}
 	})
 }

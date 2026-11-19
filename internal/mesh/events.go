@@ -161,7 +161,7 @@ func (b *Backend) prepareLog(ctx context.Context, conn contract.HelloResponse) e
 
 func (b *Backend) deliverySession(ctx context.Context, key string) (registry.Session, bool, error) {
 	s, live, err := b.liveSession(ctx, key)
-	if !errors.Is(err, registry.ErrEntryUnavailable) {
+	if !errors.Is(err, registry.ErrEntryUnavailable) || !registry.PendingEntry(err) {
 		return s, live, err
 	}
 	// Give a concurrent registry write one presence interval to finish.
