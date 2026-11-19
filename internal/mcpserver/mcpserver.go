@@ -238,9 +238,9 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, caller Caller, parent
 	transport := sessionStream{stream}
 	session, err := server.Connect(ctx, &mcp.IOTransport{Reader: io.NopCloser(transport), Writer: transport}, &opts)
 	if err != nil {
-		return IgnorePeerClose(err)
+		return err
 	}
 	stop := context.AfterFunc(ctx, func() { _ = stream.Close() })
 	defer stop()
-	return IgnorePeerClose(session.Wait())
+	return session.Wait()
 }

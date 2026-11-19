@@ -167,7 +167,7 @@ func forward(ctx context.Context, conn *bufferedConn, requests chan<- struct{}, 
 				if inputErr != nil || writeErr != nil {
 					_ = conn.Close()
 				}
-				return true, errors.Join(ctx.Err(), inputErr, mcpserver.IgnorePeerClose(writeErr), mcpserver.IgnorePeerClose(<-done))
+				return true, errors.Join(ctx.Err(), inputErr, writeErr, mcpserver.IgnorePeerClose(<-done))
 			}
 			*needInput = true
 			if writeErr != nil {
