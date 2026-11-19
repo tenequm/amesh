@@ -502,3 +502,55 @@ func TestProxyErrorAllowsRecovery(t *testing.T) {
 		}
 	})
 }
+
+func TestTwoDaemonsWithOneEnrollment(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		hello := example[contract.HelloResponse](t, "helloResponse")
+		hello.Epoch = 8
+		newOwner := func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(hello) }
+		s := hubtest.MemoryScript(t,
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "helloResponse")},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: newOwner},
+			hubtest.Step{Method: "POST", Target: "/peer/heartbeat", Reply: hubtest.Reply(t, "errSuperseded")},
+			hubtest.Step{Method: "POST", Target: "/peer/hello", Reply: hubtest.Reply(t, "errMachineInUse")},
+			hubtest.Step{Method: "GET", Target: "/peer/peers", Reply: hubtest.Reply(t, "peersResponse")})
+		first := enrolled(t, "http://amesh-hub.test")
+		second := enrolled(t, "http://amesh-hub.test")
+		key, err := os.ReadFile(filepath.Join(first.cfg.StateDir, "machine.key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = saveFile(filepath.Join(second.cfg.StateDir, "machine.key"), key, false); err != nil {
+			t.Fatal(err)
+		}
+		first.http.Transport = s.Client().Transport
+		second.http.Transport = s.Client().Transport
+		req := example[contract.HelloRequest](t, "helloRequest")
+		if _, err = first.Hello(t.Context(), req); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = second.Hello(t.Context(), req); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = first.Heartbeat(t.Context(), contract.HeartbeatRequest{}); !hasCode(err, 409, "superseded") {
+			t.Fatal("unconfirmed takeover")
+		}
+		if _, err = first.Peers(t.Context()); !hasCode(err, 409, "superseded") {
+			t.Fatal("old owner resumed")
+		}
+		if _, err = second.Peers(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		calls := s.Calls()
+		var opened, takeover, probe contract.HelloRequest
+		if json.Unmarshal(calls[0].Body, &opened) != nil || json.Unmarshal(calls[1].Body, &takeover) != nil || json.Unmarshal(calls[3].Body, &probe) != nil {
+			t.Fatal("invalid hello")
+		}
+		if opened.Instance == takeover.Instance || probe.Instance != opened.Instance || !takeover.Takeover || probe.Takeover {
+			t.Fatal("owner identity changed or repeated takeover")
+		}
+		for _, call := range calls {
+			checkSignature(t, first, call)
+		}
+	})
+}
