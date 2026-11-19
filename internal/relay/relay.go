@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/peercred"
@@ -11,7 +12,13 @@ import (
 )
 
 type (
-	Manager  struct{}
+	Manager struct {
+		socketDir string
+		store     *state.Store
+		mu        sync.Mutex
+		inboxes   map[string]*inbox
+		slots     chan struct{}
+	}
 	Delivery struct {
 		Inbox, ID      string
 		Message        envelope.Message
@@ -29,12 +36,10 @@ type Event struct {
 }
 type Handler func(context.Context, Event) error
 
-func New(socketDir string, store *state.Store) *Manager { return &Manager{} }
+func New(socketDir string, store *state.Store) *Manager {
+	return &Manager{socketDir: socketDir, store: store, inboxes: make(map[string]*inbox), slots: make(chan struct{}, 32)}
+}
 func Path(socketDir, domain, id string) (string, error) { return "", errors.ErrUnsupported }
 func (*Manager) Listen(ctx context.Context, path string, handle Handler) (io.Closer, error) {
 	return nil, errors.ErrUnsupported
-}
-func (*Manager) Write(ctx context.Context, delivery Delivery) error { return errors.ErrUnsupported }
-func (*Manager) NotifyWhenIdle(ctx context.Context, inbox, from, fromMode, id string) error {
-	return errors.ErrUnsupported
 }
