@@ -40,7 +40,7 @@ release version:
         arch="${target#*/}"
         archive="amesh_${version}_${os}_${arch}.tar.gz"
         CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w -X github.com/tenequm/amesh/internal/version.Value=$version" -o "$out/amesh" ./cmd/amesh
-        tar -C "$out" -czf "$out/$archive" amesh
+        COPYFILE_DISABLE=1 tar -C "$out" -czf "$out/$archive" amesh
         archives+=("$archive")
     done
     cd "$out"
