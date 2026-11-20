@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,37 +44,57 @@ type CodexPipe struct {
 	key                   Key
 	parent                int
 	order                 uint64
-	cwd, thread           string
+	cwd                   string
+	thread                threadLock
 	rollout, turn, status string
 	opened                time.Time
 	human, trigger        string
 	input                 [32]byte
 	offset                int64
-	locks                 map[string]bool
+	locks                 threadLocks
 	row                   *threadRow
 	rowThread             string
 	checked, queried      time.Time
 	mu                    sync.Mutex
 }
 
-func CodexHome() string {
-	if dir := os.Getenv("CODEX_HOME"); filepath.IsAbs(dir) {
-		return dir
-	}
-	dir, _ := os.UserHomeDir()
-	return filepath.Join(dir, ".codex")
+type threadLock struct {
+	home, id string
 }
 
-func resolvedCodexHome() string {
-	home := CodexHome()
-	if resolved, err := filepath.EvalSymlinks(home); err == nil {
-		return resolved
+type threadLocks map[threadLock]bool
+
+func (locks threadLocks) match(home, id string) threadLock {
+	var match threadLock
+	for lock := range locks {
+		if (home != "" && home != lock.home) || (id != "" && id != lock.id) {
+			continue
+		}
+		switch {
+		case match.home == "":
+			match = lock
+		case match.home != lock.home:
+			return threadLock{}
+		default:
+			match.id = ""
+		}
 	}
-	return home
+	return match
+}
+
+func (r *Registry) lockDirs() map[string]string {
+	dirs := make(map[string]string, len(r.codexHomes))
+	for _, home := range r.codexHomes {
+		dir, err := filepath.EvalSymlinks(filepath.Join(home, writerLocks))
+		if err == nil && dirs[dir] == "" {
+			dirs[dir] = home
+		}
+	}
+	return dirs
 }
 
 type openFiles struct {
-	locks map[string]bool
+	locks threadLocks
 	cwd   string
 }
 
@@ -87,9 +108,8 @@ func heldLock(path string) bool {
 	return errors.Is(err, syscall.EWOULDBLOCK)
 }
 
-func processFiles(ctx context.Context, pid int, home string) (openFiles, error) {
-	files := openFiles{locks: make(map[string]bool)}
-	dir := filepath.Join(home, writerLocks)
+func processFiles(ctx context.Context, pid int, dirs map[string]string) (openFiles, error) {
+	files := openFiles{locks: make(threadLocks)}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	raw, err := exec.CommandContext(ctx, "lsof", "-nP", "-a", "-p", strconv.Itoa(pid), "-F0fn").Output() // #nosec G204 -- pid comes from kernel peer credentials.
@@ -110,13 +130,14 @@ func processFiles(ctx context.Context, pid int, home string) (openFiles, error) 
 		if fd == "cwd" {
 			files.cwd = p
 		}
-		if filepath.Dir(p) != dir {
+		home, ok := dirs[filepath.Dir(p)]
+		if !ok {
 			continue
 		}
 		id, ok := strings.CutSuffix(filepath.Base(p), ".lock")
 		u, err := uuid.Parse(id)
 		if ok && err == nil && u.String() == id && heldLock(p) {
-			files.locks[id] = true
+			files.locks[threadLock{home, id}] = true
 		}
 	}
 	return files, nil
@@ -127,15 +148,15 @@ func (r *Registry) OpenCodexPipe(ctx context.Context, pid int) *CodexPipe {
 	if err != nil || parent <= 1 {
 		return nil
 	}
-	home := resolvedCodexHome()
-	if _, err = os.Stat(filepath.Join(home, writerLocks)); err != nil {
+	dirs := r.lockDirs()
+	if len(dirs) == 0 {
 		return nil
 	}
-	files, err := processFiles(ctx, parent, home)
+	files, err := processFiles(ctx, parent, dirs)
 	if err != nil || len(files.locks) == 0 {
 		return nil
 	}
-	own, err := processFiles(ctx, pid, home)
+	own, err := processFiles(ctx, pid, nil)
 	if err != nil || !filepath.IsAbs(own.cwd) {
 		return nil
 	}
@@ -144,14 +165,19 @@ func (r *Registry) OpenCodexPipe(ctx context.Context, pid int) *CodexPipe {
 	defer r.mu.Unlock()
 	r.pipeOrder++
 	p := &CodexPipe{registry: r, opened: time.Now(), key: Key{pid, start}, parent: parent, cwd: cwd, order: r.pipeOrder, status: "idle", locks: files.locks, checked: time.Now()}
+	candidates := maps.Clone(files.locks)
 	for _, sibling := range r.codex {
 		if sibling.parent == parent {
-			delete(files.locks, sibling.thread)
+			delete(candidates, sibling.thread)
 		}
 	}
-	if len(files.locks) == 1 {
-		for id := range files.locks {
-			p.thread = id
+	p.thread = candidates.match("", "")
+	if len(candidates) == 0 {
+		p.thread.home = files.locks.match("", "").home
+	}
+	for _, sibling := range r.codex {
+		if sibling.thread.id == p.thread.id && sibling.thread.home != p.thread.home {
+			p.thread.id = ""
 		}
 	}
 	r.codex[pid] = p
@@ -179,7 +205,6 @@ func (p *CodexPipe) cached(ctx context.Context) (Session, error) {
 
 func (p *CodexPipe) session(ctx context.Context, id string, fresh bool) (Session, error) {
 	r := p.registry
-	home := resolvedCodexHome()
 	parent, start, err := r.lookup(p.key.PID)
 	if err != nil || parent != p.parent || start != p.key.ProcStart {
 		return Session{}, os.ErrNotExist
@@ -189,7 +214,7 @@ func (p *CodexPipe) session(ctx context.Context, id string, fresh bool) (Session
 	stale := fresh || time.Since(p.checked) >= codexRecheck
 	p.mu.Unlock()
 	if stale {
-		files, e := processFiles(ctx, parent, home)
+		files, e := processFiles(ctx, parent, r.lockDirs())
 		if e != nil && fresh {
 			return Session{}, os.ErrNotExist
 		}
@@ -205,19 +230,26 @@ func (p *CodexPipe) session(ctx context.Context, id string, fresh bool) (Session
 		r.mu.Unlock()
 		return Session{}, os.ErrNotExist
 	}
-	if id != "" && locks[id] {
-		for _, sibling := range r.codex {
-			if sibling != p && sibling.thread == id {
-				sibling.thread = ""
+	if id != "" {
+		match := locks.match(p.thread.home, id)
+		if match.home != "" {
+			for _, sibling := range r.codex {
+				if sibling.thread.id == id && sibling.thread.home != match.home {
+					r.mu.Unlock()
+					return Session{}, os.ErrNotExist
+				}
+				if sibling != p && sibling.thread == match {
+					sibling.thread.id = ""
+				}
 			}
+			p.thread = match
 		}
-		p.thread = id
 	}
-	thread := p.thread
-	visible := locks[thread] && (id == "" || id == thread)
+	home, thread := p.thread.home, p.thread.id
+	visible := locks[p.thread] && (id == "" || id == thread)
 	// The newest pipe under a parent owns its visible thread; an older one holds the thread that /new left loaded.
 	for _, sibling := range r.codex {
-		if sibling.parent == parent && sibling.order > p.order {
+		if sibling.parent == parent && sibling.order > p.order && (sibling.thread.home == "" || sibling.thread.home == home) {
 			visible = false
 		}
 	}
@@ -270,7 +302,7 @@ func (p *CodexPipe) session(ctx context.Context, id string, fresh bool) (Session
 	s.HumanTurn = p.human
 	s.Status = p.status
 	if r.CodexStatus != nil {
-		if status := r.CodexStatus(thread); status != "" {
+		if status := r.CodexStatus(home, thread); status != "" {
 			s.Status = status
 		}
 	}
@@ -306,6 +338,11 @@ func (p *CodexPipe) readStatus(ctx context.Context, home, thread string) {
 	}
 	root := filepath.Join(home, "sessions")
 	rel, err := filepath.Rel(root, p.rollout)
+	if err == nil && !filepath.IsLocal(rel) {
+		if resolved, e := filepath.EvalSymlinks(root); e == nil {
+			rel, err = filepath.Rel(resolved, p.rollout)
+		}
+	}
 	if err != nil || !filepath.IsLocal(rel) {
 		return
 	}

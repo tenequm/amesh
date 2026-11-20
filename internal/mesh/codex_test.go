@@ -26,6 +26,9 @@ type threadRecorder struct {
 	writes           int
 }
 
+func (*threadRecorder) Status(string) string  { return "" }
+func (*threadRecorder) Watch(context.Context) {}
+
 func (r *threadRecorder) Deliver(_ context.Context, thread, id, text string, live func() bool) (bool, error) {
 	if !live() {
 		return false, os.ErrNotExist
@@ -41,7 +44,7 @@ func TestCodexLocalHopsAndReplyAttribution(t *testing.T) {
 	cfg.HubURL = ""
 	b.client = hub.New(cfg)
 	record := &threadRecorder{queued: true}
-	b.threads = record
+	b.threads[""] = record
 	native := testSession()
 	inbox, lines, err := relaytest.Inbox(t)
 	if err != nil {
@@ -144,7 +147,7 @@ func TestCodexHubRegistrationAndConversationReply(t *testing.T) {
 	})
 	*r = testRegistry{thread}
 	record := new(threadRecorder)
-	b.threads = record
+	b.threads[""] = record
 	handle, err := b.Connect(t.Context(), thread)
 	if err != nil {
 		t.Fatal(err)
@@ -192,11 +195,11 @@ func TestCodexFallbackAnswerIsNotAnsweredAgain(t *testing.T) {
 	cfg := b.cfg
 	cfg.HubURL = ""
 	b.client = hub.New(cfg)
-	record := &threadRecorder{}
-	b.threads = record
-	first := registry.Session{Codex: true, PID: 50, ProcStart: "start", SessionID: uuid.NewString(), Name: "first", Project: "demo", Status: "idle"}
+	firstApp, secondApp := new(threadRecorder), new(threadRecorder)
+	b.threads["/one"], b.threads["/two"] = firstApp, secondApp
+	first := registry.Session{Codex: true, PID: 50, ConfigDir: "/one", ProcStart: "start", SessionID: uuid.NewString(), Name: "first", Project: "demo", Status: "idle"}
 	second := first
-	second.PID, second.SessionID, second.Name = 51, uuid.NewString(), "second"
+	second.PID, second.ConfigDir, second.SessionID, second.Name = 51, "/two", uuid.NewString(), "second"
 	*r = testRegistry{first, second}
 	for _, s := range *r {
 		handle, err := b.Connect(t.Context(), s)
@@ -212,14 +215,17 @@ func TestCodexFallbackAnswerIsNotAnsweredAgain(t *testing.T) {
 	if res, e := b.SendMessage(t.Context(), first, mcpserver.SendArgs{To: dir.Peers[0].Name, Message: "ping"}); e != nil || !res.Accepted {
 		t.Fatal(res, e)
 	}
-	b.completedThread(second.SessionID, sha256.Sum256([]byte(record.text)), "pong")
-	b.flushThreadReplies(t.Context())
-	if record.writes != 2 || record.thread != first.SessionID {
-		t.Fatal("final answer did not return to the sender", record.writes)
+	if firstApp.writes != 0 || secondApp.writes != 1 || secondApp.thread != second.SessionID {
+		t.Fatal("message delivered to wrong home")
 	}
-	b.completedThread(first.SessionID, sha256.Sum256([]byte(record.text)), "pong again")
+	b.completedThread(second.SessionID, sha256.Sum256([]byte(secondApp.text)), "pong")
 	b.flushThreadReplies(t.Context())
-	if record.writes != 2 {
+	if firstApp.writes != 1 || firstApp.thread != first.SessionID {
+		t.Fatal("final answer did not return to the sender")
+	}
+	b.completedThread(first.SessionID, sha256.Sum256([]byte(firstApp.text)), "pong again")
+	b.flushThreadReplies(t.Context())
+	if secondApp.writes != 1 {
 		t.Fatal("a fallback answer was answered automatically")
 	}
 }
@@ -239,7 +245,7 @@ func TestCodexMemberSurvivesMissedScanWhilePipeOpen(t *testing.T) {
 		},
 		"POST /peer/heartbeat": func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{}")) },
 	})
-	b.threads = new(threadRecorder)
+	b.threads[""] = new(threadRecorder)
 	*r = testRegistry{thread}
 	handle, err := b.Connect(t.Context(), thread)
 	if err != nil {

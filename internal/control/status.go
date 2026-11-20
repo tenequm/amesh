@@ -34,8 +34,8 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 		counts[s.ConfigDir]++
 		byKey[s.Key] = s
 	}
-	dirs := make([]contract.DaemonStatusConfigDirsItem, 0, len(d.cfg.ClaudeConfigDirs))
-	for _, dir := range d.cfg.ClaudeConfigDirs {
+	dirs := make([]contract.DaemonStatusConfigDirsItem, 0, len(d.cfg.ClaudeConfigDirs)+len(d.cfg.CodexHomes))
+	for _, dir := range slices.Concat(d.cfg.ClaudeConfigDirs, d.cfg.CodexHomes) {
 		dirs = append(dirs, contract.DaemonStatusConfigDirsItem{Path: dir, Sessions: int64(counts[dir])})
 	}
 	pipes := []pipeStatus{}

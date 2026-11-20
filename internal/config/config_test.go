@@ -20,7 +20,7 @@ func flags(t *testing.T, args ...string) *Flags {
 
 func cleanEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"AMESH_STATE_DIR", "AMESH_SOCKET_PATH", "AMESH_CLAUDE_CONFIG_DIRS", "AMESH_EXCLUDE", "AMESH_MACHINE_NAME", "AMESH_HUB_URL"} {
+	for _, name := range []string{"AMESH_STATE_DIR", "AMESH_SOCKET_PATH", "AMESH_CLAUDE_CONFIG_DIRS", "AMESH_CODEX_HOMES", "CODEX_HOME", "AMESH_EXCLUDE", "AMESH_MACHINE_NAME", "AMESH_HUB_URL"} {
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatal(err)
@@ -38,7 +38,7 @@ func TestDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.StateDir != "/home/test/.local/state/amesh" || c.SocketPath != c.StateDir+"/amesh.sock" ||
-		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude"}) || len(c.ExcludeRoots) != 0 || c.HubURL != "" {
+		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude"}) || !slices.Equal(c.CodexHomes, []string{"/home/test/.codex"}) || len(c.ExcludeRoots) != 0 || c.HubURL != "" {
 		t.Fatalf("unexpected paths: %+v", c)
 	}
 }
@@ -59,6 +59,23 @@ func TestEnvironmentAndFlagPrecedence(t *testing.T) {
 		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude", "/home/test/work/.claude-config"}) || !slices.Equal(c.ExcludeRoots, []string{"/one", "/two"}) {
 		t.Fatalf("unexpected config: %+v", c)
 	}
+}
+
+func TestCodexHomes(t *testing.T) {
+	cleanEnv(t)
+	t.Setenv("HOME", "/home/test")
+	t.Setenv("CODEX_HOME", "/one:account")
+	check := func(want []string, args ...string) {
+		t.Helper()
+		c, err := flags(t, args...).Resolve()
+		if err != nil || !slices.Equal(c.CodexHomes, want) {
+			t.Fatalf("homes = %v, want %v: %v", c.CodexHomes, want, err)
+		}
+	}
+	check([]string{"/one:account"})
+	t.Setenv("AMESH_CODEX_HOMES", "~/.codex:/two")
+	check([]string{"/home/test/.codex", "/two"})
+	check([]string{"/three"}, "-codex-homes", "/three")
 }
 
 func TestEmptyExclude(t *testing.T) {
@@ -93,6 +110,7 @@ func TestMalformedConfig(t *testing.T) {
 		"AMESH_SOCKET_PATH":        "relative",
 		"AMESH_CLAUDE_CONFIG_DIRS": "~/one::~/two",
 		"AMESH_EXCLUDE":            "/a::/b",
+		"AMESH_CODEX_HOMES":        "/valid:relative",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(name, value)

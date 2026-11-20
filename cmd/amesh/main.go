@@ -103,7 +103,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 }
 
 func daemon(ctx context.Context, cfg config.Config) error {
-	sessions := registry.New(cfg.ClaudeConfigDirs)
+	sessions := registry.New(cfg.ClaudeConfigDirs, cfg.CodexHomes...)
 	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
 	if runtimeDir == "" {
 		runtimeDir = os.Getenv("CLAUDE_CODE_TMPDIR")
