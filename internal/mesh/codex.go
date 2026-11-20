@@ -16,6 +16,8 @@ import (
 )
 
 type threadDelivery interface {
+	Status(string) string
+	Watch(context.Context)
 	Deliver(context.Context, string, string, string, func() bool) (bool, error)
 }
 
@@ -117,13 +119,17 @@ func (b *Backend) writeThread(ctx context.Context, s registry.Session, d relay.D
 	if d.Notice {
 		kind = "notice"
 	}
+	app := b.threads[s.ConfigDir]
+	if app == nil {
+		return false, errors.New("unknown Codex home")
+	}
 	claimed, err := b.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(relay.Retention), kind)
 	if !claimed || err != nil {
 		return false, err
 	}
-	queued, err := b.threads.Deliver(ctx, s.SessionID, d.ID, content, func() bool {
+	queued, err := app.Deliver(ctx, s.SessionID, d.ID, content, func() bool {
 		current, ok, e := b.liveSession(ctx, s.MeshKey())
-		return ok && e == nil && current.Key == s.Key
+		return ok && e == nil && current.Key == s.Key && current.ConfigDir == s.ConfigDir
 	})
 	if err != nil {
 		if !errors.Is(err, codex.ErrUnconfirmed) {

@@ -19,7 +19,7 @@ import (
 )
 
 type Backend struct {
-	threads          threadDelivery
+	threads          map[string]threadDelivery
 	links            map[string]replyLink
 	ctx              context.Context
 	socketDir        string
@@ -57,10 +57,15 @@ type sessionRegistry interface {
 var _ mcpserver.MeshBackend = (*Backend)(nil)
 
 func New(cfg config.Config, sessions *registry.Registry, relays *relay.Manager, client *hub.Client) *Backend {
-	app := codex.New(registry.CodexHome())
-	b := &Backend{threads: app, links: map[string]replyLink{}, endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), localHops: make(map[[2]string]int64), wake: make(chan struct{}, 1)}
+	apps := make(map[string]threadDelivery, len(cfg.CodexHomes))
+	for _, home := range cfg.CodexHomes {
+		apps[home] = codex.New(home)
+	}
+	b := &Backend{threads: apps, links: map[string]replyLink{}, endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), localHops: make(map[[2]string]int64), wake: make(chan struct{}, 1)}
 	if sessions != nil {
-		sessions.CodexStatus = app.Status
+		sessions.CodexStatus = func(home, thread string) string {
+			return apps[home].Status(thread)
+		}
 		sessions.CodexComplete = b.completedThread
 	}
 	return b

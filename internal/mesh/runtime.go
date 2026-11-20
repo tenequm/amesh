@@ -66,7 +66,7 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	ctx, cancel := context.WithCancel(parent)
 	b.ctx = ctx
 	var workers sync.WaitGroup
-	if watcher, ok := b.threads.(interface{ Watch(context.Context) }); ok {
+	for _, watcher := range b.threads {
 		workers.Go(func() { watcher.Watch(ctx) })
 	}
 	pendingByLog := store.PendingRewrites()

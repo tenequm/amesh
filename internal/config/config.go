@@ -15,12 +15,14 @@ type Config struct {
 	StateDir         string
 	SocketPath       string
 	ClaudeConfigDirs []string
+	CodexHomes       []string
 	ExcludeRoots     []string
 	MachineName      string
 	HubURL           string
 }
 
 type Flags struct {
+	codexHomes                                                     *string
 	stateDir, socketPath, configDirs, exclude, machineName, hubURL string
 }
 
@@ -37,6 +39,13 @@ func Bind(fs *flag.FlagSet) *Flags {
 	bind(&f.stateDir, "state-dir", "AMESH_STATE_DIR", "~/.local/state/amesh", "daemon state directory")
 	bind(&f.socketPath, "socket-path", "AMESH_SOCKET_PATH", "", "Unix socket (default: amesh.sock in state directory)")
 	bind(&f.configDirs, "claude-config-dirs", "AMESH_CLAUDE_CONFIG_DIRS", "~/.claude", "colon-separated Claude config directories")
+	if homes, ok := os.LookupEnv("AMESH_CODEX_HOMES"); ok {
+		f.codexHomes = &homes
+	}
+	fs.Func("codex-homes", "colon-separated Codex homes (default: CODEX_HOME or ~/.codex)", func(homes string) error {
+		f.codexHomes = &homes
+		return nil
+	})
 	bind(&f.exclude, "exclude", "AMESH_EXCLUDE", "", "colon-separated mesh exclusion roots (empty for none)")
 	bind(&f.machineName, "machine-name", "AMESH_MACHINE_NAME", "", "enrolled machine name")
 	bind(&f.hubURL, "hub-url", "AMESH_HUB_URL", "", "hub API base including /peer (empty: same-machine peers only)")
@@ -96,6 +105,19 @@ func (f *Flags) Resolve() (Config, error) {
 	}
 	if c.ClaudeConfigDirs, err = paths(f.configDirs); err != nil {
 		return Config{}, fmt.Errorf("claude-config-dirs: %w", err)
+	}
+	if f.codexHomes != nil {
+		c.CodexHomes, err = paths(*f.codexHomes)
+	} else {
+		home := os.Getenv("CODEX_HOME")
+		if !filepath.IsAbs(home) {
+			home = "~/.codex"
+		}
+		home, err = absolute(home)
+		c.CodexHomes = []string{home}
+	}
+	if err != nil {
+		return Config{}, fmt.Errorf("codex-homes: %w", err)
 	}
 	if f.exclude != "" {
 		if c.ExcludeRoots, err = paths(f.exclude); err != nil {

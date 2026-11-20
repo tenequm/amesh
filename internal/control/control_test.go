@@ -484,6 +484,45 @@ func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 	}
 }
 
+func TestStatusCountsCodexPipeInSecondHome(t *testing.T) {
+	homes := []string{t.TempDir(), t.TempDir()}
+	const thread = "00000000-0000-4000-8000-000000000001"
+	dir := filepath.Join(homes[1], "thread-writer-locks")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Create(filepath.Join(dir, thread+".lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	child := exec.CommandContext(t.Context(), "sleep", "300")
+	if err = child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
+	sessions := registry.New(nil, homes...)
+	pipe := sessions.OpenCodexPipe(t.Context(), child.Process.Pid)
+	if pipe == nil {
+		t.Fatal("missing Codex pipe")
+	}
+	defer pipe.Close()
+	d := daemon{mesh: humanBackend{}, cfg: config.Config{CodexHomes: homes}, registry: sessions}
+	w := httptest.NewRecorder()
+	d.status(w, request(t, ""))
+	var got contract.DaemonStatus
+	if err = json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []contract.DaemonStatusConfigDirsItem{{Path: homes[0]}, {Path: homes[1], Sessions: 1}}
+	if !slices.Equal(got.ConfigDirs, want) {
+		t.Fatalf("configDirs = %v, want %v", got.ConfigDirs, want)
+	}
+}
+
 func TestTranscriptRequiresMatchingCompleteRow(t *testing.T) {
 	dir := t.TempDir()
 	root, err := os.OpenRoot(dir)

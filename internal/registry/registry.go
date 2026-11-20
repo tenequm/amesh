@@ -64,16 +64,16 @@ func (l Listing) Unavailable(s Session) bool {
 }
 
 type Registry struct {
-	codex         map[int]*CodexPipe
-	pipeOrder     uint64
-	CodexStatus   func(string) string
-	CodexComplete func(string, [32]byte, string)
-	scanMu        sync.Mutex
-	reported      map[entryPath]string
-	dirs          []string
-	lookup        func(int) (int, string, error)
-	mu            sync.Mutex
-	modes         map[int]permissionClass
+	codex            map[int]*CodexPipe
+	pipeOrder        uint64
+	CodexStatus      func(home, thread string) string
+	CodexComplete    func(string, [32]byte, string)
+	scanMu           sync.Mutex
+	reported         map[entryPath]string
+	dirs, codexHomes []string
+	lookup           func(int) (int, string, error)
+	mu               sync.Mutex
+	modes            map[int]permissionClass
 }
 
 func ProcessStart(pid int) (string, error) {
@@ -81,8 +81,8 @@ func ProcessStart(pid int) (string, error) {
 	return start, err
 }
 
-func New(configDirs []string) *Registry {
-	return &Registry{codex: make(map[int]*CodexPipe), dirs: slices.Clone(configDirs), lookup: process, modes: make(map[int]permissionClass)}
+func New(configDirs []string, codexHomes ...string) *Registry {
+	return &Registry{codex: make(map[int]*CodexPipe), dirs: slices.Clone(configDirs), codexHomes: slices.Clone(codexHomes), lookup: process, modes: make(map[int]permissionClass)}
 }
 
 func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {

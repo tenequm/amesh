@@ -65,7 +65,7 @@ command = "amesh"
 args = ["mcp"]
 ```
 
-Run the daemon with access to the same Codex home, `lsof`, `sqlite3` and `codex`. The daemon identifies a thread by its writer lock and confirms the thread ID on tool calls. The newest pipe under a shared host takes precedence while older threads remain loaded. Use the address from `list_peers` to send a message.
+Run the daemon with access to each Codex home, `lsof`, `sqlite3` and `codex`. Set `AMESH_CODEX_HOMES` on the daemon when different accounts or wrappers use separate homes, for example `AMESH_CODEX_HOMES=~/.codex:~/work/.codex`. The daemon identifies a thread by its writer lock and confirms the thread ID on tool calls. The newest pipe under a shared host takes precedence while older threads remain loaded. Use the address from `list_peers` to send a message.
 
 On Codex 0.170.0, the local app-server can steer a busy hosted thread or start an idle one. Other hosts, including an embedded TUI or a desktop app with a private app-server, consume messages from the durable queue on their next idle turn. Peer input identifies the sender and ends with the tool call for replying. If a dedicated peer turn produces only a final answer, amesh sends that answer back to the sender.
 
@@ -98,11 +98,12 @@ Flags override environment variables. Global flags go before the subcommand. `da
 | `-state-dir` | `AMESH_STATE_DIR` | `~/.local/state/amesh` |
 | `-socket-path` | `AMESH_SOCKET_PATH` | `amesh.sock` in the state directory |
 | `-claude-config-dirs` | `AMESH_CLAUDE_CONFIG_DIRS` | `~/.claude` |
+| `-codex-homes` | `AMESH_CODEX_HOMES` | `CODEX_HOME` if absolute, otherwise `~/.codex` |
 | `-exclude` | `AMESH_EXCLUDE` | No exclusion roots |
 | `-machine-name` | `AMESH_MACHINE_NAME` | Empty until you enroll |
 | `-hub-url` | `AMESH_HUB_URL` | Empty: same-machine peers only |
 
-Directory lists use a colon separator. Paths accept an absolute path or a leading `~/`. Sessions in any directory listed in `AMESH_CLAUDE_CONFIG_DIRS` can join the mesh. Set `AMESH_EXCLUDE` to refuse mesh pipes for sessions whose working directory is at or under one of its roots; lane pipes are not affected.
+Directory lists use a colon separator. Paths accept an absolute path or a leading `~/`. `amesh status` lists the Claude config directories followed by the Codex homes in `configDirs`, with a live session count for each path. Sessions in any directory listed in `AMESH_CLAUDE_CONFIG_DIRS` can join the mesh. Set `AMESH_EXCLUDE` to refuse mesh pipes for sessions whose working directory is at or under one of its roots; lane pipes are not affected.
 
 ## Commands
 

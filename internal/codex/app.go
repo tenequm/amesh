@@ -36,13 +36,13 @@ type rpcError struct {
 func (e *rpcError) Error() string { return fmt.Sprintf("app-server request failed (%d)", e.Code) }
 
 type App struct {
-	socket string
-	mu     sync.RWMutex
-	status map[string]string
+	home, socket string
+	mu           sync.RWMutex
+	status       map[string]string
 }
 
 func New(home string) *App {
-	return &App{socket: filepath.Join(home, "app-server-control", "app-server-control.sock"), status: map[string]string{}}
+	return &App{home: home, socket: filepath.Join(home, "app-server-control", "app-server-control.sock"), status: map[string]string{}}
 }
 
 type rpc struct {
@@ -104,8 +104,9 @@ func (a *App) dial(ctx context.Context) (*rpc, error) {
 	}, nil
 }
 
-func stdio(ctx context.Context) (*rpc, error) {
+func stdio(ctx context.Context, home string) (*rpc, error) {
 	cmd := exec.CommandContext(ctx, "codex", "app-server", "--listen", "stdio://")
+	cmd.Env = append(cmd.Environ(), "CODEX_HOME="+home)
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -169,7 +170,7 @@ func (a *App) Deliver(ctx context.Context, thread, id, content string, live func
 		if _, statErr := os.Stat(a.socket); !errors.Is(statErr, os.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
 			return false, err
 		}
-		r, err = stdio(ctx)
+		r, err = stdio(ctx, a.home)
 		if err != nil {
 			return false, err
 		}

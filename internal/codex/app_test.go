@@ -128,3 +128,39 @@ func TestThreadDeliverySelectsHostAndBindsMetadata(t *testing.T) {
 		})
 	}
 }
+
+func TestQueueFallbackUsesThreadHome(t *testing.T) {
+	daemonHome, threadHome := t.TempDir(), t.TempDir()
+	t.Setenv("CODEX_HOME", daemonHome)
+	bin := t.TempDir()
+	script := `#!/bin/sh
+set -eu
+read -r init
+echo '{"id":1,"result":{}}'
+read -r initialized
+read -r request
+echo "$request" > "$CODEX_HOME/request"
+echo '{"id":2,"result":{}}'
+`
+	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	queued, err := New(threadHome).Deliver(t.Context(), "thread", "id", "hello", func() bool { return true })
+	if err != nil || !queued {
+		t.Fatal(queued, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(threadHome, "request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req struct {
+		Method string `json:"method"`
+		Params struct {
+			ThreadID string `json:"threadId"`
+		} `json:"params"`
+	}
+	if err = json.Unmarshal(raw, &req); err != nil || req.Method != "thread/queue/add" || req.Params.ThreadID != "thread" {
+		t.Fatal(req, err)
+	}
+}
