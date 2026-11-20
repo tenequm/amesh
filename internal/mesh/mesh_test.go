@@ -141,12 +141,13 @@ func TestMembership(t *testing.T) {
 	}
 	*r = nil
 	b.lastHeartbeat = time.Time{}
+	b.localHops[[2]string{"0-other", key}] = 3
 	if err = b.reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	saved, err := b.store.Members()
-	if err != nil || len(saved) != 0 {
-		t.Fatalf("saved members: %v %v", saved, err)
+	if err != nil || len(saved) != 0 || len(b.localHops) != 0 {
+		t.Fatalf("saved members: %v %v, hops %v", saved, err, b.localHops)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -321,7 +322,18 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	if b.localHops[pair] != 2 {
 		t.Fatal("local sends were not counted", b.localHops)
 	}
-	b.localHops[pair] = defaultHopLimit
+	b.localHops[pair] = defaultHopLimit - 1
+	results := make(chan bool, 2)
+	for range 2 {
+		go func() {
+			res, sendErr := b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "racing"})
+			results <- sendErr == nil && res.Accepted
+		}()
+	}
+	if first, second := <-results, <-results; first == second {
+		t.Fatal("concurrent sends at the last hop were not limited to one")
+	}
+	<-replies
 	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "over the limit"}); err != nil || got.Accepted || !strings.Contains(value(got.Reason), "A human turn resets the limit.") {
 		t.Fatalf("local hop limit: %#v %v", got, err)
 	}

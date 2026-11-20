@@ -63,7 +63,7 @@ func (b *Backend) HumanTurn(ctx context.Context, s registry.Session) error {
 		return err
 	}
 	b.mu.Lock()
-	maps.DeleteFunc(b.localHops, func(pair [2]string, _ int64) bool { return slices.Contains(pair[:], key) })
+	b.forgetLocalHops(key)
 	b.mu.Unlock()
 	req := contract.HumanTurnRequest{At: time.Now().UnixMilli(), Source: "prompt"}
 	_, err = b.client.HumanTurn(ctx, key, req)
@@ -73,4 +73,9 @@ func (b *Backend) HumanTurn(ctx context.Context, s registry.Session) error {
 		}
 	}
 	return err
+}
+
+// forgetLocalHops clears every same-machine pair count that includes key. The caller holds b.mu.
+func (b *Backend) forgetLocalHops(key string) {
+	maps.DeleteFunc(b.localHops, func(pair [2]string, _ int64) bool { return slices.Contains(pair[:], key) })
 }

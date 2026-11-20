@@ -425,7 +425,7 @@ func TestSendMessageReplyStaysInConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.SocketPath = inbox
-	sent := make(chan contract.SendRequest, 2)
+	sent := make(chan contract.SendRequest, 3)
 	b, r := fixture(t, map[string]http.HandlerFunc{
 		"POST /peer/messages": func(w http.ResponseWriter, r *http.Request) {
 			var req contract.SendRequest
@@ -444,7 +444,7 @@ func TestSendMessageReplyStaysInConversation(t *testing.T) {
 	*r = testRegistry{s}
 	b.members[key] = member{session: s, hosted: true, address: "review@demo:mac"}
 	b.synchronized = true
-	b.peers = []contract.Peer{{Address: peer, Kind: contract.KindSession, Machine: new("east")}}
+	b.peers = []contract.Peer{{Address: peer, Kind: contract.KindSession, Machine: new("east")}, {Address: "stan", Kind: contract.KindAgent}}
 	conn, _ := b.client.Connection()
 	if err = b.prepareLog(t.Context(), conn); err != nil {
 		t.Fatal(err)
@@ -478,6 +478,10 @@ func TestSendMessageReplyStaysInConversation(t *testing.T) {
 	res, err = b.SendMessage(ctx, s, mcpserver.SendArgs{To: peer, Message: "again", ReplyTo: new("pe_gone")})
 	if req := <-sent; err != nil || !res.Accepted || value(req.To.Address) != peer || req.To.Endpoint != nil {
 		t.Fatalf("unknown reply_to did not fall back to the address: %#v %#v %v", res, req, err)
+	}
+	res, err = b.SendMessage(ctx, s, mcpserver.SendArgs{To: "stan", Message: "elsewhere", ReplyTo: new("pe_worker")})
+	if req := <-sent; err != nil || !res.Accepted || value(req.To.Address) != "stan" || req.To.Endpoint != nil {
+		t.Fatalf("reply_to for another peer redirected the message: %#v %#v %v", res, req, err)
 	}
 }
 

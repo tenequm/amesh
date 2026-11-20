@@ -174,6 +174,7 @@ func (b *Backend) end(ctx context.Context, key string, reason contract.SessionEn
 	}
 	if err = b.store.DeleteMember(key); err == nil {
 		delete(b.members, key)
+		b.forgetLocalHops(key)
 	}
 	return err
 }
