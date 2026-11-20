@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"net/http"
 	"os"
 	"slices"
@@ -24,8 +23,6 @@ type (
 		Parent    string `json:"parent,omitempty"`
 	}
 )
-
-var verifiedNativeVersions = []string{"2.1.325", "2.1.328"}
 
 func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	live, err := d.registry.List(r.Context())
@@ -59,32 +56,12 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	if d.lane != nil {
 		result.Lanes = d.lane.LaneStatus(r.Context())
 	}
-	warnings := map[string]bool{}
-	lanePipes := map[registry.Key]bool{}
 	d.mu.Lock()
 	for reg := range d.pipes {
 		s := byKey[reg.key]
 		pipes = append(pipes, pipeStatus{sessionKey(reg.key), s.Name, s.SessionID, s.ConfigDir, reg.parent})
-		if reg.parent != "" {
-			lanePipes[reg.key] = true
-		}
 	}
 	d.mu.Unlock()
-	for key, s := range byKey {
-		member := d.mesh.IsMember(key)
-		if !member && !lanePipes[key] {
-			continue
-		}
-		address := s.Name + "@" + s.Project
-		if d.cfg.MachineName != "" {
-			address += ":" + d.cfg.MachineName
-		}
-		if s.Version == "" {
-			warnings[fmt.Sprintf("%s has no recorded Claude Code version for the native delivery check.", address)] = true
-		} else if !slices.Contains(verifiedNativeVersions, s.Version) {
-			warnings[fmt.Sprintf("%s runs Claude Code %s without a recorded native delivery check.", address, s.Version)] = true
-		}
-	}
 	slices.SortFunc(pipes, func(a, b pipeStatus) int {
 		if a.Key == b.Key {
 			return strings.Compare(a.Parent, b.Parent)
@@ -92,10 +69,6 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 		return strings.Compare(a.Key, b.Key)
 	})
 	result.Pipes = pipes
-	if len(warnings) > 0 {
-		list := slices.Sorted(maps.Keys(warnings))
-		result.Warnings = &list
-	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
 }
