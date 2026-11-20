@@ -1640,7 +1640,7 @@ components:
                 - {$ref: '#/components/schemas/ErrorBody'}
                 - {type: 'null'}
         configDirs:
-          description: The Claude config dirs the daemon scans (AMESH_CLAUDE_CONFIG_DIRS) and the live registry entries in each.
+          description: The Claude config dirs (AMESH_CLAUDE_CONFIG_DIRS) followed by the Codex homes (AMESH_CODEX_HOMES) the daemon scans, and the live registry entries in each.
           type: array
           items:
             type: object
@@ -1993,8 +1993,8 @@ components:
           c3n-MHUOLraqLSy4lX8rIw
           deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEYCIQD88O1CxrqIjHG7QFCxp9Lvz6nbWfIrEi89PUFM28vmOwIhAJNVmRjER3jMKR62lKIGp3gX9aNyyVqSEfKKeTPji_p0
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=c3n-MHUOLraqLSy4lX8rIw,bh=deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b,s=MEYCIQD88O1CxrqIjHG7QFCxp9Lvz6nbWfIrEi89PUFM28vmOwIhAJNVmRjER3jMKR62lKIGp3gX9aNyyVqSEfKKeTPji_p0
+        signature: MEUCIC7HTuRwlO4z-9CNzSrtBKH8cARcYNE1VBjt63yGEhPvAiEAvlvMco8QTTH0SBdGYskcPIM329dhplcrauloiyUEBCE
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=c3n-MHUOLraqLSy4lX8rIw,bh=deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b,s=MEUCIC7HTuRwlO4z-9CNzSrtBKH8cARcYNE1VBjt63yGEhPvAiEAvlvMco8QTTH0SBdGYskcPIM329dhplcrauloiyUEBCE
         signatureValid: true
     sigEventsConnect:
       summary: 'Valid, GET /peer/events'
@@ -2018,8 +2018,8 @@ components:
           gDZl6DWT3atXh6Z_x2AT1A
           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCIBZF52W3IurgGwZ3iorLUpVYbSCrLN-L2enCtWKFG6pOAiEA4QMessuTYkEmvKNVoLrdet4DamTSJO3GJlVXQbOFN-8
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIBZF52W3IurgGwZ3iorLUpVYbSCrLN-L2enCtWKFG6pOAiEA4QMessuTYkEmvKNVoLrdet4DamTSJO3GJlVXQbOFN-8
+        signature: MEUCIA1LEXmvulTPqH_q1vMvPfT5xCE75fzgACJRu-xyq4WiAiEAw-OCC3gfaOjBT7aHOqnZzZtSYPgdrZjyQfUOqE0OXFU
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIA1LEXmvulTPqH_q1vMvPfT5xCE75fzgACJRu-xyq4WiAiEAw-OCC3gfaOjBT7aHOqnZzZtSYPgdrZjyQfUOqE0OXFU
         signatureValid: true
     sigGetPeersFilter:
       summary: 'Valid, GET /peer/peers with a filter'
@@ -2043,8 +2043,8 @@ components:
           4eIavNJcFsJcPJOWdcqsfg
           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEYCIQCd5LhRwcvDGPaPBdbZ5SGgNLdj2UrqM-c_l6a1NE0IDgIhAM4YpEHVMlRyxl_txz4J-2ZIBPdU7CYkYPkVZyXG4pGC
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQCd5LhRwcvDGPaPBdbZ5SGgNLdj2UrqM-c_l6a1NE0IDgIhAM4YpEHVMlRyxl_txz4J-2ZIBPdU7CYkYPkVZyXG4pGC
+        signature: MEYCIQC2hLtVm3n1NZuGzoZ1_9KvqmNHq9Cl29V8O3fhEPVPcgIhAOtLlTX-9dIHZBGIQqcC_LDKx8M55_YL6UwwfRZ3D4Lm
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQC2hLtVm3n1NZuGzoZ1_9KvqmNHq9Cl29V8O3fhEPVPcgIhAOtLlTX-9dIHZBGIQqcC_LDKx8M55_YL6UwwfRZ3D4Lm
         signatureValid: true
     sigPostMessage:
       summary: 'Valid, POST /peer/messages'
@@ -2068,8 +2068,8 @@ components:
           f302A6d7AdJeQ4Xd1umgBQ
           76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCIFUs3hqWrjqlZe6buW6ZVxNTtavntTGbnzPsXCQ5S5gUAiEA4uGkl0q6NyMXfcC7zjnCsYOxKnWhKzfHR8wr1l1ShEk
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=f302A6d7AdJeQ4Xd1umgBQ,bh=76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82,s=MEUCIFUs3hqWrjqlZe6buW6ZVxNTtavntTGbnzPsXCQ5S5gUAiEA4uGkl0q6NyMXfcC7zjnCsYOxKnWhKzfHR8wr1l1ShEk
+        signature: MEUCIQDwLJ1VwSfqJkbKMKYciwK4EUbHcXbp6E1KE1nURr_9pQIgKFSAt5foTUlkCkXaZzcj4ueDyqEjfuJUZpt9ZU0U7Eg
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=f302A6d7AdJeQ4Xd1umgBQ,bh=76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82,s=MEUCIQDwLJ1VwSfqJkbKMKYciwK4EUbHcXbp6E1KE1nURr_9pQIgKFSAt5foTUlkCkXaZzcj4ueDyqEjfuJUZpt9ZU0U7Eg
         signatureValid: true
     sigBadChangedBody:
       summary: 'Tampered body, must not verify'
@@ -2093,8 +2093,8 @@ components:
           agYlKuRtFDQDhynLE0sM7g
           316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCIQCPhDA_8whg0a-1Eexdq0gdhslepkvzjewh_Q23AODWJwIgERKPme8YftzXwxps0DXUs9OJGTWCSyt0r6hIhLrj608
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=agYlKuRtFDQDhynLE0sM7g,bh=316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe,s=MEUCIQCPhDA_8whg0a-1Eexdq0gdhslepkvzjewh_Q23AODWJwIgERKPme8YftzXwxps0DXUs9OJGTWCSyt0r6hIhLrj608
+        signature: MEQCIEgRocAkzUnVDfzGgnjmBcAzSU6_igpJbxs3S7rn1dj-AiBRDpbcL9wGTZEtrFSCNetV0c2QsN1ZHyeQmraBwZdg4g
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=agYlKuRtFDQDhynLE0sM7g,bh=316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe,s=MEQCIEgRocAkzUnVDfzGgnjmBcAzSU6_igpJbxs3S7rn1dj-AiBRDpbcL9wGTZEtrFSCNetV0c2QsN1ZHyeQmraBwZdg4g
         signatureValid: false
         note: Signed over the original body hash; the header carries the changed body hash, so the signature does not verify.
     envAgentMessage:

@@ -64,7 +64,10 @@ func New(cfg config.Config, sessions *registry.Registry, relays *relay.Manager, 
 	b := &Backend{threads: apps, links: map[string]replyLink{}, endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), localHops: make(map[[2]string]int64), wake: make(chan struct{}, 1)}
 	if sessions != nil {
 		sessions.CodexStatus = func(home, thread string) string {
-			return apps[home].Status(thread)
+			if app := apps[home]; app != nil {
+				return app.Status(thread)
+			}
+			return ""
 		}
 		sessions.CodexComplete = b.completedThread
 	}
