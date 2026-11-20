@@ -251,7 +251,7 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 		s, err = d.resolvePipe(r.Context(), pid)
 	}
 	if err != nil {
-		reject(w, 403, contract.LocalErrorErrorNotInSession, "This only works inside a Claude Code session.")
+		reject(w, 403, contract.LocalErrorErrorNotInSession, "This only works inside a Claude Code or Codex session.")
 		return
 	}
 	if parent == "" {
@@ -300,7 +300,6 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 	if err = rw.Flush(); err != nil {
 		return
 	}
-
 	caller := func(ctx context.Context) (registry.Session, error) {
 		if codex != nil {
 			bindMu.Lock()

@@ -127,7 +127,7 @@ func TestPresenceWhileRegistryEntryIsBeingWritten(t *testing.T) {
 	if err = b.reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if len(registrations) != 1 || registrations[0].SessionID != healthy.SessionID || registrations[0].NameSource != "user" || len(beats) != 1 || len(beats[0].Sessions) != 1 || beats[0].Sessions[0].Key != sessionKey(healthy.Key) {
+	if len(registrations) != 1 || registrations[0].SessionID != healthy.SessionID || registrations[0].NameSource != "user" || len(beats) != 1 || len(beats[0].Sessions) != 1 || beats[0].Sessions[0].Key != healthy.Key.MeshKey() {
 		t.Fatal(registrations, beats)
 	}
 
@@ -187,7 +187,7 @@ func TestDeliveryRetriesAnIncompleteEntry(t *testing.T) {
 	if err = os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	b := &Backend{sessions: registry.New([]string{dir}), members: map[string]member{key: {session: s, hosted: true}}}
 	synctest.Test(t, func(t *testing.T) {
 		done := make(chan bool, 1)
@@ -244,7 +244,7 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 	}
 	seat := meshDir(t)
 	s := processSession(t, inbox, seat)
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	reports := make(chan contract.StateReport, 4)
 	var msg contract.MessageEvent
 	_ = json.Unmarshal(hubtest.Example(t, "eventMessage"), &msg)
@@ -379,7 +379,7 @@ func TestOrphanAndInterruptedReports(t *testing.T) {
 		"POST /peer/sessions/{key}/end": hubtest.Reply(t, "sessionEndResponse"),
 	})
 	conn, _ := b.client.Connection()
-	key := sessionKey(testSession().Key)
+	key := testSession().Key.MeshKey()
 	if err := b.store.SetLog(conn.Log); err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +419,7 @@ func postNative(t *testing.T, addr string, raw []byte) {
 func TestSendMessageReplyStaysInConversation(t *testing.T) {
 	const peer = "worker@demo:east"
 	s := testSession()
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	inbox, lines, err := relaytest.Inbox(t)
 	if err != nil {
 		t.Fatal(err)
@@ -487,7 +487,7 @@ func TestSendMessageReplyStaysInConversation(t *testing.T) {
 
 func TestRelayReplyReceiptAndNotice(t *testing.T) {
 	s := testSession()
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	inbox, lines, err := relaytest.Inbox(t)
 	if err != nil {
 		t.Fatal(err)
@@ -598,7 +598,7 @@ func TestRelayReplyReceiptAndNotice(t *testing.T) {
 
 func TestOfflineRestartWritesExpiryNotice(t *testing.T) {
 	s := testSession()
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	inbox, lines, err := relaytest.Inbox(t)
 	if err != nil {
 		t.Fatal(err)
@@ -676,7 +676,7 @@ func TestDeferredRefusalSurvivesFailedNoticeWrite(t *testing.T) {
 				t.Fatal(err)
 			}
 			ep := contract.EndpointRef{ID: "pe_amesha2example", Peer: "atlas", Name: "atlas"}
-			req := contract.SendRequest{ID: "54ad69a0-b410-4a59-9fb1-90ff72440102", From: contract.SendRequestFrom{Session: sessionKey(s.Key)}, Text: "test", Origin: contract.SendRequestOriginUnknown}
+			req := contract.SendRequest{ID: "54ad69a0-b410-4a59-9fb1-90ff72440102", From: contract.SendRequestFrom{Session: s.Key.MeshKey()}, Text: "test", Origin: contract.SendRequestOriginUnknown}
 			if tc.reply {
 				req.To.Endpoint = &ep.ID
 			} else {
@@ -795,7 +795,7 @@ func TestStartupRewriteWaitsForHubLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	const id = "54ad69a0-b410-4a59-9fb1-90ff72440102"
 	hello := hubtest.Reply(t, "helloResponse")
 	helloFinished := make(chan struct{})
@@ -917,7 +917,7 @@ func TestNotHostedEndWaitsForGoneRecipientsNotice(t *testing.T) {
 		t.Fatal(err)
 	}
 	hello.Settings.SendWaitMs = 0
-	key := sessionKey(testSession().Key)
+	key := testSession().Key.MeshKey()
 	b, reg := fixture(t, map[string]http.HandlerFunc{
 		"POST /peer/hello": func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(hello) },
 		"POST /peer/reports": func(w http.ResponseWriter, _ *http.Request) {
@@ -984,7 +984,7 @@ func TestFailedBindKeepsAcceptedOutboxEntry(t *testing.T) {
 		"POST /peer/hello":    func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(hello) },
 		"POST /peer/messages": hubtest.Reply(t, "sendResponse"),
 	})
-	req := contract.SendRequest{ID: res.Message.ID, From: contract.SendRequestFrom{Session: sessionKey(testSession().Key)}, To: contract.SendRequestTo{Address: &res.Message.To.Address}, Text: "queued"}
+	req := contract.SendRequest{ID: res.Message.ID, From: contract.SendRequestFrom{Session: testSession().Key.MeshKey()}, To: contract.SendRequestTo{Address: &res.Message.To.Address}, Text: "queued"}
 	if _, err := b.client.Send(t.Context(), req); !errors.Is(err, hub.ErrQueued) {
 		t.Fatal(err)
 	}

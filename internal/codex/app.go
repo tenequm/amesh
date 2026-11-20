@@ -11,11 +11,20 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/tenequm/amesh/internal/version"
+)
+
+// TurnTrigger marks the turns amesh starts, and MessageKey carries the message ID back on their tool calls.
+const (
+	TurnTrigger = "amesh"
+	MessageKey  = "amesh_msg"
 )
 
 var ErrUnconfirmed = errors.New("app-server delivery was not confirmed")
@@ -44,7 +53,7 @@ type rpc struct {
 }
 
 type packet struct {
-	ID     int             `json:"id"`
+	ID     json.RawMessage `json:"id"`
 	Result json.RawMessage `json:"result"`
 	Error  *rpcError       `json:"error"`
 	Method string          `json:"method"`
@@ -61,7 +70,7 @@ func (r *rpc) call(ctx context.Context, method string, params, out any) error {
 		if err := r.read(ctx, &p); err != nil {
 			return err
 		}
-		if p.ID != r.id {
+		if p.Method != "" || string(p.ID) != strconv.Itoa(r.id) {
 			continue
 		}
 		if p.Error != nil {
@@ -124,7 +133,7 @@ func stdio(ctx context.Context) (*rpc, error) {
 }
 
 func (r *rpc) init(ctx context.Context) error {
-	err := r.call(ctx, "initialize", map[string]any{"clientInfo": map[string]string{"name": "amesh", "version": "1"}, "capabilities": map[string]bool{"experimentalApi": true}}, nil)
+	err := r.call(ctx, "initialize", map[string]any{"clientInfo": map[string]string{"name": "amesh", "version": version.Value}, "capabilities": map[string]bool{"experimentalApi": true}}, nil)
 	if err != nil {
 		return err
 	}
@@ -157,7 +166,7 @@ func (a *App) Deliver(ctx context.Context, thread, id, content string, live func
 	r, err := a.dial(ctx)
 	daemon := err == nil
 	if err != nil {
-		if _, statErr := os.Stat(a.socket); !errors.Is(statErr, os.ErrNotExist) {
+		if _, statErr := os.Stat(a.socket); !errors.Is(statErr, os.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
 			return false, err
 		}
 		r, err = stdio(ctx)
@@ -179,11 +188,11 @@ func (a *App) Deliver(ctx context.Context, thread, id, content string, live func
 	if !live() {
 		return false, os.ErrNotExist
 	}
-	params := map[string]any{"threadId": thread, "input": []map[string]string{{"type": "text", "text": content}}, "clientUserMessageId": id, "responsesapiClientMetadata": map[string]string{"amesh_msg": id}}
+	params := map[string]any{"threadId": thread, "input": []map[string]string{{"type": "text", "text": content}}, "clientUserMessageId": id, "responsesapiClientMetadata": map[string]string{MessageKey: id}}
 	method := "thread/queue/add"
 	if hosted {
 		method = "turn/start"
-		params["turnTrigger"] = "amesh"
+		params["turnTrigger"] = TurnTrigger
 	}
 	err = r.call(ctx, method, params, nil)
 	if err != nil {
@@ -191,6 +200,7 @@ func (a *App) Deliver(ctx context.Context, thread, id, content string, live func
 			err = errors.Join(ErrUnconfirmed, err)
 		}
 	}
+	// Only a hosting app-server starts or steers the turn now; the durable queue waits for the next idle turn.
 	return !hosted, err
 }
 

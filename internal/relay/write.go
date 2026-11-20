@@ -24,7 +24,7 @@ import (
 
 const (
 	lineLimit = 1 << 20
-	retention = 25 * time.Hour
+	Retention = 25 * time.Hour
 	refill    = 2 * time.Second
 	burst     = 30
 	// A repeated body inside the window waits past it, so the inbox does not fold it as a duplicate.
@@ -299,7 +299,7 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 				kind = "notice"
 			}
 			var checkErr error
-			claimed, checkErr = m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), kind)
+			claimed, checkErr = m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(Retention), kind)
 			if checkErr != nil {
 				return checkErr
 			}
@@ -365,7 +365,7 @@ func (m *Manager) NotifyWhenIdle(ctx context.Context, inbox, from, fromMode, id 
 	}
 	defer release()
 	key := "idle:" + id
-	claimed, err := m.store.Claim(key, time.Now().Add(retention))
+	claimed, err := m.store.Claim(key, time.Now().Add(Retention))
 	if err != nil || !claimed {
 		return err
 	}

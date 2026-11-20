@@ -138,7 +138,7 @@ func (p *pending) run(written time.Time) {
 	defer timer.Stop()
 	held, accepted := false, p.accepted
 	if accepted {
-		timer.Reset(retention)
+		timer.Reset(Retention)
 	}
 	rewrites := p.rewrites
 	var processed []string
@@ -150,7 +150,7 @@ func (p *pending) run(written time.Time) {
 			if !p.key.idle && !held && !accepted {
 				p.report(Event{Action: "peer_message_status", OriginalID: p.d.ID, From: envelope.Address(p.d.Inbox), Peer: p.peer, Status: contract.NativeReceiptStatus(contract.DeliveryStateAccepted)})
 				accepted = true
-				timer.Reset(time.Until(written.Add(retention)))
+				timer.Reset(time.Until(written.Add(Retention)))
 				continue
 			}
 			return
@@ -198,7 +198,7 @@ func (p *pending) run(written time.Time) {
 				if !held {
 					p.report(event)
 					held = true
-					timer.Reset(retention)
+					timer.Reset(Retention)
 				}
 				continue
 			}

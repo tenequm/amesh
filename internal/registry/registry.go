@@ -34,6 +34,7 @@ type Session struct {
 }
 
 func (s Session) MeshKey() string {
+	// A Codex key derives from the thread so it survives a resume, and starts above the PID range so it never names a process.
 	if s.Codex {
 		digest := sha256.Sum256([]byte(s.SessionID))
 		return fmt.Sprintf("%d-%x", 1<<32+uint64(binary.BigEndian.Uint32(digest[:4])), digest[4:8])
@@ -301,7 +302,7 @@ func (r *Registry) scan(ctx context.Context, check bool) (Listing, error) {
 		pipes := slices.Collect(maps.Values(r.codex))
 		r.mu.Unlock()
 		for _, pipe := range pipes {
-			if s, err := pipe.Session(ctx, ""); err == nil {
+			if s, err := pipe.cached(ctx); err == nil {
 				live.Sessions = append(live.Sessions, s)
 			}
 		}

@@ -32,6 +32,16 @@ var address = regexp.MustCompile("^" + label + "(@" + label + "(:[a-z0-9][a-z0-9
 
 var nonLabel = regexp.MustCompile("[^a-z0-9._-]+")
 
+const maxLabel = 40
+
+func addressLabel(part string) string {
+	part = strings.Trim(nonLabel.ReplaceAllString(strings.ToLower(part), "-"), "._-")
+	if part == "" {
+		return "session"
+	}
+	return part[:min(maxLabel, len(part))]
+}
+
 func normalizeAddress(input string) string {
 	if utf8.RuneCountInString(input) > 100 {
 		return ""
@@ -41,16 +51,9 @@ func normalizeAddress(input string) string {
 	if name == "" || strings.Contains(name, ":") || strings.Contains(session, "@") || qualified && project == "" {
 		return ""
 	}
-	label := func(part string) string {
-		part = strings.Trim(nonLabel.ReplaceAllString(part, "-"), "._-")
-		if part == "" {
-			return "session"
-		}
-		return part[:min(40, len(part))]
-	}
-	to := label(name)
+	to := addressLabel(name)
 	if qualified {
-		to += "@" + label(project)
+		to += "@" + addressLabel(project)
 	}
 	if hasMachine {
 		to += ":" + machine
@@ -281,7 +284,7 @@ func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target memb
 	d := relay.Delivery{ID: id, Inbox: receiver.SocketPath, ReplyAddress: senderAddress, Message: envelope.Message{From: from, FromName: s.Name, FromMode: s.FromMode, Body: message}}
 	if s.Codex || receiver.Codex {
 		d.ReplyTo = id
-		b.linkReply(d, receiver.MeshKey(), s.MeshKey())
+		b.linkReply(d, receiver.MeshKey(), s.MeshKey(), ctx.Value(fallbackReply{}) == nil)
 	}
 	queued := false
 	if err == nil {
@@ -291,21 +294,20 @@ func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target memb
 			err = b.relays.Write(ctx, d)
 		}
 	}
-
-	if err != nil {
+	note := "Sent. A reply, if any, arrives later as a message from " + target.address + "."
+	switch {
+	case errors.Is(err, codex.ErrUnconfirmed):
+		// The request reached Codex, so the message may run; a resend would queue a second turn.
+		note = "Delivery to " + target.address + " was not confirmed, but it may still arrive. Do not resend it."
+	case err != nil:
 		b.mu.Lock()
 		delete(b.links, id)
-		if !errors.Is(err, codex.ErrUnconfirmed) && b.localHops[pair] > 0 {
+		if b.localHops[pair] > 0 {
 			b.localHops[pair]--
 		}
 		b.mu.Unlock()
-		if errors.Is(err, codex.ErrUnconfirmed) {
-			return refused("Delivery to "+target.address+" could not be confirmed.", nil), nil
-		}
 		return refused("The message could not be written to "+target.address+".", nil), nil
-	}
-	note := "Sent. A reply, if any, arrives later as a message from " + target.address + "."
-	if queued {
+	case queued:
 		note = "Queued for the next idle turn of " + target.address + "."
 	}
 	return mcpserver.SendResult{Accepted: true, ID: &id, To: &target.address, Note: &note}, nil

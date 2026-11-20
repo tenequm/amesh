@@ -226,12 +226,15 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 	}
 	d := relay.Delivery{Inbox: s.SocketPath, ReplyAddress: msg.Endpoint.Peer, ReplyTo: msg.Endpoint.ID, ID: msg.ID, Session: key, Log: conn.Log, AcceptWindow: time.Duration(conn.Settings.AcceptWindowMs) * time.Millisecond, Message: envelope.Message{From: ep.from, FromSession: msg.Endpoint.ID, FromName: msg.Endpoint.Name, FromMode: value(msg.FromMode), HopChain: msg.HopChain, Body: msg.Text}}
 	if s.Codex {
-		b.linkReply(d, key, "")
+		b.linkReply(d, key, "", true)
 		_, err = b.writeThread(ctx, s, d)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if err != nil && !errors.Is(err, codex.ErrUnconfirmed) {
+			b.mu.Lock()
+			delete(b.links, msg.ID)
+			b.mu.Unlock()
 			return b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateDropped, contract.DropReasonRouteFailed)
 		}
 		if err != nil {

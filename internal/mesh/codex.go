@@ -26,7 +26,12 @@ type replyLink struct {
 	answer                              string
 }
 
-func (b *Backend) linkReply(d relay.Delivery, receiver, sender string) {
+// fallbackReply marks a send that carries a Codex turn's final answer back to its sender.
+type fallbackReply struct{}
+
+// linkReply records where an answer to d goes. When armed, the receiving thread's final answer is sent back
+// if its turn ends without send_message; a fallback answer is never armed, so two threads cannot keep answering.
+func (b *Backend) linkReply(d relay.Delivery, receiver, sender string, armed bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
@@ -35,8 +40,12 @@ func (b *Backend) linkReply(d relay.Delivery, receiver, sender string) {
 			delete(b.links, id)
 		}
 	}
-	content, _ := d.ThreadText()
-	b.links[d.ID] = replyLink{digest: sha256.Sum256([]byte(content)), sender: sender, receiver: receiver, address: d.ReplyAddress, endpoint: d.ReplyTo, expires: now.Add(24 * time.Hour)}
+	l := replyLink{sender: sender, receiver: receiver, address: d.ReplyAddress, endpoint: d.ReplyTo, expires: now.Add(24 * time.Hour)}
+	if armed {
+		content, _ := d.ThreadText()
+		l.digest = sha256.Sum256([]byte(content))
+	}
+	b.links[d.ID] = l
 }
 
 func (b *Backend) reply(ctx context.Context, s registry.Session, args mcpserver.SendArgs) (replyLink, bool) {
@@ -48,6 +57,14 @@ func (b *Backend) reply(ctx context.Context, s registry.Session, args mcpserver.
 		id = metaID
 	}
 	l, ok := b.links[id]
+	if !ok && id != "" {
+		// A hub delivery's trailer names the conversation endpoint, so match its newest armed link.
+		for linkID, candidate := range b.links {
+			if candidate.receiver == s.MeshKey() && candidate.endpoint == id && candidate.digest != ([32]byte{}) && (!ok || candidate.expires.After(l.expires)) {
+				l, ok, id = candidate, true, linkID
+			}
+		}
+	}
 	if !ok || l.receiver != s.MeshKey() || !matches(normalizeAddress(args.To), l.address) || !time.Now().Before(l.expires) {
 		return replyLink{}, false
 	}
@@ -86,7 +103,7 @@ func (b *Backend) flushThreadReplies(ctx context.Context) {
 	for id, l := range replies {
 		s, live, err := b.liveSession(ctx, l.receiver)
 		if err == nil && live {
-			_, _ = b.SendMessage(ctx, s, mcpserver.SendArgs{To: l.address, Message: l.answer, ReplyTo: &id})
+			_, _ = b.SendMessage(context.WithValue(ctx, fallbackReply{}, true), s, mcpserver.SendArgs{To: l.address, Message: l.answer, ReplyTo: &id})
 		}
 	}
 }
@@ -100,7 +117,7 @@ func (b *Backend) writeThread(ctx context.Context, s registry.Session, d relay.D
 	if d.Notice {
 		kind = "notice"
 	}
-	claimed, err := b.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(25*time.Hour), kind)
+	claimed, err := b.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(relay.Retention), kind)
 	if !claimed || err != nil {
 		return false, err
 	}
@@ -130,6 +147,7 @@ func (b *Backend) nativeThreadAddress(s registry.Session) (string, error) {
 	if ep, ok := b.endpoints[key]; ok {
 		return ep.from, nil
 	}
+	// A thread's native relay must exist without a hub, so the state directory stands in for the machine ID.
 	path, err := relay.Path(b.socketDir, "amesh-relay\n"+b.cfg.StateDir, key)
 	if err != nil {
 		return "", err

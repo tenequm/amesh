@@ -89,7 +89,7 @@ func testSession() registry.Session {
 
 func TestMembership(t *testing.T) {
 	s := testSession()
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	var mu sync.Mutex
 	var operations []string
 	record := func(v string) { mu.Lock(); defer mu.Unlock(); operations = append(operations, v) }
@@ -162,7 +162,7 @@ func TestMembership(t *testing.T) {
 
 func TestDirectoryAndSend(t *testing.T) {
 	s := testSession()
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	recv := make(chan contract.SendRequest, 1)
 	b, r := fixture(t, map[string]http.HandlerFunc{
 		"GET /peer/peers": hubtest.Reply(t, "peersResponse"),
@@ -181,7 +181,7 @@ func TestDirectoryAndSend(t *testing.T) {
 	local.PID++
 	local.Name, local.Project = "helper", "demo"
 	*r = testRegistry{s, local}
-	b.members[sessionKey(local.Key)] = member{session: local, hosted: true, address: "helper@demo:mac"}
+	b.members[local.Key.MeshKey()] = member{session: local, hosted: true, address: "helper@demo:mac"}
 	dir, err := b.ListPeers(t.Context(), s, "")
 	if err != nil {
 		t.Fatal(err)
@@ -230,9 +230,9 @@ func TestDirectoryMergesLiveLocalMembers(t *testing.T) {
 	unregistered := local
 	unregistered.PID += 2
 	*r = testRegistry{caller, local, unregistered}
-	b.members[sessionKey(caller.Key)] = member{session: caller, hosted: true, address: "worker@demo:mac"}
-	b.members[sessionKey(local.Key)] = member{session: local, hosted: true, address: localAddress}
-	b.members[sessionKey(stale.Key)] = member{session: stale, hosted: true, address: "gone@demo:mac"}
+	b.members[caller.Key.MeshKey()] = member{session: caller, hosted: true, address: "worker@demo:mac"}
+	b.members[local.Key.MeshKey()] = member{session: local, hosted: true, address: localAddress}
+	b.members[stale.Key.MeshKey()] = member{session: stale, hosted: true, address: "gone@demo:mac"}
 	b.synchronized = true
 	b.peers = []contract.Peer{
 		{Address: "worker@demo:mac", Kind: "session", Machine: new("mac"), Project: new("demo")},
@@ -287,8 +287,8 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	target.Name = "review"
 	target.SocketPath = inbox
 	*r = append(*r, sender, target)
-	b.members[sessionKey(sender.Key)] = member{session: sender, hosted: true, address: "review@webapp:mac"}
-	b.members[sessionKey(target.Key)] = member{session: target, hosted: true, address: "review-2@webapp:mac"}
+	b.members[sender.Key.MeshKey()] = member{session: sender, hosted: true, address: "review@webapp:mac"}
+	b.members[target.Key.MeshKey()] = member{session: target, hosted: true, address: "review-2@webapp:mac"}
 	body := strings.Repeat("x", 32*1024)
 	got, err := b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@webapp", Message: body})
 	if err != nil || !got.Accepted || value(got.To) != "review-2@webapp:mac" {
@@ -303,7 +303,7 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	if err != nil || msg.Body != wantBody || msg.From != envelope.Address(sender.SocketPath) || msg.FromName != sender.Name || msg.FromMode != sender.FromMode || value(frame.From) != msg.From || frame.MsgID != value(got.ID) {
 		t.Fatal("wrong local native frame")
 	}
-	got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: b.members[sessionKey(sender.Key)].address, Message: "answer"})
+	got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: b.members[sender.Key.MeshKey()].address, Message: "answer"})
 	if err != nil || !got.Accepted {
 		t.Fatalf("reply: %#v %v", got, err)
 	}
@@ -317,7 +317,7 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	if n, e := b.client.Pending(""); e != nil || n != 0 {
 		t.Fatal("local send entered outbox")
 	}
-	pair := [2]string{sessionKey(sender.Key), sessionKey(target.Key)}
+	pair := [2]string{sender.Key.MeshKey(), target.Key.MeshKey()}
 	slices.Sort(pair[:])
 	if b.localHops[pair] != 2 {
 		t.Fatal("local sends were not counted", b.localHops)
@@ -353,7 +353,7 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 
 func TestHumanTurnReregistersOnce(t *testing.T) {
 	s := testSession()
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	var calls []string
 	var at int64
 	b, r := fixture(t, map[string]http.HandlerFunc{
@@ -476,7 +476,7 @@ func TestDaemonLifecycle(t *testing.T) {
 
 func TestUnknownSessionSendKeepsID(t *testing.T) {
 	s := testSession()
-	key := sessionKey(s.Key)
+	key := s.Key.MeshKey()
 	var ids []string
 	b, sessions := fixture(t, map[string]http.HandlerFunc{
 		"GET /peer/peers": hubtest.Reply(t, "peersResponse"),
@@ -529,7 +529,7 @@ func TestQueuedSendWaitAndDirectoryReplacement(t *testing.T) {
 		}
 		defer b.store.Close()
 		s := testSession()
-		b.members[sessionKey(s.Key)] = member{session: s, hosted: true, address: "review@webapp:mac"}
+		b.members[s.Key.MeshKey()] = member{session: s, hosted: true, address: "review@webapp:mac"}
 		b.peers = []contract.Peer{{Address: "gone", Kind: "agent"}}
 		r := streamRun{b: b}
 		item := contract.EventStreamItem{Event: "status", Data: `{"kind":"status","listed":true,"peer":{"address":"atlas","kind":"agent","status":"idle"}}`}
@@ -561,7 +561,7 @@ func TestQueuedSendWaitAndDirectoryReplacement(t *testing.T) {
 		if err != nil || value(result.ID) == "" || !reflect.DeepEqual(result, want) || time.Since(start) != 5*time.Second {
 			t.Fatalf("queued result %#v: %v", result, err)
 		}
-		if n, e := c.Pending(sessionKey(s.Key)); e != nil || n != 2 {
+		if n, e := c.Pending(s.Key.MeshKey()); e != nil || n != 2 {
 			t.Fatal("queued send was not durable")
 		}
 	})
@@ -574,7 +574,7 @@ func TestRestoreEndsAfterAnswer(t *testing.T) {
 			var store *state.Store
 			s := testSession()
 			s.ConfigDir = "/amesh-a2-primary"
-			key := sessionKey(s.Key)
+			key := s.Key.MeshKey()
 			b, r := fixture(t, map[string]http.HandlerFunc{
 				"POST /peer/sessions/{key}/end": func(w http.ResponseWriter, r *http.Request) {
 					var req contract.SessionEndRequest
@@ -679,7 +679,7 @@ func TestPresenceChangesAndStatus(t *testing.T) {
 	if err := b.store.SetLog(conn.Log); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.store.BeginWrite(conn.Log, "open-id", sessionKey(s.Key), time.Now().Add(time.Hour), "message"); err != nil {
+	if _, err := b.store.BeginWrite(conn.Log, "open-id", s.Key.MeshKey(), time.Now().Add(time.Hour), "message"); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.store.MarkWritten(conn.Log, "open-id"); err != nil {

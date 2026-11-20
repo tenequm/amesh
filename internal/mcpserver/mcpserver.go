@@ -8,6 +8,7 @@ import (
 	"net"
 	"syscall"
 
+	"github.com/tenequm/amesh/internal/codex"
 	"github.com/tenequm/amesh/internal/contract"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -25,7 +26,7 @@ func CodexCall(ctx context.Context) CodexMetadata {
 	info, _ := meta["x-codex-turn-metadata"].(map[string]any)
 	turn, _ := info["turn_id"].(string)
 	trigger, _ := info["turn_trigger"].(string)
-	message, _ := info["amesh_msg"].(string)
+	message, _ := info[codex.MessageKey].(string)
 	source, _ := info["thread_source"].(string)
 	return CodexMetadata{Thread: thread, Turn: turn, Trigger: trigger, Message: message, Source: source}
 }

@@ -56,11 +56,12 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Lock()
 	for reg := range d.pipes {
-		s, ok := byKey[reg.key]
-		if !ok {
-			continue
+		s := byKey[reg.key]
+		key := reg.key.MeshKey()
+		if s.Codex {
+			key = s.MeshKey()
 		}
-		pipes = append(pipes, pipeStatus{s.MeshKey(), s.Name, s.SessionID, s.ConfigDir, reg.parent})
+		pipes = append(pipes, pipeStatus{key, s.Name, s.SessionID, s.ConfigDir, reg.parent})
 	}
 	d.mu.Unlock()
 	slices.SortFunc(pipes, func(a, b pipeStatus) int {
@@ -72,8 +73,4 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	result.Pipes = pipes
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
-}
-
-func sessionKey(key registry.Key) string {
-	return key.MeshKey()
 }

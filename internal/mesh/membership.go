@@ -8,7 +8,6 @@ import (
 	"maps"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,10 +26,6 @@ type member struct {
 	last          state.Registration
 }
 
-func sessionKey(k registry.Key) string {
-	return k.MeshKey()
-}
-
 func (b *Backend) eligible(s registry.Session) bool {
 	return !s.MeshExcluded(b.cfg.ExcludeRoots)
 }
@@ -42,7 +37,7 @@ func (b *Backend) member(key string) (member, bool) {
 	return m, ok && m.hosted
 }
 
-func (b *Backend) IsMember(key registry.Key) bool { _, ok := b.member(sessionKey(key)); return ok }
+func (b *Backend) IsMember(key registry.Key) bool { _, ok := b.member(key.MeshKey()); return ok }
 
 func (b *Backend) persist(key string, m member) error {
 	thread := ""
@@ -71,6 +66,7 @@ func (b *Backend) restore(ctx context.Context) error {
 		key := registry.Key{PID: row.PID, ProcStart: row.ProcStart}
 		s, ok := byKey[key]
 		if row.ThreadID != "" {
+			// A Codex thread is hosted again only once its pipe reconnects and proves the thread.
 			s = registry.Session{Key: key, Codex: true, SessionID: row.ThreadID}
 			ok = false
 		}
@@ -156,16 +152,9 @@ func (b *Backend) Connect(ctx context.Context, s registry.Session) (io.Closer, e
 }
 
 func (b *Backend) localAddress(s registry.Session) string {
-	label := func(part string) string {
-		part = strings.Trim(nonLabel.ReplaceAllString(strings.ToLower(part), "-"), "._-")
-		if part == "" {
-			return "session"
-		}
-		return part[:min(len(part), 40)]
-	}
 	machine := b.machineName(contract.HelloResponse{})
-	base := label(s.Name)
-	suffix := "@" + label(s.Project) + ":" + machine
+	base := addressLabel(s.Name)
+	suffix := "@" + addressLabel(s.Project) + ":" + machine
 	occupied := map[string]bool{}
 	for _, m := range b.members {
 		if m.hosted && m.session.MeshKey() != s.MeshKey() {
@@ -175,7 +164,7 @@ func (b *Backend) localAddress(s registry.Session) string {
 	addr := base + suffix
 	for i := 2; occupied[addr]; i++ {
 		n := "-" + strconv.Itoa(i)
-		addr = base[:min(len(base), 40-len(n))] + n + suffix
+		addr = base[:min(len(base), maxLabel-len(n))] + n + suffix
 	}
 	return addr
 }
@@ -228,8 +217,16 @@ func (b *Backend) end(ctx context.Context, key string, reason contract.SessionEn
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if m := b.members[key]; m.hosted {
+	m := b.members[key]
+	if m.hosted {
 		return nil
+	}
+	// A Codex thread can drop out of one scan while its pipe stays open (a newer sibling, a failed probe).
+	// Keep it with no registration, so the next scan that sees it registers it again.
+	if m.session.Codex && m.pipes > 0 {
+		m.last = state.Registration{}
+		b.members[key] = m
+		return b.persist(key, m)
 	}
 	if err = b.store.DeleteMember(key); err == nil {
 		delete(b.members, key)
@@ -244,6 +241,14 @@ func (b *Backend) reconcile(ctx context.Context) error {
 	if !local && (err != nil || conn.Epoch == 0) {
 		return err
 	}
+	if local {
+		b.mu.RLock()
+		empty := len(b.members) == 0
+		b.mu.RUnlock()
+		if empty {
+			return nil
+		}
+	}
 	live, err := b.sessions.Snapshot(ctx)
 	if err != nil {
 		return err
@@ -253,11 +258,9 @@ func (b *Backend) reconcile(ctx context.Context) error {
 		byKey[s.Key] = s
 	}
 	for _, s := range live.Sessions {
-		if s.Codex && s.HumanTurn != "" {
-			if m, ok := b.member(s.MeshKey()); ok && s.HumanTurn > m.humanTurn {
-				if e := b.HumanTurn(ctx, s); e != nil {
-					return e
-				}
+		if s.Codex {
+			if e := b.HumanTurn(ctx, s); e != nil {
+				slog.Warn("mesh human turn update failed", "error", e)
 			}
 		}
 	}
@@ -289,7 +292,7 @@ func (b *Backend) reconcile(ctx context.Context) error {
 				delete(b.members, key)
 				b.forgetLocalHops(key)
 			} else {
-				m.hosted = false
+				m.hosted = !ok && !m.session.Codex
 				b.members[key] = m
 			}
 		}
@@ -312,6 +315,9 @@ func (b *Backend) reconcile(ctx context.Context) error {
 		}
 		b.members[key] = m
 		b.mu.Unlock()
+		if !m.hosted && m.session.Codex && m.pipes > 0 && m.last == (state.Registration{}) {
+			continue
+		}
 		if !m.hosted {
 			reason := contract.SessionEndRequestReasonExited
 			if found || m.session.CWD != "" && !b.eligible(m.session) {

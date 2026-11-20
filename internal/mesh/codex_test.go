@@ -186,3 +186,83 @@ func TestCodexHubRegistrationAndConversationReply(t *testing.T) {
 		t.Fatal("reply left the hub conversation")
 	}
 }
+
+func TestCodexFallbackAnswerIsNotAnsweredAgain(t *testing.T) {
+	b, r := fixture(t, map[string]http.HandlerFunc{})
+	cfg := b.cfg
+	cfg.HubURL = ""
+	b.client = hub.New(cfg)
+	record := &threadRecorder{}
+	b.threads = record
+	first := registry.Session{Codex: true, PID: 50, ProcStart: "start", SessionID: uuid.NewString(), Name: "first", Project: "demo", Status: "idle"}
+	second := first
+	second.PID, second.SessionID, second.Name = 51, uuid.NewString(), "second"
+	*r = testRegistry{first, second}
+	for _, s := range *r {
+		handle, err := b.Connect(t.Context(), s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { handle.Close() })
+	}
+	dir, err := b.ListPeers(t.Context(), first, "")
+	if err != nil || len(dir.Peers) != 1 {
+		t.Fatal(dir, err)
+	}
+	if res, e := b.SendMessage(t.Context(), first, mcpserver.SendArgs{To: dir.Peers[0].Name, Message: "ping"}); e != nil || !res.Accepted {
+		t.Fatal(res, e)
+	}
+	b.completedThread(second.SessionID, sha256.Sum256([]byte(record.text)), "pong")
+	b.flushThreadReplies(t.Context())
+	if record.writes != 2 || record.thread != first.SessionID {
+		t.Fatal("final answer did not return to the sender", record.writes)
+	}
+	b.completedThread(first.SessionID, sha256.Sum256([]byte(record.text)), "pong again")
+	b.flushThreadReplies(t.Context())
+	if record.writes != 2 {
+		t.Fatal("a fallback answer was answered automatically")
+	}
+}
+
+func TestCodexMemberSurvivesMissedScanWhilePipeOpen(t *testing.T) {
+	thread := registry.Session{Codex: true, SessionID: uuid.NewString(), PID: 12, ProcStart: "start", Entrypoint: "codex", Name: "review", Project: "demo", Status: "idle"}
+	key := thread.MeshKey()
+	registrations, ends := 0, 0
+	b, r := fixture(t, map[string]http.HandlerFunc{
+		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
+			registrations++
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@demo:mac"}})
+		},
+		"POST /peer/sessions/{key}/end": func(w http.ResponseWriter, r *http.Request) {
+			ends++
+			hubtest.Reply(t, "sessionEndResponse")(w, r)
+		},
+		"POST /peer/heartbeat": func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{}")) },
+	})
+	b.threads = new(threadRecorder)
+	*r = testRegistry{thread}
+	handle, err := b.Connect(t.Context(), thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	if err = b.reconcile(t.Context()); err != nil || registrations != 1 {
+		t.Fatal("registration", registrations, err)
+	}
+	*r = testRegistry{}
+	for range 2 {
+		if err = b.reconcile(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, kept := b.members[key]; !kept || ends != 1 {
+		t.Fatal("open pipe lost its membership", kept, ends)
+	}
+	*r = testRegistry{thread}
+	if err = b.reconcile(t.Context()); err != nil || registrations != 2 {
+		t.Fatal("thread did not register again", registrations, err)
+	}
+	if _, ok := b.member(key); !ok {
+		t.Fatal("thread is not a member after it reappeared")
+	}
+}
