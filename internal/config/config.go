@@ -39,7 +39,7 @@ func Bind(fs *flag.FlagSet) *Flags {
 	bind(&f.configDirs, "claude-config-dirs", "AMESH_CLAUDE_CONFIG_DIRS", "~/.claude", "colon-separated Claude config directories")
 	bind(&f.exclude, "exclude", "AMESH_EXCLUDE", "", "colon-separated mesh exclusion roots (empty for none)")
 	bind(&f.machineName, "machine-name", "AMESH_MACHINE_NAME", "", "enrolled machine name")
-	bind(&f.hubURL, "hub-url", "AMESH_HUB_URL", "https://nanoclaw.opx.one/peer", "hub API base including /peer")
+	bind(&f.hubURL, "hub-url", "AMESH_HUB_URL", "", "hub API base including /peer (empty: no hub, lane mode only)")
 	return f
 }
 
@@ -104,6 +104,9 @@ func (f *Flags) Resolve() (Config, error) {
 	}
 	if c.MachineName != "" && !machineName.MatchString(c.MachineName) {
 		return Config{}, errors.New("invalid machine-name")
+	}
+	if c.HubURL == "" {
+		return c, nil
 	}
 	u, err := url.Parse(c.HubURL)
 	if err != nil || u.Hostname() == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {

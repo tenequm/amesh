@@ -53,12 +53,15 @@ type Client struct {
 	bindingMu       sync.Mutex
 }
 
+// ErrNoHub halts a client whose configuration names no hub; lane mode works without one.
+var ErrNoHub = errors.New("no hub URL is configured (set AMESH_HUB_URL)")
+
 func New(cfg config.Config) *Client { return NewWithTransport(cfg, nil) }
 
 func NewWithTransport(cfg config.Config, transport http.RoundTripper) *Client {
 	var n [16]byte
 	rand.Read(n[:])
-	return &Client{
+	c := &Client{
 		statusSince: time.Now(),
 		instance:    encoding.EncodeToString(n[:]),
 		logChanged:  make(chan struct{}),
@@ -71,6 +74,11 @@ func NewWithTransport(cfg config.Config, transport http.RoundTripper) *Client {
 		wake:        make(chan struct{}, 1),
 		waiters:     make(map[string][]chan SendOutcome),
 	}
+	if cfg.HubURL == "" {
+		c.halt = ErrNoHub
+		close(c.stopped)
+	}
+	return c
 }
 
 func (c *Client) Connection() (contract.HelloResponse, error) {

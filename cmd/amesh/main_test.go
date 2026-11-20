@@ -42,14 +42,24 @@ func TestHelpKeepsEnvironmentPrivate(t *testing.T) {
 	}
 }
 
-func TestLaneThroughUnenrolledDaemon(t *testing.T) {
+func TestLaneThroughOfflineDaemon(t *testing.T) {
+	for _, tc := range []struct{ name, hubURL, halt string }{
+		{name: "unenrolled", hubURL: "http://127.0.0.1:0/peer", halt: "unknown_machine"},
+		{name: "no hub URL", hubURL: "", halt: "internal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) { laneThroughOfflineDaemon(t, tc.hubURL, tc.halt) })
+	}
+}
+
+func laneThroughOfflineDaemon(t *testing.T, hubURL, haltCode string) {
+	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "amesh-a2-") //nolint:usetesting // Native and control sockets need short paths.
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	t.Setenv("XDG_RUNTIME_DIR", dir)
-	cfg := config.Config{StateDir: filepath.Join(dir, "state"), HubURL: "http://127.0.0.1:0/peer", SocketPath: filepath.Join(dir, "amesh-a2.sock"), ClaudeConfigDirs: []string{filepath.Join(dir, "amesh-a2-parent"), filepath.Join(dir, "amesh-a2-child")}}
+	cfg := config.Config{StateDir: filepath.Join(dir, "state"), HubURL: hubURL, SocketPath: filepath.Join(dir, "amesh-a2.sock"), ClaudeConfigDirs: []string{filepath.Join(dir, "amesh-a2-parent"), filepath.Join(dir, "amesh-a2-child")}}
 	sockets := filepath.Join(dir, "cc-socks")
 	if err = os.Mkdir(sockets, 0o700); err != nil {
 		t.Fatal(err)
@@ -102,7 +112,7 @@ func TestLaneThroughUnenrolledDaemon(t *testing.T) {
 	}
 	for {
 		st, e := status()
-		if e == nil && st.Hub.State == "halted" && st.Hub.Halt != nil && st.Hub.Halt.Error == "unknown_machine" {
+		if e == nil && st.Hub.State == "halted" && st.Hub.Halt != nil && string(st.Hub.Halt.Error) == haltCode {
 			break
 		}
 		select {

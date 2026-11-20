@@ -48,6 +48,20 @@ func enrolled(t *testing.T, base string) *Client {
 	return New(cfg)
 }
 
+func TestNoHubURLHalts(t *testing.T) {
+	c := New(config.Config{StateDir: t.TempDir()})
+	if _, err := c.Connection(); !errors.Is(err, ErrNoHub) {
+		t.Fatalf("connection error %v", err)
+	}
+	if _, err := c.Peers(t.Context()); !errors.Is(err, ErrNoHub) {
+		t.Fatalf("peers error %v", err)
+	}
+	var s contract.DaemonStatus
+	if err := c.Status(&s); err != nil || s.Hub.State != contract.DaemonStatusHubStateHalted || s.Hub.Halt == nil || !strings.Contains(s.Hub.Halt.Message, "AMESH_HUB_URL") {
+		t.Fatalf("status %+v, %v", s.Hub, err)
+	}
+}
+
 func freshTransport(t *testing.T, c *Client) {
 	t.Helper()
 	tr := &http.Transport{DisableKeepAlives: true}
@@ -110,7 +124,7 @@ func checkSignature(t *testing.T, c *Client, call hubtest.Call) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth, ok := strings.CutPrefix(call.Header.Get("Authorization"), "HeyDan-Sig v=1,p=1,")
+	auth, ok := strings.CutPrefix(call.Header.Get("Authorization"), "Amesh-Sig v=1,p=1,")
 	if !ok {
 		t.Fatal("missing signature")
 	}

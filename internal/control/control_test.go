@@ -609,7 +609,7 @@ func TestHumanHookTranscriptExample(t *testing.T) {
 	if err := json.Unmarshal(hubtest.Example(t, "hookPromptHuman"), &h); err != nil {
 		t.Fatal(err)
 	}
-	if h.SessionID == nil || h.Transcript != "/Users/tenequm/.claude/projects/-Users-tenequm-pj-pond/"+*h.SessionID+".jsonl" {
+	if h.SessionID == nil || h.Transcript != "/Users/me/.claude/projects/-Users-me-work-webapp/"+*h.SessionID+".jsonl" {
 		t.Fatal("hook transcript path")
 	}
 }

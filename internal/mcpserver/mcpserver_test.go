@@ -237,8 +237,8 @@ func TestPublishedContract(t *testing.T) {
 					t.Fatal(got)
 				}
 			} else {
-				got := payload(t, client.call("list_peers", `{"filter":"@pond"}`))["you"].(map[string]any)
-				if got["name"] != "caller1" || got["project"] != "@pond" {
+				got := payload(t, client.call("list_peers", `{"filter":"@webapp"}`))["you"].(map[string]any)
+				if got["name"] != "caller1" || got["project"] != "@webapp" {
 					t.Fatal(got)
 				}
 				args := spec.Components.Examples.SendMessage.Value
