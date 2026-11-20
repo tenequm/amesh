@@ -255,20 +255,26 @@ func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target memb
 	}
 	pair := [2]string{sessionKey(s.Key), sessionKey(target.session.Key)}
 	slices.Sort(pair[:])
-	b.mu.RLock()
+	// Reserve the hop before writing so concurrent sends on one pair cannot pass the limit together.
+	b.mu.Lock()
 	hops := b.localHops[pair]
-	b.mu.RUnlock()
+	if hops < hopLimit {
+		b.localHops[pair]++
+	}
+	b.mu.Unlock()
 	if hops >= hopLimit {
 		return refused(fmt.Sprintf("Conversation paused after %d messages. A human turn resets the limit.", hops), nil), nil
 	}
 	id := uuid.NewString()
 	err = b.relays.Write(ctx, relay.Delivery{ID: id, Inbox: receiver.SocketPath, ReplyAddress: senderAddress, Message: envelope.Message{From: envelope.Address(s.SocketPath), FromName: s.Name, FromMode: s.FromMode, Body: message}})
 	if err != nil {
-		return refused("The message could not be written to "+target.address+".", nil), nil //nolint:nilerr // MCP delivery refusals are ordinary tool results.
+		b.mu.Lock()
+		if b.localHops[pair] > 0 {
+			b.localHops[pair]--
+		}
+		b.mu.Unlock()
+		return refused("The message could not be written to "+target.address+".", nil), nil
 	}
-	b.mu.Lock()
-	b.localHops[pair]++
-	b.mu.Unlock()
 	return mcpserver.SendResult{Accepted: true, ID: &id, To: &target.address, Note: new("Sent. A reply, if any, arrives later as a message from " + target.address + ".")}, nil
 }
 
