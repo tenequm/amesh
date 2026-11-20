@@ -1,7 +1,10 @@
 name: Release
 on:
   push:
+    branches: [main]
+    paths: ['.github/workflows/release.yml', 'Justfile', 'go.mod', 'go.sum']
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
 permissions:
   contents: write
 jobs:
@@ -12,14 +15,34 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: |
+            go.mod
+            go.sum
+            Justfile
       - uses: extractions/setup-just@v3
       - run: just test
-      - name: Build and publish fleet archives
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Build and verify fleet archives
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="0.$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
           just release "$version"
           cd "dist/$version"
           sha256sum --check checksums.txt
+          for archive in *.tar.gz; do
+            [[ "$(tar -tzf "$archive")" == amesh ]]
+          done
+          tar -xzf "amesh_${version}_linux_amd64.tar.gz"
+          [[ "$(./amesh -version)" == "$version" ]]
+      - name: Publish signed tag
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag" |
+            jq -e --arg tag "$GITHUB_REF_NAME" --arg commit "$(git rev-parse HEAD)" \
+              '.verification.verified and .tag == $tag and .object.type == "commit" and .object.sha == $commit'
+          cd "dist/${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes ./*.tar.gz checksums.txt
