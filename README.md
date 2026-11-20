@@ -36,7 +36,7 @@ Flags override environment defaults. Global flags go before the subcommand. Daem
 | `-machine-name` | `AMESH_MACHINE_NAME` | Empty before enrollment |
 | `-hub-url` | `AMESH_HUB_URL` | [Fleet hub API](https://nanoclaw.opx.one/peer) |
 
-Directory lists use a colon separator. Paths accept an absolute path or a leading `~/`. Set `AMESH_CLAUDE_CONFIG_DIRS` to `~/.claude:~/pjd/.claude-config` on the multi-seat Mac. The hub URL includes the API prefix. Logs go to stderr as text in a terminal and JSON when redirected.
+Directory lists use a colon separator. Paths accept an absolute path or a leading `~/`. Sessions in any directory listed in `AMESH_CLAUDE_CONFIG_DIRS` can join the mesh. Set `AMESH_EXCLUDE` to refuse mesh pipes for sessions whose working directory is at or under an exclusion root. The hub URL includes the API prefix. Logs go to stderr as text in a terminal and JSON when redirected.
 
 ## Releases
 

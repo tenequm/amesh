@@ -337,12 +337,12 @@ func (r *Registry) Live(ctx context.Context, key Key) (bool, error) {
 	return err == nil, err
 }
 
-func (s Session) MeshExcluded(dirs, roots []string) bool {
-	_, excluded := s.MeshExclusionRoot(dirs, roots)
+func (s Session) MeshExcluded(roots []string) bool {
+	_, excluded := s.MeshExclusionRoot(roots)
 	return excluded
 }
 
-func (s Session) MeshExclusionRoot(dirs, roots []string) (string, bool) {
+func (s Session) MeshExclusionRoot(roots []string) (string, bool) {
 	var resolved string
 	var err error
 	if len(roots) > 0 {
@@ -356,9 +356,6 @@ func (s Session) MeshExclusionRoot(dirs, roots []string) (string, bool) {
 		if err == nil && e == nil && (resolved == base || strings.HasPrefix(resolved, strings.TrimRight(base, "/")+"/")) {
 			return root, true
 		}
-	}
-	if len(dirs) > 0 && s.ConfigDir != dirs[0] {
-		return s.ConfigDir, true
 	}
 	return "", false
 }

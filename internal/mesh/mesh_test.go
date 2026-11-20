@@ -468,8 +468,8 @@ func TestQueuedSendWaitAndDirectoryReplacement(t *testing.T) {
 	})
 }
 
-func TestRestoreExclusionEndsAfterAnswer(t *testing.T) {
-	for _, source := range []string{"cwd", "second-seat", "removed-seat"} {
+func TestRestoreEndsAfterAnswer(t *testing.T) {
+	for _, source := range []string{"cwd", "removed-seat"} {
 		t.Run(source, func(t *testing.T) {
 			var calls int
 			var store *state.Store
@@ -479,7 +479,11 @@ func TestRestoreExclusionEndsAfterAnswer(t *testing.T) {
 			b, r := fixture(t, map[string]http.HandlerFunc{
 				"POST /peer/sessions/{key}/end": func(w http.ResponseWriter, r *http.Request) {
 					var req contract.SessionEndRequest
-					if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Reason != contract.SessionEndRequestReasonExcluded {
+					want := contract.SessionEndRequestReasonExcluded
+					if source == "removed-seat" {
+						want = contract.SessionEndRequestReasonExited
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Reason != want {
 						t.Error(req, err)
 					}
 					saved, err := store.Members()
@@ -500,20 +504,15 @@ func TestRestoreExclusionEndsAfterAnswer(t *testing.T) {
 				t.Fatal(err)
 			}
 			b.members = map[string]member{}
-			switch source {
-			case "cwd":
+			if source == "cwd" {
 				s.CWD = "/amesh-a2-exclude/sub"
 				b.cfg.ExcludeRoots = []string{"/amesh-a2-exclude"}
-			case "second-seat":
-				b.cfg.ClaudeConfigDirs = []string{"/amesh-a2-new", s.ConfigDir}
-			case "removed-seat":
+				*r = append(*r, s)
+			} else {
 				b.cfg.ClaudeConfigDirs = []string{"/amesh-a2-new"}
 			}
-			if source != "removed-seat" {
-				*r = append(*r, s)
-			}
 			if err := b.restore(t.Context()); err != nil || b.IsMember(s.Key) {
-				t.Fatal("hosted excluded session", err)
+				t.Fatal("unexpected restored member", err)
 			}
 			if err := b.reconcile(t.Context()); err == nil {
 				t.Fatal("lost failed end")

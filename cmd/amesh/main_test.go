@@ -183,4 +183,13 @@ func TestLaneThroughUnenrolledDaemon(t *testing.T) {
 	if err = json.NewDecoder(reader).Decode(&result); err != nil || !result.Result.Structured.Accepted {
 		t.Fatal(result, err)
 	}
+	t.Run("mesh membership from second config dir", func(t *testing.T) {
+		if err := run(ctx, []string{"-socket-path", cfg.SocketPath, "mcp"}, bytes.NewReader(nil), io.Discard, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		st, err := status()
+		if err != nil || len(st.Sessions) != 1 || st.Sessions[0].Role != "member" {
+			t.Fatal(st.Sessions, err)
+		}
+	})
 }

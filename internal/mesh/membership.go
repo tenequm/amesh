@@ -31,7 +31,7 @@ func sessionKey(k registry.Key) string {
 }
 
 func (b *Backend) eligible(s registry.Session) bool {
-	return !s.MeshExcluded(b.cfg.ClaudeConfigDirs, b.cfg.ExcludeRoots)
+	return !s.MeshExcluded(b.cfg.ExcludeRoots)
 }
 
 func (b *Backend) member(key string) (member, bool) {
@@ -214,7 +214,7 @@ func (b *Backend) reconcile(ctx context.Context) error {
 		b.mu.Unlock()
 		if !m.hosted {
 			reason := contract.SessionEndRequestReasonExited
-			if found || m.session.ConfigDir != "" && !b.eligible(m.session) {
+			if found || m.session.CWD != "" && !b.eligible(m.session) {
 				reason = contract.SessionEndRequestReasonExcluded
 			}
 			if err = b.end(ctx, key, reason); err != nil {
