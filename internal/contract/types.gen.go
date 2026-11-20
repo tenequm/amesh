@@ -617,6 +617,7 @@ const (
 	PeerStatusOffline                  PeerStatus                 = "offline"
 	KindAgent                          Kind                       = "agent"
 	KindSession                        Kind                       = "session"
+	KindCodex                          Kind                       = "codex"
 	ErrorCodeBadRequest                ErrorCode                  = "bad_request"
 	ErrorCodeBadBody                   ErrorCode                  = "bad_body"
 	ErrorCodeEmptyText                 ErrorCode                  = "empty_text"

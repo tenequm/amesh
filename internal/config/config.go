@@ -39,7 +39,7 @@ func Bind(fs *flag.FlagSet) *Flags {
 	bind(&f.configDirs, "claude-config-dirs", "AMESH_CLAUDE_CONFIG_DIRS", "~/.claude", "colon-separated Claude config directories")
 	bind(&f.exclude, "exclude", "AMESH_EXCLUDE", "", "colon-separated mesh exclusion roots (empty for none)")
 	bind(&f.machineName, "machine-name", "AMESH_MACHINE_NAME", "", "enrolled machine name")
-	bind(&f.hubURL, "hub-url", "AMESH_HUB_URL", "", "hub API base including /peer (empty: no hub, lane mode only)")
+	bind(&f.hubURL, "hub-url", "AMESH_HUB_URL", "", "hub API base including /peer (empty: same-machine peers only)")
 	return f
 }
 

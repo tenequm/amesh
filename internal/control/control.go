@@ -236,7 +236,20 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 		reject(w, 400, contract.LocalErrorErrorBadRequest, err.Error())
 		return
 	}
-	s, err := d.resolvePipe(r.Context(), pid)
+	var codex *registry.CodexPipe
+	if parent == "" {
+		codex = d.registry.OpenCodexPipe(r.Context(), pid)
+	}
+	var s registry.Session
+	if codex != nil {
+		defer codex.Close()
+		s, err = codex.Session(r.Context(), "")
+		if errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+	} else {
+		s, err = d.resolvePipe(r.Context(), pid)
+	}
 	if err != nil {
 		reject(w, 403, contract.LocalErrorErrorNotInSession, "This only works inside a Claude Code session.")
 		return
@@ -250,16 +263,23 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var handle io.Closer
-	if parent == "" {
+	if parent == "" && (codex == nil || s.Codex) {
 		handle, err = d.mesh.Connect(r.Context(), s)
-	} else {
+	} else if parent != "" {
 		handle, err = d.lane.Connect(r.Context(), s, parent)
 	}
 	if err != nil {
 		http.Error(w, "cannot register session", http.StatusServiceUnavailable)
 		return
 	}
-	defer handle.Close()
+	var bindMu sync.Mutex
+	defer func() {
+		bindMu.Lock()
+		defer bindMu.Unlock()
+		if handle != nil {
+			_ = handle.Close()
+		}
+	}()
 	d.work.Add(1)
 	defer d.work.Done()
 	conn, rw, err := http.NewResponseController(w).Hijack()
@@ -280,7 +300,45 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 	if err = rw.Flush(); err != nil {
 		return
 	}
+
 	caller := func(ctx context.Context) (registry.Session, error) {
+		if codex != nil {
+			bindMu.Lock()
+			defer bindMu.Unlock()
+			meta := mcpserver.CodexCall(ctx)
+			if meta.Source != "" && meta.Source != "user" {
+				return registry.Session{}, errors.New("peer messaging is for user threads only")
+			}
+			if meta.Thread == "" {
+				return registry.Session{}, errors.New("missing Codex thread identity")
+			}
+			current, e := codex.Session(ctx, meta.Thread)
+			if e != nil {
+				return registry.Session{}, e
+			}
+			if d.meshExcluded(current) {
+				return registry.Session{}, errors.New("amesh is turned off for this directory")
+			}
+			if handle == nil || s.SessionID != current.SessionID {
+				if handle != nil {
+					_ = handle.Close()
+					handle = nil
+				}
+				handle, e = d.mesh.Connect(ctx, current)
+				if e != nil {
+					return registry.Session{}, e
+				}
+				s = current
+				d.mu.Lock()
+				reg.key = s.Key
+				d.mu.Unlock()
+			}
+			if meta.Turn != "" && meta.Trigger == "user" && meta.Message == "" {
+				current.HumanTurn = meta.Turn
+				_ = d.mesh.HumanTurn(ctx, current)
+			}
+			return current, nil
+		}
 		current, e := d.registry.Resolve(ctx, pid)
 		if e != nil {
 			return registry.Session{}, e

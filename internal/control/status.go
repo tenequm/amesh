@@ -1,9 +1,7 @@
 package control
 
 import (
-	"crypto/sha256"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"slices"
@@ -58,8 +56,11 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Lock()
 	for reg := range d.pipes {
-		s := byKey[reg.key]
-		pipes = append(pipes, pipeStatus{sessionKey(reg.key), s.Name, s.SessionID, s.ConfigDir, reg.parent})
+		s, ok := byKey[reg.key]
+		if !ok {
+			continue
+		}
+		pipes = append(pipes, pipeStatus{s.MeshKey(), s.Name, s.SessionID, s.ConfigDir, reg.parent})
 	}
 	d.mu.Unlock()
 	slices.SortFunc(pipes, func(a, b pipeStatus) int {
@@ -74,6 +75,5 @@ func (d *daemon) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func sessionKey(key registry.Key) string {
-	digest := sha256.Sum256([]byte(key.ProcStart))
-	return fmt.Sprintf("%d-%x", key.PID, digest[:4])
+	return key.MeshKey()
 }

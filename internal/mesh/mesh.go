@@ -2,10 +2,13 @@ package mesh
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/tenequm/amesh/internal/codex"
 
 	"github.com/tenequm/amesh/internal/config"
 	"github.com/tenequm/amesh/internal/contract"
@@ -17,6 +20,8 @@ import (
 )
 
 type Backend struct {
+	threads          threadDelivery
+	links            map[string]replyLink
 	ctx              context.Context
 	socketDir        string
 	endpointMu       sync.Mutex
@@ -53,18 +58,36 @@ type sessionRegistry interface {
 var _ mcpserver.MeshBackend = (*Backend)(nil)
 
 func New(cfg config.Config, sessions *registry.Registry, relays *relay.Manager, client *hub.Client) *Backend {
-	return &Backend{endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), localHops: make(map[[2]string]int64), wake: make(chan struct{}, 1)}
+	app := codex.New(registry.CodexHome())
+	b := &Backend{threads: app, links: map[string]replyLink{}, endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), localHops: make(map[[2]string]int64), wake: make(chan struct{}, 1)}
+	if sessions != nil {
+		sessions.CodexStatus = app.Status
+		sessions.CodexComplete = b.completedThread
+	}
+	return b
 }
 
 func (b *Backend) HumanTurn(ctx context.Context, s registry.Session) error {
-	key := sessionKey(s.Key)
+	key := s.MeshKey()
 	current, live, err := b.liveSession(ctx, key)
 	if err != nil || !live || current.SessionID != s.SessionID {
 		return err
 	}
 	b.mu.Lock()
+	if s.Codex {
+		m := b.members[key]
+		if s.HumanTurn == "" || s.HumanTurn <= m.humanTurn {
+			b.mu.Unlock()
+			return nil
+		}
+		m.humanTurn = s.HumanTurn
+		b.members[key] = m
+	}
 	b.forgetLocalHops(key)
 	b.mu.Unlock()
+	if _, halt := b.client.Connection(); errors.Is(halt, hub.ErrNoHub) {
+		return nil
+	}
 	req := contract.HumanTurnRequest{At: time.Now().UnixMilli(), Source: "prompt"}
 	_, err = b.client.HumanTurn(ctx, key, req)
 	if unknownSession(err) {

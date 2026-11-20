@@ -2,11 +2,14 @@ package registry
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -22,10 +25,25 @@ type Key struct {
 }
 
 type Session struct {
+	Codex     bool
+	HumanTurn string
 	Key
 	SessionID, Name, Project, CWD, ConfigDir, SocketPath, Status, FromMode, Version string
 	NameSource, Entrypoint                                                          string
 	StartedAt                                                                       int64
+}
+
+func (s Session) MeshKey() string {
+	if s.Codex {
+		digest := sha256.Sum256([]byte(s.SessionID))
+		return fmt.Sprintf("%d-%x", 1<<32+uint64(binary.BigEndian.Uint32(digest[:4])), digest[4:8])
+	}
+	return s.Key.MeshKey()
+}
+
+func (k Key) MeshKey() string {
+	digest := sha256.Sum256([]byte(k.ProcStart))
+	return fmt.Sprintf("%d-%x", k.PID, digest[:4])
 }
 
 type Listing struct {
@@ -45,12 +63,16 @@ func (l Listing) Unavailable(s Session) bool {
 }
 
 type Registry struct {
-	scanMu   sync.Mutex
-	reported map[entryPath]string
-	dirs     []string
-	lookup   func(int) (int, string, error)
-	mu       sync.Mutex
-	modes    map[int]permissionClass
+	codex         map[int]*CodexPipe
+	pipeOrder     uint64
+	CodexStatus   func(string) string
+	CodexComplete func(string, [32]byte, string)
+	scanMu        sync.Mutex
+	reported      map[entryPath]string
+	dirs          []string
+	lookup        func(int) (int, string, error)
+	mu            sync.Mutex
+	modes         map[int]permissionClass
 }
 
 func ProcessStart(pid int) (string, error) {
@@ -59,10 +81,16 @@ func ProcessStart(pid int) (string, error) {
 }
 
 func New(configDirs []string) *Registry {
-	return &Registry{dirs: slices.Clone(configDirs), lookup: process, modes: make(map[int]permissionClass)}
+	return &Registry{codex: make(map[int]*CodexPipe), dirs: slices.Clone(configDirs), lookup: process, modes: make(map[int]permissionClass)}
 }
 
 func (r *Registry) Resolve(ctx context.Context, pid int) (Session, error) {
+	r.mu.Lock()
+	pipe := r.codex[pid]
+	r.mu.Unlock()
+	if pipe != nil {
+		return pipe.Session(ctx, "")
+	}
 	for hops := 0; hops <= 8 && pid > 0; hops++ {
 		if err := ctx.Err(); err != nil {
 			return Session{}, err
@@ -266,6 +294,16 @@ func (r *Registry) scan(ctx context.Context, check bool) (Listing, error) {
 				}
 			}
 			live.Sessions = append(live.Sessions, r.withMode(session))
+		}
+	}
+	if !check {
+		r.mu.Lock()
+		pipes := slices.Collect(maps.Values(r.codex))
+		r.mu.Unlock()
+		for _, pipe := range pipes {
+			if s, err := pipe.Session(ctx, ""); err == nil {
+				live.Sessions = append(live.Sessions, s)
+			}
 		}
 	}
 	r.reported = live.unavailable

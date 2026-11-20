@@ -2,22 +2,24 @@ package mesh
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"maps"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/tenequm/amesh/internal/contract"
+	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/state"
 )
 
 type member struct {
+	humanTurn     string
 	session       registry.Session
 	address       string
 	pipes         int
@@ -26,8 +28,7 @@ type member struct {
 }
 
 func sessionKey(k registry.Key) string {
-	digest := sha256.Sum256([]byte(k.ProcStart))
-	return fmt.Sprintf("%d-%x", k.PID, digest[:4])
+	return k.MeshKey()
 }
 
 func (b *Backend) eligible(s registry.Session) bool {
@@ -44,7 +45,11 @@ func (b *Backend) member(key string) (member, bool) {
 func (b *Backend) IsMember(key registry.Key) bool { _, ok := b.member(sessionKey(key)); return ok }
 
 func (b *Backend) persist(key string, m member) error {
-	return b.store.PutMember(state.Member{Key: key, PID: m.session.PID, ProcStart: m.session.ProcStart, Address: m.address, Registration: m.last, ConfigDir: m.session.ConfigDir})
+	thread := ""
+	if m.session.Codex {
+		thread = m.session.SessionID
+	}
+	return b.store.PutMember(state.Member{ThreadID: thread, Key: key, PID: m.session.PID, ProcStart: m.session.ProcStart, Address: m.address, Registration: m.last, ConfigDir: m.session.ConfigDir})
 }
 
 func (b *Backend) restore(ctx context.Context) error {
@@ -64,13 +69,17 @@ func (b *Backend) restore(ctx context.Context) error {
 	defer b.mu.Unlock()
 	for _, row := range saved {
 		key := registry.Key{PID: row.PID, ProcStart: row.ProcStart}
-		if row.Key != sessionKey(key) {
-			return errors.New("invalid persisted mesh session key")
-		}
 		s, ok := byKey[key]
+		if row.ThreadID != "" {
+			s = registry.Session{Key: key, Codex: true, SessionID: row.ThreadID}
+			ok = false
+		}
 		if !ok {
 			s.Key = key
 			s.ConfigDir = row.ConfigDir
+		}
+		if row.Key != s.MeshKey() {
+			return errors.New("invalid persisted mesh session key")
 		}
 		b.members[row.Key] = member{session: s, address: row.Address, last: row.Registration, hosted: ok && b.eligible(s)}
 	}
@@ -95,11 +104,20 @@ func (b *Backend) Connect(ctx context.Context, s registry.Session) (io.Closer, e
 	if !b.eligible(s) || b.store == nil {
 		return nil, errors.New("mesh unavailable for session")
 	}
-	key := sessionKey(s.Key)
+	key := s.MeshKey()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	m := b.members[key]
+	if m.session.Codex && m.session.SessionID != s.SessionID {
+		return nil, errors.New("thread key collision")
+	}
+	if m.session.Key != s.Key {
+		m.pipes = 0
+	}
 	m.session = s
+	if _, err := b.client.Connection(); errors.Is(err, hub.ErrNoHub) && m.address == "" {
+		m.address = b.localAddress(s)
+	}
 	m.hosted = true
 	m.dirty = true
 	m.pipes++
@@ -110,15 +128,56 @@ func (b *Backend) Connect(ctx context.Context, s registry.Session) (io.Closer, e
 	b.changed()
 	return pipe{sync.OnceFunc(func() {
 		b.mu.Lock()
-		defer b.mu.Unlock()
 		v, ok := b.members[key]
-		if !ok || v.pipes == 0 {
+		if !ok || v.session.Key != s.Key || v.pipes == 0 {
+			b.mu.Unlock()
 			return
 		}
 		v.pipes--
+		if s.Codex && v.pipes == 0 {
+			v.hosted = false
+		}
 		b.members[key] = v
+		b.mu.Unlock()
+		if s.Codex && v.pipes == 0 {
+			b.endpointMu.Lock()
+			_, hosted := b.member(key)
+			ep, exists := b.endpoints[key]
+			if !hosted && exists {
+				delete(b.endpoints, key)
+			}
+			b.endpointMu.Unlock()
+			if !hosted && exists {
+				_ = ep.listener.Close()
+			}
+		}
 		b.changed()
 	})}, nil
+}
+
+func (b *Backend) localAddress(s registry.Session) string {
+	label := func(part string) string {
+		part = strings.Trim(nonLabel.ReplaceAllString(strings.ToLower(part), "-"), "._-")
+		if part == "" {
+			return "session"
+		}
+		return part[:min(len(part), 40)]
+	}
+	machine := b.machineName(contract.HelloResponse{})
+	base := label(s.Name)
+	suffix := "@" + label(s.Project) + ":" + machine
+	occupied := map[string]bool{}
+	for _, m := range b.members {
+		if m.hosted && m.session.MeshKey() != s.MeshKey() {
+			occupied[m.address] = true
+		}
+	}
+	addr := base + suffix
+	for i := 2; occupied[addr]; i++ {
+		n := "-" + strconv.Itoa(i)
+		addr = base[:min(len(base), 40-len(n))] + n + suffix
+	}
+	return addr
 }
 
 func status(s registry.Session) contract.PeerStatus {
@@ -180,10 +239,9 @@ func (b *Backend) end(ctx context.Context, key string, reason contract.SessionEn
 }
 
 func (b *Backend) reconcile(ctx context.Context) error {
-	b.presence.Lock()
-	defer b.presence.Unlock()
 	conn, err := b.client.Connection()
-	if err != nil || conn.Epoch == 0 {
+	local := errors.Is(err, hub.ErrNoHub)
+	if !local && (err != nil || conn.Epoch == 0) {
 		return err
 	}
 	live, err := b.sessions.Snapshot(ctx)
@@ -194,19 +252,60 @@ func (b *Backend) reconcile(ctx context.Context) error {
 	for _, s := range live.Sessions {
 		byKey[s.Key] = s
 	}
+	for _, s := range live.Sessions {
+		if s.Codex && s.HumanTurn != "" {
+			if m, ok := b.member(s.MeshKey()); ok && s.HumanTurn > m.humanTurn {
+				if e := b.HumanTurn(ctx, s); e != nil {
+					return e
+				}
+			}
+		}
+	}
+	b.presence.Lock()
+	defer b.presence.Unlock()
 	b.mu.RLock()
 	keys := slices.Sorted(maps.Keys(b.members))
 	b.mu.RUnlock()
+	if local {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		for _, key := range keys {
+			m := b.members[key]
+			s, ok := byKey[m.session.Key]
+			if !ok && live.Unavailable(m.session) {
+				continue
+			}
+			if ok && s.MeshKey() == key && b.eligible(s) {
+				if m.session.Name != s.Name || m.session.Project != s.Project || m.address == "" {
+					m.address = b.localAddress(s)
+				}
+				m.session = s
+				m.hosted = true
+				b.members[key] = m
+			} else if m.pipes == 0 {
+				if e := b.store.DeleteMember(key); e != nil {
+					return e
+				}
+				delete(b.members, key)
+				b.forgetLocalHops(key)
+			} else {
+				m.hosted = false
+				b.members[key] = m
+			}
+		}
+		return nil
+	}
 	changed := b.presenceLog != conn.Log || b.heartbeatDue
 	for _, key := range keys {
 		b.mu.Lock()
 		m := b.members[key]
 		s, found := byKey[m.session.Key]
+		found = found && s.MeshKey() == key
 		if !found && live.Unavailable(m.session) {
 			b.mu.Unlock()
 			continue
 		}
-		m.hosted = found && b.eligible(s) || !found && m.pipes > 0
+		m.hosted = found && b.eligible(s) || !found && !m.session.Codex && m.pipes > 0
 		if found {
 			changed = changed || status(m.session) != status(s)
 			m.session = s
@@ -272,11 +371,12 @@ func (b *Backend) runPresence(ctx context.Context) {
 	defer tick.Stop()
 	for ctx.Err() == nil {
 		if err := b.reconcile(ctx); err != nil && ctx.Err() == nil {
-			if _, halt := b.client.Connection(); halt != nil {
+			if _, halt := b.client.Connection(); halt != nil && !errors.Is(halt, hub.ErrNoHub) {
 				return
 			}
 			slog.Warn("mesh presence update failed", "error", err)
 		}
+		b.flushThreadReplies(ctx)
 		select {
 		case <-ctx.Done():
 			return

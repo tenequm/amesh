@@ -37,6 +37,7 @@ type Registration struct {
 }
 
 type Member struct {
+	ThreadID     string       `json:"threadId,omitempty"`
 	Registration Registration `json:"registration,omitzero"`
 	ConfigDir    string       `json:"configDir,omitempty"`
 	Key          string       `json:"key"`

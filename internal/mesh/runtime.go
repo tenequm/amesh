@@ -15,6 +15,7 @@ import (
 
 	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/envelope"
+	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/state"
 	"github.com/tenequm/amesh/internal/version"
 )
@@ -28,6 +29,9 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	}
 	if err := envelope.SelfCheck(); err != nil {
 		return nil, errors.Join(fmt.Errorf("native envelope startup check: %w", err), store.Close())
+	}
+	if err := os.Mkdir(socketDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) { // #nosec G703 -- socketDir comes from daemon startup configuration.
+		return nil, errors.Join(err, store.Close())
 	}
 	info, err := os.Lstat(socketDir) // #nosec G703 -- the daemon supplies its native socket directory before accepting requests.
 	if err != nil {
@@ -62,6 +66,9 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	ctx, cancel := context.WithCancel(parent)
 	b.ctx = ctx
 	var workers sync.WaitGroup
+	if watcher, ok := b.threads.(interface{ Watch(context.Context) }); ok {
+		workers.Go(func() { watcher.Watch(ctx) })
+	}
 	pendingByLog := store.PendingRewrites()
 	b.resumeRewrites = func(log string) {
 		pending := pendingByLog[log]
@@ -78,6 +85,10 @@ func (b *Backend) Start(parent context.Context, store *state.Store, socketDir st
 	// Lane rewrites have no hub log and must work offline.
 	b.resumeRewrites("")
 	workers.Go(func() {
+		if _, halt := b.client.Connection(); errors.Is(halt, hub.ErrNoHub) {
+			b.runPresence(ctx)
+			return
+		}
 		_, helloErr := b.client.Hello(ctx, hello)
 		b.connectivity(helloErr)
 		workers.Go(func() { b.runPresence(ctx) })
