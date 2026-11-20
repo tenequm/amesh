@@ -309,7 +309,7 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 	}
 	id := uuid.NewString()
 	req := contract.SendRequest{ID: id, From: contract.SendRequestFrom{Session: key}, Text: args.Message, FromMode: optional(s.FromMode), Origin: contract.SendRequestOriginUnknown}
-	if ep, ok := b.endpoint(value(args.ReplyTo)); ok && slices.Contains(ep.parties, key) {
+	if ep, ok := b.endpoint(value(args.ReplyTo)); ok && slices.Contains(ep.parties, key) && matches(to, ep.ref.Peer) {
 		req.To = contract.SendRequestTo{Endpoint: &ep.ref.ID}
 		res, err := b.client.SendReply(ctx, req, ep.ref)
 		return b.sendResult(id, ep.ref.Peer, res, err, nil), nil

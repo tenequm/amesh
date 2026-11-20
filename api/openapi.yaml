@@ -1452,8 +1452,9 @@ components:
         (amesh: <name> cannot see what you write here. To answer, call send_message with to="<address>".)
         A sender with no assigned address gets the native line, SendMessage with the frame's exact
         from address. send_message with reply_to is sent to that endpoint exactly as a native reply
-        on its relay socket would be; an unknown reply_to is ignored and the message goes to the
-        address. Lane and notice rules follow contract.md section 15.
+        on its relay socket would be, when this session is a party to it and `to` names its peer;
+        any other reply_to is ignored and the message goes to the address. Lane and notice rules
+        follow contract.md section 15.
       x-amesh-native: true
       externalDocs: {description: 's-native.md: exact frame and envelope formats', url: './s-native.md#exact-frame-and-envelope-formats-that-worked'}
       type: object
