@@ -57,35 +57,25 @@ func TestUpgradeArgumentsAndRefusals(t *testing.T) {
 	if w.Code != 403 {
 		t.Fatal(w.Code)
 	}
-	if !(registry.Session{CWD: "/tmp/amesh-identity/sub"}).MeshExcluded(nil, []string{"/tmp/amesh-identity"}) || (registry.Session{CWD: "/tmp/amesh-identity-other"}).MeshExcluded(nil, []string{"/tmp/amesh-identity"}) {
+	if !(registry.Session{CWD: "/tmp/amesh-identity/sub"}).MeshExcluded([]string{"/tmp/amesh-identity"}) || (registry.Session{CWD: "/tmp/amesh-identity-other"}).MeshExcluded([]string{"/tmp/amesh-identity"}) {
 		t.Fatal("directory boundary")
 	}
 	dir, key := liveEntry(t)
-	for _, tc := range []struct {
-		name        string
-		dirs, roots []string
-	}{
-		{"secondary seat", []string{filepath.Join(dir, "primary"), dir}, nil},
-		{"excluded cwd", []string{dir}, []string{dir}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var logs bytes.Buffer
-			prior := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-			defer slog.SetDefault(prior)
-			d.cfg.ClaudeConfigDirs, d.cfg.ExcludeRoots = tc.dirs, tc.roots
-			d.registry = registry.New(tc.dirs)
-			r := request(t, "")
-			w := httptest.NewRecorder()
-			d.upgrade(w, r.WithContext(context.WithValue(r.Context(), peerPID{}, key.PID)))
-			var refusal contract.LocalError
-			if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != http.StatusForbidden || refusal.Error != "excluded" {
-				t.Fatal(w.Code, refusal, err)
-			}
-			if got := logs.String(); strings.Count(got, "pipe upgrade refused") != 1 || !strings.Contains(got, "cause=excluded") || !strings.Contains(got, "root="+dir) || !strings.Contains(got, fmt.Sprintf("pid=%d", key.PID)) {
-				t.Fatal(got)
-			}
-		})
+	var logs bytes.Buffer
+	prior := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(prior)
+	d.cfg.ExcludeRoots = []string{dir}
+	d.registry = registry.New([]string{dir})
+	r := request(t, "")
+	w = httptest.NewRecorder()
+	d.upgrade(w, r.WithContext(context.WithValue(r.Context(), peerPID{}, key.PID)))
+	var refusal contract.LocalError
+	if err := json.Unmarshal(w.Body.Bytes(), &refusal); err != nil || w.Code != http.StatusForbidden || refusal.Error != "excluded" {
+		t.Fatal(w.Code, refusal, err)
+	}
+	if got := logs.String(); strings.Count(got, "pipe upgrade refused") != 1 || !strings.Contains(got, "cause=excluded") || !strings.Contains(got, "root="+dir) || !strings.Contains(got, fmt.Sprintf("pid=%d", key.PID)) {
+		t.Fatal(got)
 	}
 }
 
@@ -353,13 +343,14 @@ func (b humanBackend) HumanTurn(_ context.Context, s registry.Session) error {
 
 func TestHookGuardAndHumanTurns(t *testing.T) {
 	dir, key := liveEntry(t)
-	sessions := registry.New([]string{dir})
+	dirs := []string{t.TempDir(), dir}
+	sessions := registry.New(dirs)
 	s, err := sessions.Resolve(t.Context(), key.PID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	backend := humanBackend{human: make(chan registry.Session, 1), member: key}
-	d := daemon{ctx: t.Context(), mesh: &backend, ownsRelay: backend.OwnsRelay, registry: sessions}
+	d := daemon{ctx: t.Context(), cfg: config.Config{ClaudeConfigDirs: dirs}, mesh: &backend, ownsRelay: backend.OwnsRelay, registry: sessions}
 	if s.FromMode != "" {
 		t.Fatal("classified before first hook")
 	}
@@ -420,9 +411,9 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	if current, err := sessions.Resolve(t.Context(), key.PID); err != nil || current.FromMode != "prompting" {
 		t.Fatal(current, err)
 	}
-	d.cfg.ClaudeConfigDirs = []string{dir + "/other", dir}
+	d.cfg.ExcludeRoots = []string{dir}
 	call(prompt("hello"), 204)
-	d.cfg.ClaudeConfigDirs = []string{dir}
+	d.cfg.ExcludeRoots = nil
 	backend.member = registry.Key{}
 	d.pipes = map[*registration]struct{}{{key: key, parent: "parent"}: {}}
 	call(prompt("hello"), 204)

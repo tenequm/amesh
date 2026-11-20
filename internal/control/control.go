@@ -155,7 +155,7 @@ func reject(w http.ResponseWriter, status int, code contract.LocalErrorError, me
 }
 
 func (d *daemon) meshExcluded(s registry.Session) bool {
-	return s.MeshExcluded(d.cfg.ClaudeConfigDirs, d.cfg.ExcludeRoots)
+	return s.MeshExcluded(d.cfg.ExcludeRoots)
 }
 
 func mode(r *http.Request) (string, bool, error) {
@@ -242,7 +242,7 @@ func (d *daemon) upgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if parent == "" {
-		if root, excluded := s.MeshExclusionRoot(d.cfg.ClaudeConfigDirs, d.cfg.ExcludeRoots); excluded {
+		if root, excluded := s.MeshExclusionRoot(d.cfg.ExcludeRoots); excluded {
 			err = errors.New("excluded")
 			log = log.With("root", root)
 			reject(w, 403, contract.LocalErrorErrorExcluded, "amesh is turned off for this directory.")
