@@ -27,6 +27,7 @@ type (
 		Log, Session   string
 		AcceptWindow   time.Duration
 		Notice         bool
+		ReplyAddress   string
 		ToLaneChild    bool
 		Message        envelope.Message
 		NotifyWhenIdle bool

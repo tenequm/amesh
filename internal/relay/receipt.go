@@ -209,16 +209,17 @@ func (p *pending) run(written time.Time) {
 }
 
 type rewriteRecord struct {
-	Inbox       string        `json:"inbox"`
-	ToLaneChild bool          `json:"toLaneChild,omitempty"`
-	Content     string        `json:"content"`
-	PID         int           `json:"pid"`
-	UID         uint32        `json:"uid"`
-	Start       string        `json:"procStart"`
-	Rewrites    int           `json:"rewrites"`
-	Accepted    bool          `json:"accepted"`
-	Window      time.Duration `json:"acceptWindow"`
-	Ready       time.Time     `json:"ready"`
+	Inbox        string        `json:"inbox"`
+	ReplyAddress string        `json:"replyAddress,omitempty"`
+	ToLaneChild  bool          `json:"toLaneChild,omitempty"`
+	Content      string        `json:"content"`
+	PID          int           `json:"pid"`
+	UID          uint32        `json:"uid"`
+	Start        string        `json:"procStart"`
+	Rewrites     int           `json:"rewrites"`
+	Accepted     bool          `json:"accepted"`
+	Window       time.Duration `json:"acceptWindow"`
+	Ready        time.Time     `json:"ready"`
 }
 
 func (p *pending) rewrite(count int, accepted bool) (time.Time, error) {
@@ -230,7 +231,7 @@ func (p *pending) rewrite(count int, accepted bool) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, err
 	}
-	record := rewriteRecord{Inbox: p.d.Inbox, ToLaneChild: p.d.ToLaneChild, Content: content, PID: p.peer.PID, UID: p.peer.UID, Window: p.d.AcceptWindow, Start: start, Rewrites: count, Accepted: accepted, Ready: time.Now().Add(duplicateDelay)}
+	record := rewriteRecord{Inbox: p.d.Inbox, ToLaneChild: p.d.ToLaneChild, ReplyAddress: p.d.ReplyAddress, Content: content, PID: p.peer.PID, UID: p.peer.UID, Window: p.d.AcceptWindow, Start: start, Rewrites: count, Accepted: accepted, Ready: time.Now().Add(duplicateDelay)}
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return time.Time{}, err
@@ -260,7 +261,7 @@ func (m *Manager) ResumeRewrites(ctx context.Context, pending map[string]state.E
 				slog.Error("invalid pending rewrite envelope", "id", id)
 				return
 			}
-			d := Delivery{Inbox: record.Inbox, ToLaneChild: record.ToLaneChild, ID: id, Message: msg, Session: entry.Session, Log: entry.Log, AcceptWindow: record.Window, Notice: entry.Kind == "notice"}
+			d := Delivery{Inbox: record.Inbox, ToLaneChild: record.ToLaneChild, ReplyAddress: record.ReplyAddress, ID: id, Message: msg, Session: entry.Session, Log: entry.Log, AcceptWindow: record.Window, Notice: entry.Kind == "notice"}
 			if entry.Session != "" && !hosted(ctx, entry.Session, record.PID, record.Inbox) {
 				return
 			}

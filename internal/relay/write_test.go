@@ -363,6 +363,7 @@ func TestPendingRewriteAcrossRestart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := delivery(inbox, 17)
 		d.Log, d.Session = "log-before", "receiver"
+		d.ReplyAddress = "worker@demo:east"
 		if err := m.store.SetLog(d.Log); err != nil {
 			t.Fatal(err)
 		}

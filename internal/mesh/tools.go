@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"regexp"
 	"slices"
@@ -107,12 +108,54 @@ func haltReason(err error) string {
 	return "amesh on this machine is not connected to the hub: " + reason
 }
 
+func (b *Backend) reachablePeers(ctx context.Context, caller registry.Key, machine string, cached []contract.Peer) []contract.Peer {
+	b.mu.RLock()
+	members := maps.Clone(b.members)
+	b.mu.RUnlock()
+	locals := make(map[string]contract.Peer)
+	for key, m := range members {
+		if !m.hosted || m.address == "" || m.session.Key == caller {
+			continue
+		}
+		s, live, err := b.liveSession(ctx, key)
+		if err != nil || !live {
+			continue
+		}
+		_, qualified, _ := strings.Cut(m.address, "@")
+		project, host, hasHost := strings.Cut(qualified, ":")
+		if !hasHost {
+			host = machine
+		}
+		locals[m.address] = contract.Peer{Address: m.address, Kind: contract.KindSession, Machine: &host, Project: &project, Status: status(s)}
+	}
+	peers := make([]contract.Peer, 0, len(cached)+len(locals))
+	for _, p := range cached {
+		if p.Kind == contract.KindSession && value(p.Machine) == machine {
+			if local, ok := locals[p.Address]; ok {
+				local.LastSeen = p.LastSeen
+				peers = append(peers, local)
+				delete(locals, p.Address)
+			}
+		} else {
+			peers = append(peers, p)
+		}
+	}
+	for _, addr := range slices.Sorted(maps.Keys(locals)) {
+		peers = append(peers, locals[addr])
+	}
+	return peers
+}
+
+func (b *Backend) machineName(conn contract.HelloResponse) string {
+	if conn.Machine.Name != "" {
+		return conn.Machine.Name
+	}
+	return b.cfg.MachineName
+}
+
 func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter string) (mcpserver.Directory, error) {
 	conn, halt := b.client.Connection()
-	machine := conn.Machine.Name
-	if machine == "" {
-		machine = b.cfg.MachineName
-	}
+	machine := b.machineName(conn)
 	m, _ := b.member(sessionKey(s.Key))
 	name := m.address
 	if name == "" {
@@ -120,8 +163,8 @@ func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter stri
 	}
 	out := mcpserver.Directory{You: mcpserver.Identity{Name: name, Project: s.Project, Machine: machine}, Peers: []mcpserver.Peer{}}
 	project, host, _ := strings.Cut(strings.TrimPrefix(filter, "@"), ":")
-	for _, p := range b.directory(ctx) {
-		if p.Kind == contract.KindSession && value(p.Machine) == machine || filter != "" && (value(p.Project) != project || host != "" && value(p.Machine) != host) {
+	for _, p := range b.reachablePeers(ctx, s.Key, machine, b.directory(ctx)) {
+		if filter != "" && (value(p.Project) != project || host != "" && value(p.Machine) != host) {
 			continue
 		}
 		row := mcpserver.Peer{Name: p.Address, Kind: p.Kind, Machine: p.Machine, Project: p.Project, Status: p.Status}
@@ -198,7 +241,15 @@ func (b *Backend) liveSession(ctx context.Context, key string) (registry.Session
 	return s, s.Key == m.session.Key && b.eligible(s), nil
 }
 
-func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target member, message string) (mcpserver.SendResult, error) {
+// An agent address can represent several hub conversations with separate hop counters.
+func sessionReplyAddress(peer string) string {
+	if strings.Contains(peer, ":") && address.MatchString(peer) {
+		return peer
+	}
+	return ""
+}
+
+func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target member, senderAddress, message string) (mcpserver.SendResult, error) {
 	receiver, ok, err := b.liveSession(ctx, sessionKey(target.session.Key))
 	if err != nil {
 		return mcpserver.SendResult{}, err
@@ -207,7 +258,7 @@ func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target memb
 		return refused(target.address+" is not running anymore.", nil), nil
 	}
 	id := uuid.NewString()
-	err = b.relays.Write(ctx, relay.Delivery{ID: id, Inbox: receiver.SocketPath, Message: envelope.Message{From: envelope.Address(s.SocketPath), FromName: s.Name, FromMode: s.FromMode, Body: message}})
+	err = b.relays.Write(ctx, relay.Delivery{ID: id, Inbox: receiver.SocketPath, ReplyAddress: sessionReplyAddress(senderAddress), Message: envelope.Message{From: envelope.Address(s.SocketPath), FromName: s.Name, FromMode: s.FromMode, Body: message}})
 	if err != nil {
 		return refused("The message could not be written to "+target.address+".", nil), nil //nolint:nilerr // MCP delivery refusals are ordinary tool results.
 	}
@@ -241,19 +292,23 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 		return refused("The message is longer than "+limit+". Shorten it or split it.", nil), nil
 	}
 	if target, found := b.localTarget(to); found {
-		return b.sendLocal(ctx, s, target, args.Message)
+		return b.sendLocal(ctx, s, target, m.address, args.Message)
 	}
 	b.mu.RLock()
 	check := b.synchronized
-	var known []string
-	for _, p := range b.peers {
-		if p.Kind != contract.KindSession || value(p.Machine) != conn.Machine.Name {
+	cached := slices.Clone(b.peers)
+	b.mu.RUnlock()
+	machine := b.machineName(conn)
+	knownPeers := func() []string {
+		peers := b.reachablePeers(ctx, s.Key, machine, cached)
+		known := make([]string, 0, len(peers))
+		for _, p := range peers {
 			known = append(known, p.Address)
 		}
+		return known
 	}
-	b.mu.RUnlock()
-	if check && !slices.Contains(known, to) {
-		return refused(fmt.Sprintf("No peer named %q.", to), known), nil
+	if strings.HasSuffix(to, ":"+machine) || check && !slices.ContainsFunc(cached, func(p contract.Peer) bool { return p.Address == to }) {
+		return refused(fmt.Sprintf("No peer named %q.", to), knownPeers()), nil
 	}
 	id := uuid.NewString()
 	req := contract.SendRequest{ID: id, From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &to}, Text: args.Message, FromMode: optional(s.FromMode), Origin: contract.SendRequestOriginUnknown}
@@ -273,7 +328,7 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 		if h, ok := errors.AsType[*hub.HTTPError](err); ok {
 			var options []string
 			if h.Body.Error == contract.ErrorCodeNotFound {
-				options = known
+				options = knownPeers()
 			} else if h.Body.Candidates != nil {
 				options = *h.Body.Candidates
 			}

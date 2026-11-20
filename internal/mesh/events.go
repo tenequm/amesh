@@ -204,7 +204,7 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 	if !ok {
 		return errors.New("message endpoint has no bound relay")
 	}
-	d := relay.Delivery{Inbox: s.SocketPath, ID: msg.ID, Session: key, Log: conn.Log, AcceptWindow: time.Duration(conn.Settings.AcceptWindowMs) * time.Millisecond, Message: envelope.Message{From: ep.from, FromSession: msg.Endpoint.ID, FromName: msg.Endpoint.Name, FromMode: value(msg.FromMode), HopChain: msg.HopChain, Body: msg.Text}}
+	d := relay.Delivery{Inbox: s.SocketPath, ReplyAddress: sessionReplyAddress(msg.Endpoint.Peer), ID: msg.ID, Session: key, Log: conn.Log, AcceptWindow: time.Duration(conn.Settings.AcceptWindowMs) * time.Millisecond, Message: envelope.Message{From: ep.from, FromSession: msg.Endpoint.ID, FromName: msg.Endpoint.Name, FromMode: value(msg.FromMode), HopChain: msg.HopChain, Body: msg.Text}}
 	err = b.relays.Write(ctx, d)
 	if err == nil || ctx.Err() != nil {
 		return err
