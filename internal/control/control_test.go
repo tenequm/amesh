@@ -60,7 +60,7 @@ func TestUpgradeArgumentsAndRefusals(t *testing.T) {
 	if !(registry.Session{CWD: "/tmp/amesh-identity/sub"}).MeshExcluded(nil, []string{"/tmp/amesh-identity"}) || (registry.Session{CWD: "/tmp/amesh-identity-other"}).MeshExcluded(nil, []string{"/tmp/amesh-identity"}) {
 		t.Fatal("directory boundary")
 	}
-	dir, key := liveEntry(t, "2.1.330")
+	dir, key := liveEntry(t)
 	for _, tc := range []struct {
 		name        string
 		dirs, roots []string
@@ -257,6 +257,54 @@ func TestPipeForwardsArgvAndBytes(t *testing.T) {
 	}
 }
 
+func TestPipeCancelWithBlockedStdout(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const socket = "pipe.sock"
+	ln, err := listen(t.Context(), socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	reader, stdout := io.Pipe()
+	defer reader.Close()
+	defer stdout.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Pipe(ctx, socket, nil, strings.NewReader(""), stdout) }()
+
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	in := bufio.NewReader(conn)
+	if _, err := http.ReadRequest(in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: mcp-stdio\r\n\r\nok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.ReadByte(); err != io.EOF {
+		t.Fatalf("expected stdin EOF, got %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Pipe waited for blocked stdout after cancellation")
+	}
+}
+
 func TestPipeStopsOnOutputError(t *testing.T) {
 	for _, tc := range []struct {
 		err, want error
@@ -304,7 +352,7 @@ func (b humanBackend) HumanTurn(_ context.Context, s registry.Session) error {
 }
 
 func TestHookGuardAndHumanTurns(t *testing.T) {
-	dir, key := liveEntry(t, "2.1.330")
+	dir, key := liveEntry(t)
 	sessions := registry.New([]string{dir})
 	s, err := sessions.Resolve(t.Context(), key.PID)
 	if err != nil {
@@ -383,7 +431,7 @@ func TestHookGuardAndHumanTurns(t *testing.T) {
 	call("{}", 400)
 }
 
-func liveEntry(t *testing.T, version string) (string, registry.Key) {
+func liveEntry(t *testing.T) (string, registry.Key) {
 	t.Helper()
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -408,7 +456,7 @@ func liveEntry(t *testing.T, version string) (string, registry.Key) {
 	if err := os.Mkdir(filepath.Join(dir, "sessions"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	entry := map[string]any{"pid": pid, "procStart": start, "sessionId": "id", "name": "amesh-identity", "cwd": dir, "messagingSocketPath": "/tmp/amesh-identity.sock", "peerProtocol": 1, "status": "idle", "version": version}
+	entry := map[string]any{"pid": pid, "procStart": start, "sessionId": "id", "name": "amesh-identity", "cwd": dir, "messagingSocketPath": "/tmp/amesh-identity.sock", "peerProtocol": 1, "status": "idle"}
 	b, _ := json.Marshal(entry)
 	if err := os.WriteFile(filepath.Join(dir, "sessions", strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
 		t.Fatal(err)
@@ -417,19 +465,18 @@ func liveEntry(t *testing.T, version string) (string, registry.Key) {
 }
 
 func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
-	dir, key := liveEntry(t, "2.1.330")
+	dir, key := liveEntry(t)
 	if err := os.Mkdir(filepath.Join(dir, "sessions", strconv.Itoa(os.Getppid())+".json"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	dirs := []string{dir, filepath.Join(dir, "empty")}
-	d := daemon{mesh: humanBackend{member: key}, registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs, MachineName: "mac"}, started: time.Now(), pipes: map[*registration]struct{}{{key: key}: {}, {key: key, parent: "parent"}: {}}}
+	d := daemon{mesh: humanBackend{member: key}, registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs}, started: time.Now(), pipes: map[*registration]struct{}{{key: key}: {}, {key: key, parent: "parent"}: {}}}
 	w := httptest.NewRecorder()
 	d.status(w, request(t, ""))
 	var got struct {
-		Dirs     []contract.DaemonStatusConfigDirsItem `json:"configDirs"`
-		Pipes    []pipeStatus                          `json:"pipes"`
-		Members  []contract.DaemonStatusSessionsItem   `json:"sessions"`
-		Warnings []string                              `json:"warnings"`
+		Dirs    []contract.DaemonStatusConfigDirsItem `json:"configDirs"`
+		Pipes   []pipeStatus                          `json:"pipes"`
+		Members []contract.DaemonStatusSessionsItem   `json:"sessions"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
@@ -438,26 +485,11 @@ func TestStatusShowsSeatsAndConnectedPipes(t *testing.T) {
 		t.Fatal(got)
 	}
 	clear(d.pipes)
-	got.Warnings = nil
 	got.Members = nil
 	w = httptest.NewRecorder()
 	d.status(w, request(t, ""))
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || len(got.Pipes) != 0 || len(got.Members) != 1 || len(got.Warnings) != 1 || !strings.Contains(got.Warnings[0], "2.1.330") {
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || len(got.Pipes) != 0 || len(got.Members) != 1 {
 		t.Fatal(got, err)
-	}
-}
-
-func TestVerifiedNativeVersions(t *testing.T) {
-	for _, version := range []string{"2.1.325", "2.1.328"} {
-		dir, key := liveEntry(t, version)
-		dirs := []string{dir}
-		d := daemon{mesh: humanBackend{member: key}, registry: registry.New(dirs), cfg: config.Config{ClaudeConfigDirs: dirs}}
-		w := httptest.NewRecorder()
-		d.status(w, request(t, ""))
-		var got contract.DaemonStatus
-		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || got.Warnings != nil {
-			t.Errorf("verified %s: warnings %v, error %v", version, got.Warnings, err)
-		}
 	}
 }
 
@@ -493,7 +525,7 @@ func TestTranscriptRequiresMatchingCompleteRow(t *testing.T) {
 }
 
 func TestCandidateWaitsForRowOrSessionEnd(t *testing.T) {
-	dir, key := liveEntry(t, "2.1.330")
+	dir, key := liveEntry(t)
 	r := registry.New([]string{dir})
 	s, err := r.Resolve(t.Context(), key.PID)
 	if err != nil {

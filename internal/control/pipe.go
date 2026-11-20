@@ -147,6 +147,14 @@ func forward(ctx context.Context, conn *bufferedConn, requests chan<- struct{}, 
 	done := make(chan error, 1)
 	go func() { w := outputWriter{dest: out}; _, _ = io.Copy(&w, conn); done <- w.err }()
 	defer conn.Close()
+	waitOutput := func() error {
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return nil
+		}
+	}
 	for {
 		var grant chan<- struct{}
 		if *needInput {
@@ -167,12 +175,13 @@ func forward(ctx context.Context, conn *bufferedConn, requests chan<- struct{}, 
 				if inputErr != nil || writeErr != nil {
 					_ = conn.Close()
 				}
-				return true, errors.Join(ctx.Err(), inputErr, writeErr, mcpserver.IgnorePeerClose(<-done))
+				outputErr := waitOutput()
+				return true, errors.Join(ctx.Err(), inputErr, writeErr, mcpserver.IgnorePeerClose(outputErr))
 			}
 			*needInput = true
 			if writeErr != nil {
 				_ = conn.Close()
-				outputErr := <-done
+				outputErr := waitOutput()
 				return outputErr != nil, errors.Join(ctx.Err(), mcpserver.IgnorePeerClose(outputErr))
 			}
 		}
