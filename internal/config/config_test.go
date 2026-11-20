@@ -38,7 +38,7 @@ func TestDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.StateDir != "/home/test/.local/state/amesh" || c.SocketPath != c.StateDir+"/amesh.sock" ||
-		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude"}) || len(c.ExcludeRoots) != 0 {
+		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude"}) || len(c.ExcludeRoots) != 0 || c.HubURL != "" {
 		t.Fatalf("unexpected paths: %+v", c)
 	}
 }
@@ -48,15 +48,15 @@ func TestEnvironmentAndFlagPrecedence(t *testing.T) {
 	t.Setenv("AMESH_STATE_DIR", "/state")
 	t.Setenv("AMESH_SOCKET_PATH", "/run/custom.sock")
 	t.Setenv("AMESH_MACHINE_NAME", "mac")
-	t.Setenv("AMESH_CLAUDE_CONFIG_DIRS", "~/.claude:~/pjd/.claude-config")
+	t.Setenv("AMESH_CLAUDE_CONFIG_DIRS", "~/.claude:~/work/.claude-config")
 	t.Setenv("AMESH_EXCLUDE", "/one:/two")
 	t.Setenv("AMESH_HUB_URL", "http://localhost:3001/peer/")
-	c, err := flags(t, "-machine-name", "bl").Resolve()
+	c, err := flags(t, "-machine-name", "server").Resolve()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.MachineName != "bl" || c.StateDir != "/state" || c.SocketPath != "/run/custom.sock" || c.HubURL != "http://localhost:3001/peer" ||
-		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude", "/home/test/pjd/.claude-config"}) || !slices.Equal(c.ExcludeRoots, []string{"/one", "/two"}) {
+	if c.MachineName != "server" || c.StateDir != "/state" || c.SocketPath != "/run/custom.sock" || c.HubURL != "http://localhost:3001/peer" ||
+		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude", "/home/test/work/.claude-config"}) || !slices.Equal(c.ExcludeRoots, []string{"/one", "/two"}) {
 		t.Fatalf("unexpected config: %+v", c)
 	}
 }

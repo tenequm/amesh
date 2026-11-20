@@ -145,7 +145,7 @@ func TestReplyTrailerName(t *testing.T) {
 	d = delivery("", 1)
 	d.Message.FromName, d.Message.From = "peer", "uds:/tmp/peer.sock"
 	for _, tc := range []struct{ address, endpoint, call string }{
-		{"stan", "pe_1", `send_message with to="stan" and reply_to="pe_1"`},
+		{"atlas", "pe_1", `send_message with to="atlas" and reply_to="pe_1"`},
 		{"worker@demo:east", "", `send_message with to="worker@demo:east"`},
 		{"", "pe_1", `SendMessage with to="uds:/tmp/peer.sock"`},
 	} {
@@ -335,9 +335,9 @@ func TestNoticeContract(t *testing.T) {
 			}
 			d := Delivery{Inbox: inbox, Log: "log", Session: "ignored", Message: envelope.Message{From: ex.Envelope.From, FromMode: ex.Envelope.Mode, FromName: ex.Envelope.Name, FromSession: ex.Envelope.Session}}
 			n := NoticeSource{vector.Value.MachineID, vector.Value.Log, ex.Source.Source, ex.Source.Kind}
-			cause, peer, detail := "limit", "stan", "This conversation with stan has had 20 messages without the owner taking part, so it is paused until the owner writes in it."
+			cause, peer, detail := "limit", "atlas", "This conversation with atlas has had 20 messages without the owner taking part, so it is paused until the owner writes in it."
 			if n.Kind == "outbox" {
-				cause, peer, detail = "start_refused", "notes@db-work:air", "notes@db-work:air is offline and already has 100 messages waiting."
+				cause, peer, detail = "start_refused", "notes@docs:air", "notes@docs:air is offline and already has 100 messages waiting."
 			}
 			if err = m.WriteNotice(t.Context(), d, n, cause, peer, detail); err != nil {
 				t.Fatal(err)

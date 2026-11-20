@@ -84,7 +84,7 @@ func fixture(t *testing.T, routes map[string]http.HandlerFunc) (*Backend, *testR
 }
 
 func testSession() registry.Session {
-	return registry.Session{PID: os.Getpid(), ProcStart: "amesh-mesh", SessionID: "one", Name: "review", Project: "pond", Status: "idle"}
+	return registry.Session{PID: os.Getpid(), ProcStart: "amesh-mesh", SessionID: "one", Name: "review", Project: "webapp", Status: "idle"}
 }
 
 func TestMembership(t *testing.T) {
@@ -97,7 +97,7 @@ func TestMembership(t *testing.T) {
 		var req contract.SessionRegisterRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		record("register " + req.Name)
-		_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+		_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@webapp:mac"}})
 	}
 	b, r := fixture(t, map[string]http.HandlerFunc{
 		"PUT /peer/sessions/{key}": registered,
@@ -176,7 +176,7 @@ func TestDirectoryAndSend(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(res)
 		},
 	})
-	b.members[key] = member{session: s, hosted: true, address: "review@pond:mac"}
+	b.members[key] = member{session: s, hosted: true, address: "review@webapp:mac"}
 	local := s
 	local.PID++
 	local.Name, local.Project = "helper", "demo"
@@ -192,7 +192,7 @@ func TestDirectoryAndSend(t *testing.T) {
 		t.Fatalf("directory %#v", dir)
 	}
 	b.synchronized = true
-	for _, tc := range []struct{ to, text, example string }{{"stna", "hi", "mcpSendRefusedNotFound"}, {"stan", strings.Repeat("a", 32769), "mcpSendRefusedTooLarge"}} {
+	for _, tc := range []struct{ to, text, example string }{{"atlsa", "hi", "mcpSendRefusedNotFound"}, {"atlas", strings.Repeat("a", 32769), "mcpSendRefusedTooLarge"}} {
 		got, e := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: tc.to, Message: tc.text})
 		var expected mcpserver.SendResult
 		_ = json.Unmarshal(hubtest.Example(t, tc.example), &expected)
@@ -204,7 +204,7 @@ func TestDirectoryAndSend(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- b.client.Drain(ctx, b.reregister, b.completed) }()
 	defer func() { cancel(); <-done }()
-	got, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "stan", Message: "hello"})
+	got, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "atlas", Message: "hello"})
 	var expected mcpserver.SendResult
 	_ = json.Unmarshal(hubtest.Example(t, "mcpSendAccepted"), &expected)
 	expected.ID = got.ID
@@ -287,11 +287,11 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	target.Name = "review"
 	target.SocketPath = inbox
 	*r = append(*r, sender, target)
-	b.members[sessionKey(sender.Key)] = member{session: sender, hosted: true, address: "review@pond:mac"}
-	b.members[sessionKey(target.Key)] = member{session: target, hosted: true, address: "review-2@pond:mac"}
+	b.members[sessionKey(sender.Key)] = member{session: sender, hosted: true, address: "review@webapp:mac"}
+	b.members[sessionKey(target.Key)] = member{session: target, hosted: true, address: "review-2@webapp:mac"}
 	body := strings.Repeat("x", 32*1024)
-	got, err := b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond", Message: body})
-	if err != nil || !got.Accepted || value(got.To) != "review-2@pond:mac" {
+	got, err := b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@webapp", Message: body})
+	if err != nil || !got.Accepted || value(got.To) != "review-2@webapp:mac" {
 		t.Fatalf("%#v %v", got, err)
 	}
 	var frame contract.NativeUserFrame
@@ -299,7 +299,7 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg, err := envelope.Parse(frame.Message.Content)
-	wantBody := body + "\n\n" + `(amesh: review cannot see what you write here. To answer, call send_message with to="review@pond:mac".)`
+	wantBody := body + "\n\n" + `(amesh: review cannot see what you write here. To answer, call send_message with to="review@webapp:mac".)`
 	if err != nil || msg.Body != wantBody || msg.From != envelope.Address(sender.SocketPath) || msg.FromName != sender.Name || msg.FromMode != sender.FromMode || value(frame.From) != msg.From || frame.MsgID != value(got.ID) {
 		t.Fatal("wrong local native frame")
 	}
@@ -311,7 +311,7 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 		t.Fatal(err)
 	}
 	answer, err := envelope.Parse(frame.Message.Content)
-	if err != nil || answer.From != envelope.Address(target.SocketPath) || answer.Body != "answer\n\n"+`(amesh: review cannot see what you write here. To answer, call send_message with to="review-2@pond:mac".)` {
+	if err != nil || answer.From != envelope.Address(target.SocketPath) || answer.Body != "answer\n\n"+`(amesh: review cannot see what you write here. To answer, call send_message with to="review-2@webapp:mac".)` {
 		t.Fatalf("wrong local reply: %#v %v", answer, err)
 	}
 	if n, e := b.client.Pending(""); e != nil || n != 0 {
@@ -326,7 +326,7 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	results := make(chan bool, 2)
 	for range 2 {
 		go func() {
-			res, sendErr := b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "racing"})
+			res, sendErr := b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@webapp:mac", Message: "racing"})
 			results <- sendErr == nil && res.Accepted
 		}()
 	}
@@ -334,18 +334,18 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 		t.Fatal("concurrent sends at the last hop were not limited to one")
 	}
 	<-replies
-	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "over the limit"}); err != nil || got.Accepted || !strings.Contains(value(got.Reason), "A human turn resets the limit.") {
+	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@webapp:mac", Message: "over the limit"}); err != nil || got.Accepted || !strings.Contains(value(got.Reason), "A human turn resets the limit.") {
 		t.Fatalf("local hop limit: %#v %v", got, err)
 	}
 	if err = b.HumanTurn(t.Context(), sender); err != nil {
 		t.Fatal(err)
 	}
-	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "after a human turn"}); err != nil || !got.Accepted {
+	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@webapp:mac", Message: "after a human turn"}); err != nil || !got.Accepted {
 		t.Fatalf("human turn did not reset the local hop count: %#v %v", got, err)
 	}
 	<-replies
 	*r = (*r)[:1]
-	got, err = b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond:mac", Message: "after exit"})
+	got, err = b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@webapp:mac", Message: "after exit"})
 	if err != nil || got.Accepted {
 		t.Fatal("delivered to a former member")
 	}
@@ -376,7 +376,7 @@ func TestHumanTurnReregistersOnce(t *testing.T) {
 		},
 		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
 			calls = append(calls, "register")
-			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@webapp:mac"}})
 		},
 	})
 	*r = append(*r, s)
@@ -494,7 +494,7 @@ func TestUnknownSessionSendKeepsID(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(res)
 		},
 		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
-			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@webapp:mac"}})
 		},
 	})
 	*sessions = append(*sessions, s)
@@ -505,7 +505,7 @@ func TestUnknownSessionSendKeepsID(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- b.client.Drain(ctx, b.reregister, b.completed) }()
 	defer func() { cancel(); <-done }()
-	got, err := b.SendMessage(ctx, s, mcpserver.SendArgs{To: "stan", Message: "retry this id"})
+	got, err := b.SendMessage(ctx, s, mcpserver.SendArgs{To: "atlas", Message: "retry this id"})
 	if err != nil || !got.Accepted || !slices.Equal(ids, []string{value(got.ID), value(got.ID)}) {
 		t.Fatalf("retry: %#v %v", got, err)
 	}
@@ -529,10 +529,10 @@ func TestQueuedSendWaitAndDirectoryReplacement(t *testing.T) {
 		}
 		defer b.store.Close()
 		s := testSession()
-		b.members[sessionKey(s.Key)] = member{session: s, hosted: true, address: "review@pond:mac"}
+		b.members[sessionKey(s.Key)] = member{session: s, hosted: true, address: "review@webapp:mac"}
 		b.peers = []contract.Peer{{Address: "gone", Kind: "agent"}}
 		r := streamRun{b: b}
-		item := contract.EventStreamItem{Event: "status", Data: `{"kind":"status","listed":true,"peer":{"address":"stan","kind":"agent","status":"idle"}}`}
+		item := contract.EventStreamItem{Event: "status", Data: `{"kind":"status","listed":true,"peer":{"address":"atlas","kind":"agent","status":"idle"}}`}
 		if err := r.handle(t.Context(), item); err != nil {
 			t.Fatal(err)
 		}
@@ -543,18 +543,18 @@ func TestQueuedSendWaitAndDirectoryReplacement(t *testing.T) {
 		if err = r.handle(t.Context(), contract.EventStreamItem{Event: "synchronized", Data: `{"kind":"synchronized","seq":0}`}); err != nil {
 			t.Fatal(err)
 		}
-		if len(b.peers) != 1 || b.peers[0].Address != "stan" {
+		if len(b.peers) != 1 || b.peers[0].Address != "atlas" {
 			t.Fatal("stale directory entry survived synchronization")
 		}
-		for _, addr := range []string{"absent", "other@pond"} {
-			b.peers = append(b.peers, contract.Peer{Address: "other@pond:bl", Kind: "session"})
+		for _, addr := range []string{"absent", "other@webapp"} {
+			b.peers = append(b.peers, contract.Peer{Address: "other@webapp:server", Kind: "session"})
 			miss, e := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: addr, Message: "after sync"})
 			if e != nil || miss.Accepted {
 				t.Fatal("post-sync cache miss accepted", addr, e)
 			}
 		}
 		start := time.Now()
-		result, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "__STAN..", Message: "durably queued"})
+		result, err := b.SendMessage(t.Context(), s, mcpserver.SendArgs{To: "__ATLAS..", Message: "durably queued"})
 		var want mcpserver.SendResult
 		_ = json.Unmarshal(hubtest.Example(t, "mcpSendAcceptedHubDown"), &want)
 		want.ID = result.ID
@@ -637,7 +637,7 @@ func TestPresenceChangesAndStatus(t *testing.T) {
 				t.Error(err)
 			}
 			registrations = append(registrations, req)
-			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: r.PathValue("key"), Address: "review-2@pond:mac"}})
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: r.PathValue("key"), Address: "review-2@webapp:mac"}})
 		},
 		"POST /peer/heartbeat": func(w http.ResponseWriter, r *http.Request) {
 			var req contract.HeartbeatRequest
@@ -686,7 +686,7 @@ func TestPresenceChangesAndStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	var status contract.DaemonStatus
-	if err := b.Status(&status); err != nil || len(status.Sessions) != 1 || status.Sessions[0].Address != "review-2@pond:mac" || status.Sessions[0].Status != "busy" || status.Open.Count != 1 || status.Machine.ID != conn.Machine.ID {
+	if err := b.Status(&status); err != nil || len(status.Sessions) != 1 || status.Sessions[0].Address != "review-2@webapp:mac" || status.Sessions[0].Status != "busy" || status.Open.Count != 1 || status.Machine.ID != conn.Machine.ID {
 		t.Fatal(status, err)
 	}
 }

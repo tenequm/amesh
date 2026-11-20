@@ -1,0 +1,79 @@
+# Betterleaks 1.10 config (https://github.com/betterleaks/betterleaks): the built-in secret rules
+# plus rules for private data that does not belong in a public repository. Run through `just leaks`.
+# The rules match classes of values, never a real value: a list of the values to keep out would
+# publish them. Literal rules for one deployment go in a private config that `just leaks` also
+# runs when it exists (BETTERLEAKS_PRIVATE_CONFIG, default ~/.config/betterleaks/private.toml).
+title = "amesh"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "home-directory"
+description = "A real user's home directory. Use /Users/me or /home/me."
+regex = '''(?:/Users/|/home/)([A-Za-z][A-Za-z0-9._-]*)'''
+secretGroup = 1
+keywords = ["/users/", "/home/"]
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''^(?:me|you|user|username|test|tester|example|runner|alice|bob|linuxbrew|Shared)$''']
+
+[[rules]]
+id = "claude-project-directory"
+description = "A Claude Code project directory named after a real home directory. Use -Users-me-..."
+regex = '''-(?:Users|home)-([A-Za-z][A-Za-z0-9._]*)-'''
+secretGroup = 1
+keywords = ["-users-", "-home-"]
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''^(?:me|you|user|test|example|runner)$''']
+
+[[rules]]
+id = "tailnet-hostname"
+description = "A Tailscale MagicDNS name, which names a private tailnet."
+regex = '''\b[a-z0-9][a-z0-9-]*\.ts\.net\b'''
+keywords = [".ts.net"]
+
+[[rules]]
+id = "tailnet-address"
+description = "An address in Tailscale's 100.64.0.0/10 range."
+regex = '''\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b'''
+keywords = ["100."]
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''^100\.64\.0\.0$''']
+
+[[rules]]
+id = "email-address"
+description = "An email address outside the reserved example domains."
+regex = '''\b[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b'''
+secretGroup = 1
+keywords = ["@"]
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''^(?:[a-z0-9-]+\.)*(?:example\.(?:com|org|net)|invalid|test|localhost|users\.noreply\.github\.com)$''', '''^github\.com$''']
+
+[[rules]]
+id = "telegram-chat-id"
+description = "A Telegram user or chat id."
+regex = '''\b(?:telegram|tg):-?[0-9]{5,}\b'''
+keywords = ["telegram:", "tg:"]
+
+# The config test feeds a made-up credential URL to prove it is rejected without being echoed.
+[[allowlists]]
+description = "Fake hub URL credentials in the config test"
+targetRules = ["generic-credential-uri"]
+condition = "AND"
+paths = ['''^internal/config/config_test\.go$''']
+regexTarget = "match"
+regexes = ['''user:sample@example\.invalid''']
+
+# The contract's throwaway P-256 test key, published on purpose so anyone can check the signature
+# vectors. It signs nothing real.
+[[allowlists]]
+description = "Contract test key"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''^api/openapi\.yaml$''']
+regexTarget = "match"
+regexes = ['''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcHxq9X9L26iCQrkR''']

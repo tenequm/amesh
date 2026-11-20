@@ -250,13 +250,13 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 	_ = json.Unmarshal(hubtest.Example(t, "eventMessage"), &msg)
 	msg.Session = key
 	msg.ExpiresAt = time.Now().Add(time.Hour).UnixMilli()
-	end := contract.EndpointEvent{Kind: "endpoint", ID: msg.Endpoint.ID, Name: msg.Endpoint.Name, State: "open", Sessions: []string{key}, Peer: contract.EndpointEventPeer{Address: "stan", Kind: "agent"}}
+	end := contract.EndpointEvent{Kind: "endpoint", ID: msg.Endpoint.ID, Name: msg.Endpoint.Name, State: "open", Sessions: []string{key}, Peer: contract.EndpointEventPeer{Address: "atlas", Kind: "agent"}}
 	endpointData, _ := json.Marshal(end)
 	messageData, _ := json.Marshal(msg)
 	b, _ := fixture(t, map[string]http.HandlerFunc{
 		"POST /peer/heartbeat": func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{}") },
 		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
-			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@webapp:mac"}})
 		},
 		"GET /peer/events": func(w http.ResponseWriter, r *http.Request) {
 			if after, e := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64); e != nil || after >= msg.Seq {
@@ -444,7 +444,7 @@ func TestSendMessageReplyStaysInConversation(t *testing.T) {
 	*r = testRegistry{s}
 	b.members[key] = member{session: s, hosted: true, address: "review@demo:mac"}
 	b.synchronized = true
-	b.peers = []contract.Peer{{Address: peer, Kind: contract.KindSession, Machine: new("east")}, {Address: "stan", Kind: contract.KindAgent}}
+	b.peers = []contract.Peer{{Address: peer, Kind: contract.KindSession, Machine: new("east")}, {Address: "atlas", Kind: contract.KindAgent}}
 	conn, _ := b.client.Connection()
 	if err = b.prepareLog(t.Context(), conn); err != nil {
 		t.Fatal(err)
@@ -479,8 +479,8 @@ func TestSendMessageReplyStaysInConversation(t *testing.T) {
 	if req := <-sent; err != nil || !res.Accepted || value(req.To.Address) != peer || req.To.Endpoint != nil {
 		t.Fatalf("unknown reply_to did not fall back to the address: %#v %#v %v", res, req, err)
 	}
-	res, err = b.SendMessage(ctx, s, mcpserver.SendArgs{To: "stan", Message: "elsewhere", ReplyTo: new("pe_worker")})
-	if req := <-sent; err != nil || !res.Accepted || value(req.To.Address) != "stan" || req.To.Endpoint != nil {
+	res, err = b.SendMessage(ctx, s, mcpserver.SendArgs{To: "atlas", Message: "elsewhere", ReplyTo: new("pe_worker")})
+	if req := <-sent; err != nil || !res.Accepted || value(req.To.Address) != "atlas" || req.To.Endpoint != nil {
 		t.Fatalf("reply_to for another peer redirected the message: %#v %#v %v", res, req, err)
 	}
 }
@@ -581,7 +581,7 @@ func TestRelayReplyReceiptAndNotice(t *testing.T) {
 		t.Fatal("duplicate notice")
 	default:
 	}
-	addr := "stan"
+	addr := "atlas"
 	req := contract.SendRequest{ID: msg.ID, From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &addr}}
 	if err = b.completed(hub.SendOutcome{NoticeRequired: true, Request: req, Err: &hub.HTTPError{Body: contract.ErrorBody{Error: "log_replaced"}}}); err != nil {
 		t.Fatal(err)
@@ -613,7 +613,7 @@ func TestOfflineRestartWritesExpiryNotice(t *testing.T) {
 	if err = b.prepareLog(t.Context(), conn); err != nil {
 		t.Fatal(err)
 	}
-	to := "stan"
+	to := "atlas"
 	req := contract.SendRequest{ID: "c8ce54bb-1dc0-4aa0-9d60-f131492a685e", From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &to}, Text: "queued"}
 	// Use virtual time for the full TTL. The fake inbox lives outside the bubble.
 	synctest.Test(t, func(t *testing.T) {
@@ -675,7 +675,7 @@ func TestDeferredRefusalSurvivesFailedNoticeWrite(t *testing.T) {
 			if _, err := b.Connect(t.Context(), s); err != nil {
 				t.Fatal(err)
 			}
-			ep := contract.EndpointRef{ID: "pe_amesha2example", Peer: "stan", Name: "stan"}
+			ep := contract.EndpointRef{ID: "pe_amesha2example", Peer: "atlas", Name: "atlas"}
 			req := contract.SendRequest{ID: "54ad69a0-b410-4a59-9fb1-90ff72440102", From: contract.SendRequestFrom{Session: sessionKey(s.Key)}, Text: "test", Origin: contract.SendRequestOriginUnknown}
 			if tc.reply {
 				req.To.Endpoint = &ep.ID
@@ -739,7 +739,7 @@ func TestDeferredRefusalSurvivesFailedNoticeWrite(t *testing.T) {
 			} else if f.From != nil || note.From != "" {
 				t.Fatal("unexpected start relay")
 			}
-			if err != nil || note.Body != "amesh notice: your "+word+" to stan was not delivered: refusal detail No reply needed." || note.FromMode != "bypass" {
+			if err != nil || note.Body != "amesh notice: your "+word+" to atlas was not delivered: refusal detail No reply needed." || note.FromMode != "bypass" {
 				t.Fatal("wrong refusal notice", err)
 			}
 			if f.MsgID != (relay.NoticeSource{MachineID: conn.Machine.ID, Log: conn.Log, Source: req.ID, Kind: "outbox"}).ID() {
@@ -801,7 +801,7 @@ func TestStartupRewriteWaitsForHubLog(t *testing.T) {
 	helloFinished := make(chan struct{})
 	var hellos atomic.Int32
 	reports := make(chan contract.StateReport, 2)
-	ep := contract.EndpointEvent{Kind: "endpoint", ID: "pe_test", Name: "stan", Sessions: []string{key}, State: contract.EndpointEventStateOpen, Peer: contract.EndpointEventPeer{Address: "stan", Kind: contract.KindAgent}}
+	ep := contract.EndpointEvent{Kind: "endpoint", ID: "pe_test", Name: "atlas", Sessions: []string{key}, State: contract.EndpointEventStateOpen, Peer: contract.EndpointEventPeer{Address: "atlas", Kind: contract.KindAgent}}
 	b, r := fixture(t, map[string]http.HandlerFunc{
 		"POST /peer/hello": func(w http.ResponseWriter, r *http.Request) {
 			if hellos.Add(1) == 2 {
@@ -827,7 +827,7 @@ func TestStartupRewriteWaitsForHubLog(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(contract.ReportsResponse{Results: []contract.ReportsResponseResultsItem{{ID: id}}})
 		},
 		"PUT /peer/sessions/{key}": func(w http.ResponseWriter, _ *http.Request) {
-			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@pond:mac"}})
+			_ = json.NewEncoder(w).Encode(contract.SessionRegisterResponse{Session: contract.SessionInfo{Key: key, Address: "review@webapp:mac"}})
 		},
 		"POST /peer/heartbeat": func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "{}") },
 		"GET /peer/events": func(w http.ResponseWriter, r *http.Request) {
@@ -930,7 +930,7 @@ func TestNotHostedEndWaitsForGoneRecipientsNotice(t *testing.T) {
 			hubtest.Reply(t, "sessionEndResponse")(w, r)
 		},
 	})
-	to := "stan"
+	to := "atlas"
 	req := contract.SendRequest{From: contract.SendRequestFrom{Session: key}, ID: "outgoing", To: contract.SendRequestTo{Address: &to}, Text: "queued"}
 	if _, err := b.client.Send(t.Context(), req); !errors.Is(err, hub.ErrQueued) {
 		t.Fatal(err)

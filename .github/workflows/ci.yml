@@ -41,3 +41,28 @@ jobs:
         with:
           version: v2.15.0
       - run: just fmt-check test
+  leaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: extractions/setup-just@v3
+      - name: Install Betterleaks
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/betterleaks.tar.gz" https://github.com/betterleaks/betterleaks/releases/download/v1.10.1/betterleaks_1.10.1_linux_x64.tar.gz
+          echo "c174b42d7aa60caf58c0c3e555c0e4bed01fe6b0d99a412bce777b5af4ce913e  $RUNNER_TEMP/betterleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/betterleaks.tar.gz" -C "$RUNNER_TEMP" betterleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # The commits this push or pull request adds. BETTERLEAKS_PRIVATE_TOML, when set, adds a private rule set.
+      - name: Scan new commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PRIVATE_TOML: ${{ secrets.BETTERLEAKS_PRIVATE_TOML }}
+        run: |
+          if [[ -n "$PRIVATE_TOML" ]]; then
+            printf '%s\n' "$PRIVATE_TOML" > "$RUNNER_TEMP/private.toml"
+            export BETTERLEAKS_PRIVATE_CONFIG="$RUNNER_TEMP/private.toml"
+          fi
+          if [[ -z "${BASE//0/}" ]] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then BASE=origin/main; fi
+          just leaks "$BASE..HEAD"

@@ -136,10 +136,17 @@ func Enroll(ctx context.Context, cfg config.Config, out io.Writer) error {
 	return err
 }
 
+// The peer signature scheme and its signing-text prefix; hubs that predate them accept only
+// device-auth's HeyDan-Sig pair.
+const (
+	signatureScheme = "Amesh-Sig"
+	signaturePrefix = "AMESH-SIG-V1"
+)
+
 func canonical(method, target, id string, ts int64, nonce string, body []byte) (string, string) {
 	sum := sha256.Sum256(body)
 	bh := hex.EncodeToString(sum[:])
-	return strings.Join([]string{"HEYDAN-SIG-V1", "1", method, target, strconv.FormatInt(ts, 10), nonce, bh, id}, "\n"), bh
+	return strings.Join([]string{signaturePrefix, "1", method, target, strconv.FormatInt(ts, 10), nonce, bh, id}, "\n"), bh
 }
 
 func (id identity) sign(method, target string, ts int64, body []byte) (string, error) {
@@ -152,5 +159,5 @@ func (id identity) sign(method, target string, ts int64, body []byte) (string, e
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("HeyDan-Sig v=1,p=1,d=%s,t=%d,n=%s,bh=%s,s=%s", id.id, ts, nonce, bh, encoding.EncodeToString(sig)), nil
+	return fmt.Sprintf("%s v=1,p=1,d=%s,t=%d,n=%s,bh=%s,s=%s", signatureScheme, id.id, ts, nonce, bh, encoding.EncodeToString(sig)), nil
 }
