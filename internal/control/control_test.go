@@ -257,6 +257,54 @@ func TestPipeForwardsArgvAndBytes(t *testing.T) {
 	}
 }
 
+func TestPipeCancelWithBlockedStdout(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const socket = "pipe.sock"
+	ln, err := listen(t.Context(), socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	reader, stdout := io.Pipe()
+	defer reader.Close()
+	defer stdout.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Pipe(ctx, socket, nil, strings.NewReader(""), stdout) }()
+
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	in := bufio.NewReader(conn)
+	if _, err := http.ReadRequest(in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: mcp-stdio\r\n\r\nok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.ReadByte(); err != io.EOF {
+		t.Fatalf("expected stdin EOF, got %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Pipe waited for blocked stdout after cancellation")
+	}
+}
+
 func TestPipeStopsOnOutputError(t *testing.T) {
 	for _, tc := range []struct {
 		err, want error
