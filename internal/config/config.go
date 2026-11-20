@@ -37,7 +37,7 @@ func Bind(fs *flag.FlagSet) *Flags {
 	bind(&f.stateDir, "state-dir", "AMESH_STATE_DIR", "~/.local/state/amesh", "daemon state directory")
 	bind(&f.socketPath, "socket-path", "AMESH_SOCKET_PATH", "", "Unix socket (default: amesh.sock in state directory)")
 	bind(&f.configDirs, "claude-config-dirs", "AMESH_CLAUDE_CONFIG_DIRS", "~/.claude", "colon-separated Claude config directories")
-	bind(&f.exclude, "exclude", "AMESH_EXCLUDE", "~/pjd", "colon-separated mesh exclusion roots")
+	bind(&f.exclude, "exclude", "AMESH_EXCLUDE", "", "colon-separated mesh exclusion roots (empty for none)")
 	bind(&f.machineName, "machine-name", "AMESH_MACHINE_NAME", "", "enrolled machine name")
 	bind(&f.hubURL, "hub-url", "AMESH_HUB_URL", "https://nanoclaw.opx.one/peer", "hub API base including /peer")
 	return f
@@ -97,8 +97,10 @@ func (f *Flags) Resolve() (Config, error) {
 	if c.ClaudeConfigDirs, err = paths(f.configDirs); err != nil {
 		return Config{}, fmt.Errorf("claude-config-dirs: %w", err)
 	}
-	if c.ExcludeRoots, err = paths(f.exclude); err != nil {
-		return Config{}, fmt.Errorf("exclude: %w", err)
+	if f.exclude != "" {
+		if c.ExcludeRoots, err = paths(f.exclude); err != nil {
+			return Config{}, fmt.Errorf("exclude: %w", err)
+		}
 	}
 	if c.MachineName != "" && !machineName.MatchString(c.MachineName) {
 		return Config{}, errors.New("invalid machine-name")

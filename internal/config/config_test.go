@@ -38,7 +38,7 @@ func TestDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.StateDir != "/home/test/.local/state/amesh" || c.SocketPath != c.StateDir+"/amesh.sock" ||
-		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude"}) || !slices.Equal(c.ExcludeRoots, []string{"/home/test/pjd"}) {
+		!slices.Equal(c.ClaudeConfigDirs, []string{"/home/test/.claude"}) || len(c.ExcludeRoots) != 0 {
 		t.Fatalf("unexpected paths: %+v", c)
 	}
 }
@@ -61,6 +61,29 @@ func TestEnvironmentAndFlagPrecedence(t *testing.T) {
 	}
 }
 
+func TestEmptyExclude(t *testing.T) {
+	cleanEnv(t)
+	for _, tc := range []struct {
+		name string
+		env  string
+		args []string
+	}{
+		{name: "empty environment"},
+		{name: "empty flag overrides environment", env: "/one:/two", args: []string{"--exclude", ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AMESH_EXCLUDE", tc.env)
+			c, err := flags(t, tc.args...).Resolve()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(c.ExcludeRoots) != 0 {
+				t.Fatalf("unexpected exclusion roots: %v", c.ExcludeRoots)
+			}
+		})
+	}
+}
+
 func TestMalformedConfig(t *testing.T) {
 	cleanEnv(t)
 	for name, value := range map[string]string{
@@ -69,7 +92,7 @@ func TestMalformedConfig(t *testing.T) {
 		"AMESH_STATE_DIR":          "relative",
 		"AMESH_SOCKET_PATH":        "relative",
 		"AMESH_CLAUDE_CONFIG_DIRS": "~/one::~/two",
-		"AMESH_EXCLUDE":            "",
+		"AMESH_EXCLUDE":            "/a::/b",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(name, value)

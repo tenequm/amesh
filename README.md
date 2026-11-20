@@ -32,7 +32,7 @@ Flags override environment defaults. Global flags go before the subcommand. Daem
 | `-state-dir` | `AMESH_STATE_DIR` | `~/.local/state/amesh` |
 | `-socket-path` | `AMESH_SOCKET_PATH` | `amesh.sock` in the resolved state directory |
 | `-claude-config-dirs` | `AMESH_CLAUDE_CONFIG_DIRS` | `~/.claude` |
-| `-exclude` | `AMESH_EXCLUDE` | `~/pjd` |
+| `-exclude` | `AMESH_EXCLUDE` | No exclusion roots (empty) |
 | `-machine-name` | `AMESH_MACHINE_NAME` | Empty before enrollment |
 | `-hub-url` | `AMESH_HUB_URL` | [Fleet hub API](https://nanoclaw.opx.one/peer) |
 
