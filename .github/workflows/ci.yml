@@ -4,9 +4,28 @@ on:
     branches: ['**']
   pull_request:
 permissions:
+  actions: read
   contents: read
 jobs:
+  main-tree:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      checked: ${{ steps.tree.outputs.checked }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - id: tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet HEAD^1 HEAD -- go.mod go.sum && bash .github/tested-tree.sh HEAD; then
+            echo 'checked=true' >> "$GITHUB_OUTPUT"
+          fi
   check:
+    needs: main-tree
+    if: ${{ !cancelled() && needs.main-tree.outputs.checked != 'true' }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
