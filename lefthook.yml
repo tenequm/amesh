@@ -11,6 +11,7 @@ pre-merge-commit:
       run: just check
 pre-push:
   commands:
+    # Repeats the race suite CI runs; the test cache limits it to changed packages. Drop it if it grows to minutes.
     test:
       use_stdin: true
       run: |
