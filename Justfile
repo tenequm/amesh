@@ -23,10 +23,25 @@ test:
 
 check: fmt-check lint test
 
+# Scan for secrets and private data: staged changes, or the commits `git log <log-opts>` selects
+leaks log-opts="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    configs=(.betterleaks.toml)
+    private="${BETTERLEAKS_PRIVATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/betterleaks/private.toml}"
+    if [[ -f "$private" ]]; then configs+=("$private"); fi
+    for config in "${configs[@]}"; do
+        if [[ -z "$1" ]]; then
+            betterleaks git --pre-commit --staged --no-banner --redact --config "$config" .
+        else
+            betterleaks git --log-opts "$1" --no-banner --redact --config "$config" .
+        fi
+    done
+
 hooks:
     lefthook install
 
-# Build the fleet archives from a version without its tag prefix
+# Build the release archives from a version without its tag prefix
 release version:
     #!/usr/bin/env bash
     set -euo pipefail

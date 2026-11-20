@@ -30,7 +30,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]] || ! bash .github/tested-tree.sh HEAD; then
             just test
           fi
-      - name: Build and verify fleet archives
+      - name: Build and verify release archives
         run: |
           version="0.$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
           if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag ]]; then
