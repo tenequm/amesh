@@ -491,8 +491,9 @@ type McpListPeersArguments struct {
 	Filter *string `json:"filter,omitempty"`
 }
 type McpSendMessageArguments struct {
-	To      string `json:"to"`
-	Message string `json:"message"`
+	To      string  `json:"to"`
+	Message string  `json:"message"`
+	ReplyTo *string `json:"reply_to,omitempty"`
 }
 type McpSendToParentArguments struct {
 	Message string `json:"message"`

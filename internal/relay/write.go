@@ -217,6 +217,12 @@ func (d Delivery) replyTrailer() string {
 	if d.ToLaneChild {
 		return "(amesh: " + name + " cannot see what you write here. To answer, call send_to_parent.)"
 	}
+	if d.ReplyAddress != "" && d.ReplyTo != "" {
+		return `(amesh: ` + name + ` cannot see what you write here. To answer, call send_message with to="` + d.ReplyAddress + `" and reply_to="` + d.ReplyTo + `".)`
+	}
+	if d.ReplyAddress != "" {
+		return `(amesh: ` + name + ` cannot see what you write here. To answer, call send_message with to="` + d.ReplyAddress + `".)`
+	}
 	return `(amesh: ` + name + ` cannot see what you write here. To answer, call SendMessage with to="` + d.Message.From + `".)`
 }
 

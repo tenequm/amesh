@@ -142,6 +142,18 @@ func TestReplyTrailerName(t *testing.T) {
 			t.Fatalf("trailer for %q: %q", raw, got)
 		}
 	}
+	d = delivery("", 1)
+	d.Message.FromName, d.Message.From = "peer", "uds:/tmp/peer.sock"
+	for _, tc := range []struct{ address, endpoint, call string }{
+		{"stan", "pe_1", `send_message with to="stan" and reply_to="pe_1"`},
+		{"worker@demo:east", "", `send_message with to="worker@demo:east"`},
+		{"", "pe_1", `SendMessage with to="uds:/tmp/peer.sock"`},
+	} {
+		d.ReplyAddress, d.ReplyTo = tc.address, tc.endpoint
+		if got := d.replyTrailer(); got != "(amesh: peer cannot see what you write here. To answer, call "+tc.call+".)" {
+			t.Fatalf("trailer for %+v: %q", tc, got)
+		}
+	}
 }
 
 func TestFailedGateReleasesClaim(t *testing.T) {
@@ -363,6 +375,7 @@ func TestPendingRewriteAcrossRestart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d := delivery(inbox, 17)
 		d.Log, d.Session = "log-before", "receiver"
+		d.ReplyAddress = "worker@demo:east"
 		if err := m.store.SetLog(d.Log); err != nil {
 			t.Fatal(err)
 		}

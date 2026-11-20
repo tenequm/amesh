@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -164,7 +163,7 @@ func TestDirectoryAndSend(t *testing.T) {
 	s := testSession()
 	key := sessionKey(s.Key)
 	recv := make(chan contract.SendRequest, 1)
-	b, _ := fixture(t, map[string]http.HandlerFunc{
+	b, r := fixture(t, map[string]http.HandlerFunc{
 		"GET /peer/peers": hubtest.Reply(t, "peersResponse"),
 		"POST /peer/messages": func(w http.ResponseWriter, r *http.Request) {
 			var req contract.SendRequest
@@ -177,6 +176,11 @@ func TestDirectoryAndSend(t *testing.T) {
 		},
 	})
 	b.members[key] = member{session: s, hosted: true, address: "review@pond:mac"}
+	local := s
+	local.PID++
+	local.Name, local.Project = "helper", "demo"
+	*r = testRegistry{s, local}
+	b.members[sessionKey(local.Key)] = member{session: local, hosted: true, address: "helper@demo:mac"}
 	dir, err := b.ListPeers(t.Context(), s, "")
 	if err != nil {
 		t.Fatal(err)
@@ -212,14 +216,70 @@ func TestDirectoryAndSend(t *testing.T) {
 	}
 }
 
-func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
+func TestDirectoryMergesLiveLocalMembers(t *testing.T) {
 	b, r := fixture(t, map[string]http.HandlerFunc{})
+	caller := testSession()
+	local := caller
+	local.PID++
+	local.Project = "Demo"
+	local.Status = "busy"
+	const localAddress = "worker-2@demo:mac"
+	stale := local
+	stale.PID++
+	unregistered := local
+	unregistered.PID += 2
+	*r = testRegistry{caller, local, unregistered}
+	b.members[sessionKey(caller.Key)] = member{session: caller, hosted: true, address: "worker@demo:mac"}
+	b.members[sessionKey(local.Key)] = member{session: local, hosted: true, address: localAddress}
+	b.members[sessionKey(stale.Key)] = member{session: stale, hosted: true, address: "gone@demo:mac"}
+	b.synchronized = true
+	b.peers = []contract.Peer{
+		{Address: "worker@demo:mac", Kind: "session", Machine: new("mac"), Project: new("demo")},
+		{Address: "gone@demo:mac", Kind: "session", Machine: new("mac"), Project: new("demo")},
+		{Address: "worker@demo:east", Kind: "session", Machine: new("east"), Project: new("demo"), Status: "idle"},
+		{Address: "helper", Kind: "agent", Status: "idle"},
+	}
+	check := func(filter string, names ...string) {
+		t.Helper()
+		dir, err := b.ListPeers(t.Context(), caller, filter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, peer := range dir.Peers {
+			got = append(got, peer.Name)
+			if peer.Name == localAddress && (peer.Kind != "session" || peer.Status != "busy" || value(peer.Project) != "demo" || value(peer.Machine) != "mac") {
+				t.Fatal(peer)
+			}
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, names) {
+			t.Fatalf("filter %q: got %v, want %v", filter, got, names)
+		}
+	}
+	check("", "helper", localAddress, "worker@demo:east")
+	b.peers = append(b.peers, contract.Peer{Address: localAddress, Kind: "session", Project: new("demo"), Machine: new("mac"), Status: "offline"})
+	check("@demo", localAddress, "worker@demo:east")
+	check("@demo:mac", localAddress)
+	check("@demo:east", "worker@demo:east")
+}
+
+func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
+	b, r := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/sessions/{key}/human": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(hubtest.Example(t, "humanTurnResponse"))
+		},
+	})
 	inbox, lines, err := relaytest.Inbox(t)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sender := testSession()
-	sender.SocketPath = filepath.Join(b.cfg.StateDir, "123.sock")
+	replyInbox, replies, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender.SocketPath = replyInbox
 	sender.FromMode = "prompting"
 	target := sender
 	target.PID++
@@ -238,13 +298,40 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg, err := envelope.Parse(frame.Message.Content)
-	wantBody := body + "\n\n" + `(amesh: review cannot see what you write here. To answer, call SendMessage with to="` + envelope.Address(sender.SocketPath) + `".)`
+	wantBody := body + "\n\n" + `(amesh: review cannot see what you write here. To answer, call send_message with to="review@pond:mac".)`
 	if err != nil || msg.Body != wantBody || msg.From != envelope.Address(sender.SocketPath) || msg.FromName != sender.Name || msg.FromMode != sender.FromMode || value(frame.From) != msg.From || frame.MsgID != value(got.ID) {
 		t.Fatal("wrong local native frame")
+	}
+	got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: b.members[sessionKey(sender.Key)].address, Message: "answer"})
+	if err != nil || !got.Accepted {
+		t.Fatalf("reply: %#v %v", got, err)
+	}
+	if err = json.Unmarshal(<-replies, &frame); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := envelope.Parse(frame.Message.Content)
+	if err != nil || answer.From != envelope.Address(target.SocketPath) || answer.Body != "answer\n\n"+`(amesh: review cannot see what you write here. To answer, call send_message with to="review-2@pond:mac".)` {
+		t.Fatalf("wrong local reply: %#v %v", answer, err)
 	}
 	if n, e := b.client.Pending(""); e != nil || n != 0 {
 		t.Fatal("local send entered outbox")
 	}
+	pair := [2]string{sessionKey(sender.Key), sessionKey(target.Key)}
+	slices.Sort(pair[:])
+	if b.localHops[pair] != 2 {
+		t.Fatal("local sends were not counted", b.localHops)
+	}
+	b.localHops[pair] = defaultHopLimit
+	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "over the limit"}); err != nil || got.Accepted || !strings.Contains(value(got.Reason), "A human turn resets the limit.") {
+		t.Fatalf("local hop limit: %#v %v", got, err)
+	}
+	if err = b.HumanTurn(t.Context(), sender); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "after a human turn"}); err != nil || !got.Accepted {
+		t.Fatalf("human turn did not reset the local hop count: %#v %v", got, err)
+	}
+	<-replies
 	*r = (*r)[:1]
 	got, err = b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond:mac", Message: "after exit"})
 	if err != nil || got.Accepted {

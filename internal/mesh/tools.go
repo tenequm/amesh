@@ -1,9 +1,11 @@
 package mesh
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"regexp"
 	"slices"
@@ -21,6 +23,9 @@ import (
 )
 
 const label = "[a-z0-9][a-z0-9._-]{0,39}"
+
+// defaultHopLimit bounds same-machine conversations until the hub has supplied its own limit.
+const defaultHopLimit = 20
 
 var address = regexp.MustCompile("^" + label + "(@" + label + "(:[a-z0-9][a-z0-9-]{0,15})?)?$")
 
@@ -107,12 +112,54 @@ func haltReason(err error) string {
 	return "amesh on this machine is not connected to the hub: " + reason
 }
 
+func (b *Backend) reachablePeers(ctx context.Context, caller registry.Key, machine string, cached []contract.Peer) []contract.Peer {
+	b.mu.RLock()
+	members := maps.Clone(b.members)
+	b.mu.RUnlock()
+	locals := make(map[string]contract.Peer)
+	for key, m := range members {
+		if !m.hosted || m.address == "" || m.session.Key == caller {
+			continue
+		}
+		s, live, err := b.liveSession(ctx, key)
+		if err != nil || !live {
+			continue
+		}
+		_, qualified, _ := strings.Cut(m.address, "@")
+		project, host, hasHost := strings.Cut(qualified, ":")
+		if !hasHost {
+			host = machine
+		}
+		locals[m.address] = contract.Peer{Address: m.address, Kind: contract.KindSession, Machine: &host, Project: &project, Status: status(s)}
+	}
+	peers := make([]contract.Peer, 0, len(cached)+len(locals))
+	for _, p := range cached {
+		if p.Kind == contract.KindSession && value(p.Machine) == machine {
+			if local, ok := locals[p.Address]; ok {
+				local.LastSeen = p.LastSeen
+				peers = append(peers, local)
+				delete(locals, p.Address)
+			}
+		} else {
+			peers = append(peers, p)
+		}
+	}
+	for _, addr := range slices.Sorted(maps.Keys(locals)) {
+		peers = append(peers, locals[addr])
+	}
+	return peers
+}
+
+func (b *Backend) machineName(conn contract.HelloResponse) string {
+	if conn.Machine.Name != "" {
+		return conn.Machine.Name
+	}
+	return b.cfg.MachineName
+}
+
 func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter string) (mcpserver.Directory, error) {
 	conn, halt := b.client.Connection()
-	machine := conn.Machine.Name
-	if machine == "" {
-		machine = b.cfg.MachineName
-	}
+	machine := b.machineName(conn)
 	m, _ := b.member(sessionKey(s.Key))
 	name := m.address
 	if name == "" {
@@ -120,8 +167,8 @@ func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter stri
 	}
 	out := mcpserver.Directory{You: mcpserver.Identity{Name: name, Project: s.Project, Machine: machine}, Peers: []mcpserver.Peer{}}
 	project, host, _ := strings.Cut(strings.TrimPrefix(filter, "@"), ":")
-	for _, p := range b.directory(ctx) {
-		if p.Kind == contract.KindSession && value(p.Machine) == machine || filter != "" && (value(p.Project) != project || host != "" && value(p.Machine) != host) {
+	for _, p := range b.reachablePeers(ctx, s.Key, machine, b.directory(ctx)) {
+		if filter != "" && (value(p.Project) != project || host != "" && value(p.Machine) != host) {
 			continue
 		}
 		row := mcpserver.Peer{Name: p.Address, Kind: p.Kind, Machine: p.Machine, Project: p.Project, Status: p.Status}
@@ -198,7 +245,7 @@ func (b *Backend) liveSession(ctx context.Context, key string) (registry.Session
 	return s, s.Key == m.session.Key && b.eligible(s), nil
 }
 
-func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target member, message string) (mcpserver.SendResult, error) {
+func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target member, senderAddress, message string, hopLimit int64) (mcpserver.SendResult, error) {
 	receiver, ok, err := b.liveSession(ctx, sessionKey(target.session.Key))
 	if err != nil {
 		return mcpserver.SendResult{}, err
@@ -206,11 +253,22 @@ func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target memb
 	if !ok {
 		return refused(target.address+" is not running anymore.", nil), nil
 	}
+	pair := [2]string{sessionKey(s.Key), sessionKey(target.session.Key)}
+	slices.Sort(pair[:])
+	b.mu.RLock()
+	hops := b.localHops[pair]
+	b.mu.RUnlock()
+	if hops >= hopLimit {
+		return refused(fmt.Sprintf("Conversation paused after %d messages. A human turn resets the limit.", hops), nil), nil
+	}
 	id := uuid.NewString()
-	err = b.relays.Write(ctx, relay.Delivery{ID: id, Inbox: receiver.SocketPath, Message: envelope.Message{From: envelope.Address(s.SocketPath), FromName: s.Name, FromMode: s.FromMode, Body: message}})
+	err = b.relays.Write(ctx, relay.Delivery{ID: id, Inbox: receiver.SocketPath, ReplyAddress: senderAddress, Message: envelope.Message{From: envelope.Address(s.SocketPath), FromName: s.Name, FromMode: s.FromMode, Body: message}})
 	if err != nil {
 		return refused("The message could not be written to "+target.address+".", nil), nil //nolint:nilerr // MCP delivery refusals are ordinary tool results.
 	}
+	b.mu.Lock()
+	b.localHops[pair]++
+	b.mu.Unlock()
 	return mcpserver.SendResult{Accepted: true, ID: &id, To: &target.address, Note: new("Sent. A reply, if any, arrives later as a message from " + target.address + ".")}, nil
 }
 
@@ -241,50 +299,64 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 		return refused("The message is longer than "+limit+". Shorten it or split it.", nil), nil
 	}
 	if target, found := b.localTarget(to); found {
-		return b.sendLocal(ctx, s, target, args.Message)
+		return b.sendLocal(ctx, s, target, m.address, args.Message, cmp.Or(conn.Limits.HopLimit, defaultHopLimit))
+	}
+	id := uuid.NewString()
+	req := contract.SendRequest{ID: id, From: contract.SendRequestFrom{Session: key}, Text: args.Message, FromMode: optional(s.FromMode), Origin: contract.SendRequestOriginUnknown}
+	if ep, ok := b.endpoint(value(args.ReplyTo)); ok && slices.Contains(ep.parties, key) {
+		req.To = contract.SendRequestTo{Endpoint: &ep.ref.ID}
+		res, err := b.client.SendReply(ctx, req, ep.ref)
+		return b.sendResult(id, ep.ref.Peer, res, err, nil), nil
 	}
 	b.mu.RLock()
 	check := b.synchronized
-	var known []string
-	for _, p := range b.peers {
-		if p.Kind != contract.KindSession || value(p.Machine) != conn.Machine.Name {
+	cached := slices.Clone(b.peers)
+	b.mu.RUnlock()
+	machine := b.machineName(conn)
+	knownPeers := func() []string {
+		peers := b.reachablePeers(ctx, s.Key, machine, cached)
+		known := make([]string, 0, len(peers))
+		for _, p := range peers {
 			known = append(known, p.Address)
 		}
+		return known
 	}
-	b.mu.RUnlock()
-	if check && !slices.Contains(known, to) {
-		return refused(fmt.Sprintf("No peer named %q.", to), known), nil
+	if strings.HasSuffix(to, ":"+machine) || check && !slices.ContainsFunc(cached, func(p contract.Peer) bool { return p.Address == to }) {
+		return refused(fmt.Sprintf("No peer named %q.", to), knownPeers()), nil
 	}
-	id := uuid.NewString()
-	req := contract.SendRequest{ID: id, From: contract.SendRequestFrom{Session: key}, To: contract.SendRequestTo{Address: &to}, Text: args.Message, FromMode: optional(s.FromMode), Origin: contract.SendRequestOriginUnknown}
+	req.To = contract.SendRequestTo{Address: &to}
 	res, err := b.client.Send(ctx, req)
+	return b.sendResult(id, to, res, err, knownPeers), nil
+}
+
+func (b *Backend) sendResult(id, to string, res contract.SendResponse, err error, knownPeers func() []string) mcpserver.SendResult {
 	out := mcpserver.SendResult{Accepted: true, ID: &id, To: &to}
 	if errors.Is(err, hub.ErrQueued) {
 		out.Note = new("Sent from this machine. It reaches the hub as soon as the connection is back, within 24 hours.")
 		if h, ok := errors.AsType[*hub.HTTPError](err); ok && h.Status == 429 {
 			out.Note = new("Sending is paced. This machine will retry automatically.")
 		}
-		return out, nil
+		return out
 	}
 	if err != nil {
-		if _, halt = b.client.Connection(); halt != nil {
-			return refused(haltReason(halt), nil), nil
+		if _, halt := b.client.Connection(); halt != nil {
+			return refused(haltReason(halt), nil)
 		}
 		if h, ok := errors.AsType[*hub.HTTPError](err); ok {
 			var options []string
-			if h.Body.Error == contract.ErrorCodeNotFound {
-				options = known
+			if h.Body.Error == contract.ErrorCodeNotFound && knownPeers != nil {
+				options = knownPeers()
 			} else if h.Body.Candidates != nil {
 				options = *h.Body.Candidates
 			}
-			return refused(h.Body.Message, options), nil
+			return refused(h.Body.Message, options)
 		}
-		return refused("The message could not be queued on this machine.", nil), nil
+		return refused("The message could not be queued on this machine.", nil)
 	}
 	out.To = &res.Message.To.Address
 	out.Note = new("Sent. A reply, if any, arrives later as a message from " + res.Message.To.Address + ".")
 	if res.Message.To.Status == contract.PeerStatusOffline {
 		out.Note = new(res.Message.To.Address + " is offline. The message waits up to 24 hours and is delivered when it is back.")
 	}
-	return out, nil
+	return out
 }

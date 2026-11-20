@@ -26,6 +26,7 @@ import (
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/hub"
 	"github.com/tenequm/amesh/internal/hub/hubtest"
+	"github.com/tenequm/amesh/internal/mcpserver"
 	"github.com/tenequm/amesh/internal/registry"
 	"github.com/tenequm/amesh/internal/relay"
 	"github.com/tenequm/amesh/internal/relay/relaytest"
@@ -323,7 +324,7 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsed, err := envelope.Parse(frame.Message.Content)
-	wantBody := msg.Text + "\n\n" + fmt.Sprintf(`(amesh: %s cannot see what you write here. To answer, call SendMessage with to="%s".)`, end.Name, value(frame.From))
+	wantBody := msg.Text + "\n\n" + fmt.Sprintf(`(amesh: %s cannot see what you write here. To answer, call send_message with to="%s" and reply_to="%s".)`, end.Name, msg.Endpoint.Peer, end.ID)
 	if err != nil || parsed.FromSession != end.ID || parsed.From != value(frame.From) || parsed.Body != wantBody || frame.MsgID != msg.ID || !slices.Equal(parsed.HopChain, msg.HopChain) {
 		t.Fatal("incorrect inbound native frame")
 	}
@@ -412,6 +413,71 @@ func postNative(t *testing.T, addr string, raw []byte) {
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err = io.Copy(io.Discard, conn); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSendMessageReplyStaysInConversation(t *testing.T) {
+	const peer = "worker@demo:east"
+	s := testSession()
+	key := sessionKey(s.Key)
+	inbox, lines, err := relaytest.Inbox(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SocketPath = inbox
+	sent := make(chan contract.SendRequest, 2)
+	b, r := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/messages": func(w http.ResponseWriter, r *http.Request) {
+			var req contract.SendRequest
+			if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil || req.From.Session != key {
+				t.Error("wrong sender", req, decodeErr)
+			}
+			sent <- req
+			var res contract.SendResponse
+			_ = json.Unmarshal(hubtest.Example(t, "sendResponse"), &res)
+			res.Message.ID = req.ID
+			res.Message.To.Address, res.Message.To.Kind = peer, contract.KindSession
+			res.Message.Endpoint = contract.EndpointRef{ID: "pe_worker", Peer: peer, Name: "worker"}
+			_ = json.NewEncoder(w).Encode(res)
+		},
+	})
+	*r = testRegistry{s}
+	b.members[key] = member{session: s, hosted: true, address: "review@demo:mac"}
+	b.synchronized = true
+	b.peers = []contract.Peer{{Address: peer, Kind: contract.KindSession, Machine: new("east")}}
+	conn, _ := b.client.Connection()
+	if err = b.prepareLog(t.Context(), conn); err != nil {
+		t.Fatal(err)
+	}
+	var msg contract.MessageEvent
+	_ = json.Unmarshal(hubtest.Example(t, "eventMessage"), &msg)
+	msg.Session, msg.ExpiresAt = key, time.Now().Add(time.Hour).UnixMilli()
+	msg.Endpoint = contract.EndpointRef{ID: "pe_worker", Peer: peer, Name: "worker"}
+	if _, err = b.bind(conn, msg.Endpoint, []string{key}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err = b.receive(t.Context(), conn, msg); err != nil {
+		t.Fatal(err)
+	}
+	var frame contract.NativeUserFrame
+	if err = json.Unmarshal(<-lines, &frame); err != nil {
+		t.Fatal(err)
+	}
+	delivery, err := envelope.Parse(frame.Message.Content)
+	if err != nil || delivery.Body != msg.Text+"\n\n"+`(amesh: worker cannot see what you write here. To answer, call send_message with to="worker@demo:east" and reply_to="pe_worker".)` {
+		t.Fatal("wrong reply line", delivery.Body, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- b.client.Drain(ctx, b.reregister, b.completed) }()
+	defer func() { cancel(); <-done }()
+	res, err := b.SendMessage(ctx, s, mcpserver.SendArgs{To: peer, Message: "answer", ReplyTo: new("pe_worker")})
+	if req := <-sent; err != nil || !res.Accepted || value(res.To) != peer || value(req.To.Endpoint) != "pe_worker" || req.To.Address != nil || req.Text != "answer" {
+		t.Fatalf("reply left the conversation: %#v %#v %v", res, req, err)
+	}
+	res, err = b.SendMessage(ctx, s, mcpserver.SendArgs{To: peer, Message: "again", ReplyTo: new("pe_gone")})
+	if req := <-sent; err != nil || !res.Accepted || value(req.To.Address) != peer || req.To.Endpoint != nil {
+		t.Fatalf("unknown reply_to did not fall back to the address: %#v %#v %v", res, req, err)
 	}
 }
 
