@@ -12,4 +12,6 @@ pre-merge-commit:
 pre-push:
   commands:
     test:
-      run: just test
+      use_stdin: true
+      run: |
+        awk 'NF != 4 || $3 !~ /^refs\/tags\// { other = 1 } END { exit (NR == 0 || other) }' || exec just test
