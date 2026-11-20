@@ -324,7 +324,7 @@ func TestCrashBeforeAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsed, err := envelope.Parse(frame.Message.Content)
-	wantBody := msg.Text + "\n\n" + fmt.Sprintf(`(amesh: %s cannot see what you write here. To answer, call SendMessage with to="%s".)`, end.Name, value(frame.From))
+	wantBody := msg.Text + "\n\n" + fmt.Sprintf(`(amesh: %s cannot see what you write here. To answer, call send_message with to="%s" and reply_to="%s".)`, end.Name, msg.Endpoint.Peer, end.ID)
 	if err != nil || parsed.FromSession != end.ID || parsed.From != value(frame.From) || parsed.Body != wantBody || frame.MsgID != msg.ID || !slices.Equal(parsed.HopChain, msg.HopChain) {
 		t.Fatal("incorrect inbound native frame")
 	}
@@ -416,7 +416,7 @@ func postNative(t *testing.T, addr string, raw []byte) {
 	}
 }
 
-func TestRemoteSessionReplyUsesSenderAddress(t *testing.T) {
+func TestSendMessageReplyStaysInConversation(t *testing.T) {
 	const peer = "worker@demo:east"
 	s := testSession()
 	key := sessionKey(s.Key)
@@ -425,12 +425,14 @@ func TestRemoteSessionReplyUsesSenderAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.SocketPath = inbox
+	sent := make(chan contract.SendRequest, 2)
 	b, r := fixture(t, map[string]http.HandlerFunc{
 		"POST /peer/messages": func(w http.ResponseWriter, r *http.Request) {
 			var req contract.SendRequest
-			if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil || req.From.Session != key || value(req.To.Address) != peer || req.To.Endpoint != nil || req.Text != "answer" {
-				t.Error("wrong reply destination or sender", req, decodeErr)
+			if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil || req.From.Session != key {
+				t.Error("wrong sender", req, decodeErr)
 			}
+			sent <- req
 			var res contract.SendResponse
 			_ = json.Unmarshal(hubtest.Example(t, "sendResponse"), &res)
 			res.Message.ID = req.ID
@@ -462,16 +464,20 @@ func TestRemoteSessionReplyUsesSenderAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	delivery, err := envelope.Parse(frame.Message.Content)
-	if err != nil || delivery.Body != msg.Text+"\n\n"+`(amesh: worker cannot see what you write here. To answer, call send_message with to="worker@demo:east".)` {
+	if err != nil || delivery.Body != msg.Text+"\n\n"+`(amesh: worker cannot see what you write here. To answer, call send_message with to="worker@demo:east" and reply_to="pe_worker".)` {
 		t.Fatal("wrong reply line", delivery.Body, err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- b.client.Drain(ctx, b.reregister, b.completed) }()
 	defer func() { cancel(); <-done }()
-	res, err := b.SendMessage(ctx, s, mcpserver.SendArgs{To: peer, Message: "answer"})
-	if err != nil || !res.Accepted || value(res.To) != peer {
-		t.Fatalf("reply: %#v %v", res, err)
+	res, err := b.SendMessage(ctx, s, mcpserver.SendArgs{To: peer, Message: "answer", ReplyTo: new("pe_worker")})
+	if req := <-sent; err != nil || !res.Accepted || value(res.To) != peer || value(req.To.Endpoint) != "pe_worker" || req.To.Address != nil || req.Text != "answer" {
+		t.Fatalf("reply left the conversation: %#v %#v %v", res, req, err)
+	}
+	res, err = b.SendMessage(ctx, s, mcpserver.SendArgs{To: peer, Message: "again", ReplyTo: new("pe_gone")})
+	if req := <-sent; err != nil || !res.Accepted || value(req.To.Address) != peer || req.To.Endpoint != nil {
+		t.Fatalf("unknown reply_to did not fall back to the address: %#v %#v %v", res, req, err)
 	}
 }
 

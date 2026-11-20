@@ -2,6 +2,8 @@ package mesh
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -30,6 +32,7 @@ type Backend struct {
 	store            *state.Store
 	mu               sync.RWMutex
 	members          map[string]member
+	localHops        map[[2]string]int64 // same-machine sends per session pair since either side's last human turn
 	wake             chan struct{}
 	peers            []contract.Peer
 	synchronized     bool
@@ -50,7 +53,7 @@ type sessionRegistry interface {
 var _ mcpserver.MeshBackend = (*Backend)(nil)
 
 func New(cfg config.Config, sessions *registry.Registry, relays *relay.Manager, client *hub.Client) *Backend {
-	return &Backend{endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), wake: make(chan struct{}, 1)}
+	return &Backend{endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), localHops: make(map[[2]string]int64), wake: make(chan struct{}, 1)}
 }
 
 func (b *Backend) HumanTurn(ctx context.Context, s registry.Session) error {
@@ -59,6 +62,9 @@ func (b *Backend) HumanTurn(ctx context.Context, s registry.Session) error {
 	if err != nil || !live || current.SessionID != s.SessionID {
 		return err
 	}
+	b.mu.Lock()
+	maps.DeleteFunc(b.localHops, func(pair [2]string, _ int64) bool { return slices.Contains(pair[:], key) })
+	b.mu.Unlock()
 	req := contract.HumanTurnRequest{At: time.Now().UnixMilli(), Source: "prompt"}
 	_, err = b.client.HumanTurn(ctx, key, req)
 	if unknownSession(err) {

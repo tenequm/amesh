@@ -265,7 +265,11 @@ func TestDirectoryMergesLiveLocalMembers(t *testing.T) {
 }
 
 func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
-	b, r := fixture(t, map[string]http.HandlerFunc{})
+	b, r := fixture(t, map[string]http.HandlerFunc{
+		"POST /peer/sessions/{key}/human": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(hubtest.Example(t, "humanTurnResponse"))
+		},
+	})
 	inbox, lines, err := relaytest.Inbox(t)
 	if err != nil {
 		t.Fatal(err)
@@ -312,6 +316,22 @@ func TestLocalWinsUsesAssignedAddressAndNativeSender(t *testing.T) {
 	if n, e := b.client.Pending(""); e != nil || n != 0 {
 		t.Fatal("local send entered outbox")
 	}
+	pair := [2]string{sessionKey(sender.Key), sessionKey(target.Key)}
+	slices.Sort(pair[:])
+	if b.localHops[pair] != 2 {
+		t.Fatal("local sends were not counted", b.localHops)
+	}
+	b.localHops[pair] = defaultHopLimit
+	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "over the limit"}); err != nil || got.Accepted || !strings.Contains(value(got.Reason), "A human turn resets the limit.") {
+		t.Fatalf("local hop limit: %#v %v", got, err)
+	}
+	if err = b.HumanTurn(t.Context(), sender); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = b.SendMessage(t.Context(), target, mcpserver.SendArgs{To: "review@pond:mac", Message: "after a human turn"}); err != nil || !got.Accepted {
+		t.Fatalf("human turn did not reset the local hop count: %#v %v", got, err)
+	}
+	<-replies
 	*r = (*r)[:1]
 	got, err = b.SendMessage(t.Context(), sender, mcpserver.SendArgs{To: "review-2@pond:mac", Message: "after exit"})
 	if err != nil || got.Accepted {

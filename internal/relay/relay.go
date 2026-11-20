@@ -24,10 +24,12 @@ type (
 	Delivery struct {
 		Inbox, ID string
 		// Hub deliveries carry the log ID and receiving session key for startup reports.
-		Log, Session   string
-		AcceptWindow   time.Duration
-		Notice         bool
+		Log, Session string
+		AcceptWindow time.Duration
+		Notice       bool
+		// ReplyAddress and ReplyTo fill the reply line: the sender's mesh address and, for a hub delivery, its endpoint.
 		ReplyAddress   string
+		ReplyTo        string
 		ToLaneChild    bool
 		Message        envelope.Message
 		NotifyWhenIdle bool
