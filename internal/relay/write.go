@@ -24,7 +24,7 @@ import (
 
 const (
 	lineLimit = 1 << 20
-	retention = 25 * time.Hour
+	Retention = 25 * time.Hour
 	refill    = 2 * time.Second
 	burst     = 30
 	// A repeated body inside the window waits past it, so the inbox does not fold it as a duplicate.
@@ -226,6 +226,17 @@ func (d Delivery) replyTrailer() string {
 	return `(amesh: ` + name + ` cannot see what you write here. To answer, call SendMessage with to="` + d.Message.From + `".)`
 }
 
+func (d Delivery) ThreadText() (string, error) {
+	if !d.Notice {
+		d.Message.Body = "Message " + d.ID + "\n" + d.Message.Body
+	}
+	content, err := envelope.Render(d.Message)
+	if err != nil || d.Notice {
+		return content, err
+	}
+	return content + "\n" + d.replyTrailer(), nil
+}
+
 func (d Delivery) inboxLine(content string) ([]byte, error) {
 	f := frame{Type: "user", Message: &wireMessage{Role: "user", Content: content}, Priority: "next", From: d.Message.From, Version: 1, ID: d.ID}
 	if !d.Notice {
@@ -288,7 +299,7 @@ func (m *Manager) post(ctx context.Context, d Delivery, retry bool, before func(
 				kind = "notice"
 			}
 			var checkErr error
-			claimed, checkErr = m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(retention), kind)
+			claimed, checkErr = m.store.BeginWrite(d.Log, d.ID, d.Session, time.Now().Add(Retention), kind)
 			if checkErr != nil {
 				return checkErr
 			}
@@ -354,7 +365,7 @@ func (m *Manager) NotifyWhenIdle(ctx context.Context, inbox, from, fromMode, id 
 	}
 	defer release()
 	key := "idle:" + id
-	claimed, err := m.store.Claim(key, time.Now().Add(retention))
+	claimed, err := m.store.Claim(key, time.Now().Add(Retention))
 	if err != nil || !claimed {
 		return err
 	}
@@ -378,6 +389,10 @@ func (n NoticeSource) ID() string {
 }
 
 func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSource, cause, peer, detail string) error {
+	return m.DeliverNotice(ctx, d, source, cause, peer, detail, m.Write)
+}
+
+func (m *Manager) DeliverNotice(ctx context.Context, d Delivery, source NoticeSource, cause, peer, detail string, write func(context.Context, Delivery) error) error {
 	if source.MachineID == "" || source.Log == "" || source.Source == "" {
 		return errors.New("missing notice source")
 	}
@@ -414,7 +429,7 @@ func (m *Manager) WriteNotice(ctx context.Context, d Delivery, source NoticeSour
 	d.Message.HopChain = nil
 	d.NotifyWhenIdle = false
 	d.Message.Body = "amesh notice: " + body + " No reply needed."
-	if err := m.Write(ctx, d); err != nil {
+	if err := write(ctx, d); err != nil {
 		return err
 	}
 	if !m.store.NoticeWritten(d.ID) {

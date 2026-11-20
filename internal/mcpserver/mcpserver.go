@@ -8,12 +8,28 @@ import (
 	"net"
 	"syscall"
 
+	"github.com/tenequm/amesh/internal/codex"
 	"github.com/tenequm/amesh/internal/contract"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/tenequm/amesh/internal/registry"
 )
+
+type callMetadata struct{}
+
+type CodexMetadata struct{ Thread, Turn, Trigger, Message, Source string }
+
+func CodexCall(ctx context.Context) CodexMetadata {
+	meta, _ := ctx.Value(callMetadata{}).(mcp.Meta)
+	thread, _ := meta["threadId"].(string)
+	info, _ := meta["x-codex-turn-metadata"].(map[string]any)
+	turn, _ := info["turn_id"].(string)
+	trigger, _ := info["turn_trigger"].(string)
+	message, _ := info[codex.MessageKey].(string)
+	source, _ := info["thread_source"].(string)
+	return CodexMetadata{Thread: thread, Turn: turn, Trigger: trigger, Message: message, Source: source}
+}
 
 type Caller func(context.Context) (registry.Session, error)
 
@@ -206,7 +222,8 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, caller Caller, parent
 			return nil, result, nil
 		})
 	} else {
-		mcp.AddTool(server, &listPeers, func(ctx context.Context, _ *mcp.CallToolRequest, in contract.McpListPeersArguments) (*mcp.CallToolResult, any, error) {
+		mcp.AddTool(server, &listPeers, func(ctx context.Context, req *mcp.CallToolRequest, in contract.McpListPeersArguments) (*mcp.CallToolResult, any, error) {
+			ctx = context.WithValue(ctx, callMetadata{}, req.Params.Meta)
 			s, err := caller(ctx)
 			if err != nil {
 				return nil, nil, err
@@ -221,7 +238,8 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, caller Caller, parent
 			}
 			return nil, result, err
 		})
-		mcp.AddTool(server, &sendMessage, func(ctx context.Context, _ *mcp.CallToolRequest, in SendArgs) (*mcp.CallToolResult, any, error) {
+		mcp.AddTool(server, &sendMessage, func(ctx context.Context, req *mcp.CallToolRequest, in SendArgs) (*mcp.CallToolResult, any, error) {
+			ctx = context.WithValue(ctx, callMetadata{}, req.Params.Meta)
 			s, err := caller(ctx)
 			if err != nil {
 				return nil, SendResult{Reason: new(err.Error()), Known: &[]string{}}, nil

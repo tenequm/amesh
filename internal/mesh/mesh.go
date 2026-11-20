@@ -2,11 +2,13 @@ package mesh
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"sync"
 	"time"
 
+	"github.com/tenequm/amesh/internal/codex"
 	"github.com/tenequm/amesh/internal/config"
 	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/hub"
@@ -17,6 +19,8 @@ import (
 )
 
 type Backend struct {
+	threads          threadDelivery
+	links            map[string]replyLink
 	ctx              context.Context
 	socketDir        string
 	endpointMu       sync.Mutex
@@ -53,11 +57,20 @@ type sessionRegistry interface {
 var _ mcpserver.MeshBackend = (*Backend)(nil)
 
 func New(cfg config.Config, sessions *registry.Registry, relays *relay.Manager, client *hub.Client) *Backend {
-	return &Backend{endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), localHops: make(map[[2]string]int64), wake: make(chan struct{}, 1)}
+	app := codex.New(registry.CodexHome())
+	b := &Backend{threads: app, links: map[string]replyLink{}, endpoints: make(map[string]endpoint), ack: client.Ack, cfg: cfg, sessions: sessions, relays: relays, client: client, members: make(map[string]member), localHops: make(map[[2]string]int64), wake: make(chan struct{}, 1)}
+	if sessions != nil {
+		sessions.CodexStatus = app.Status
+		sessions.CodexComplete = b.completedThread
+	}
+	return b
 }
 
 func (b *Backend) HumanTurn(ctx context.Context, s registry.Session) error {
-	key := sessionKey(s.Key)
+	key := s.MeshKey()
+	if s.Codex && !b.newHumanTurn(key, s.HumanTurn) {
+		return nil
+	}
 	current, live, err := b.liveSession(ctx, key)
 	if err != nil || !live || current.SessionID != s.SessionID {
 		return err
@@ -65,14 +78,34 @@ func (b *Backend) HumanTurn(ctx context.Context, s registry.Session) error {
 	b.mu.Lock()
 	b.forgetLocalHops(key)
 	b.mu.Unlock()
-	req := contract.HumanTurnRequest{At: time.Now().UnixMilli(), Source: "prompt"}
-	_, err = b.client.HumanTurn(ctx, key, req)
-	if unknownSession(err) {
-		if err = b.reregister(ctx, key); err == nil {
-			_, err = b.client.HumanTurn(ctx, key, req)
+	if _, halt := b.client.Connection(); !errors.Is(halt, hub.ErrNoHub) {
+		req := contract.HumanTurnRequest{At: time.Now().UnixMilli(), Source: "prompt"}
+		_, err = b.client.HumanTurn(ctx, key, req)
+		if unknownSession(err) {
+			if err = b.reregister(ctx, key); err == nil {
+				_, err = b.client.HumanTurn(ctx, key, req)
+			}
+		}
+		if err != nil {
+			return err
 		}
 	}
-	return err
+	if s.Codex {
+		b.mu.Lock()
+		if m, ok := b.members[key]; ok && s.HumanTurn > m.humanTurn {
+			m.humanTurn = s.HumanTurn
+			b.members[key] = m
+		}
+		b.mu.Unlock()
+	}
+	return nil
+}
+
+// newHumanTurn compares Codex turn IDs as strings, which orders them because they are UUIDv7.
+func (b *Backend) newHumanTurn(key, turn string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return turn != "" && turn > b.members[key].humanTurn
 }
 
 // forgetLocalHops clears every same-machine pair count that includes key. The caller holds b.mu.

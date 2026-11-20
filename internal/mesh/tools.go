@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/tenequm/amesh/internal/codex"
 	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/hub"
@@ -31,6 +32,16 @@ var address = regexp.MustCompile("^" + label + "(@" + label + "(:[a-z0-9][a-z0-9
 
 var nonLabel = regexp.MustCompile("[^a-z0-9._-]+")
 
+const maxLabel = 40
+
+func addressLabel(part string) string {
+	part = strings.Trim(nonLabel.ReplaceAllString(strings.ToLower(part), "-"), "._-")
+	if part == "" {
+		return "session"
+	}
+	return part[:min(maxLabel, len(part))]
+}
+
 func normalizeAddress(input string) string {
 	if utf8.RuneCountInString(input) > 100 {
 		return ""
@@ -40,16 +51,9 @@ func normalizeAddress(input string) string {
 	if name == "" || strings.Contains(name, ":") || strings.Contains(session, "@") || qualified && project == "" {
 		return ""
 	}
-	label := func(part string) string {
-		part = strings.Trim(nonLabel.ReplaceAllString(part, "-"), "._-")
-		if part == "" {
-			return "session"
-		}
-		return part[:min(40, len(part))]
-	}
-	to := label(name)
+	to := addressLabel(name)
 	if qualified {
-		to += "@" + label(project)
+		to += "@" + addressLabel(project)
 	}
 	if hasMachine {
 		to += ":" + machine
@@ -130,11 +134,15 @@ func (b *Backend) reachablePeers(ctx context.Context, caller registry.Key, machi
 		if !hasHost {
 			host = machine
 		}
-		locals[m.address] = contract.Peer{Address: m.address, Kind: contract.KindSession, Machine: &host, Project: &project, Status: status(s)}
+		kind := contract.KindSession
+		if s.Codex {
+			kind = contract.KindCodex
+		}
+		locals[m.address] = contract.Peer{Address: m.address, Kind: kind, Machine: &host, Project: &project, Status: status(s)}
 	}
 	peers := make([]contract.Peer, 0, len(cached)+len(locals))
 	for _, p := range cached {
-		if p.Kind == contract.KindSession && value(p.Machine) == machine {
+		if (p.Kind == contract.KindSession || p.Kind == contract.KindCodex) && value(p.Machine) == machine {
 			if local, ok := locals[p.Address]; ok {
 				local.LastSeen = p.LastSeen
 				peers = append(peers, local)
@@ -154,13 +162,13 @@ func (b *Backend) machineName(conn contract.HelloResponse) string {
 	if conn.Machine.Name != "" {
 		return conn.Machine.Name
 	}
-	return b.cfg.MachineName
+	return cmp.Or(b.cfg.MachineName, "local")
 }
 
 func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter string) (mcpserver.Directory, error) {
 	conn, halt := b.client.Connection()
 	machine := b.machineName(conn)
-	m, _ := b.member(sessionKey(s.Key))
+	m, _ := b.member(s.MeshKey())
 	name := m.address
 	if name == "" {
 		name = s.Name + "@" + s.Project + ":" + machine
@@ -181,6 +189,9 @@ func (b *Backend) ListPeers(ctx context.Context, s registry.Session, filter stri
 	b.mu.RLock()
 	since := b.offlineSince
 	b.mu.RUnlock()
+	if errors.Is(halt, hub.ErrNoHub) {
+		return out, nil
+	}
 	if halt != nil {
 		out.Stale = new(haltReason(halt))
 	} else if !since.IsZero() {
@@ -242,18 +253,18 @@ func (b *Backend) liveSession(ctx context.Context, key string) (registry.Session
 	if err != nil {
 		return registry.Session{}, false, err
 	}
-	return s, s.Key == m.session.Key && b.eligible(s), nil
+	return s, s.Key == m.session.Key && s.MeshKey() == key && b.eligible(s), nil
 }
 
 func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target member, senderAddress, message string, hopLimit int64) (mcpserver.SendResult, error) {
-	receiver, ok, err := b.liveSession(ctx, sessionKey(target.session.Key))
+	receiver, ok, err := b.liveSession(ctx, target.session.MeshKey())
 	if err != nil {
 		return mcpserver.SendResult{}, err
 	}
 	if !ok {
 		return refused(target.address+" is not running anymore.", nil), nil
 	}
-	pair := [2]string{sessionKey(s.Key), sessionKey(target.session.Key)}
+	pair := [2]string{s.MeshKey(), target.session.MeshKey()}
 	slices.Sort(pair[:])
 	// Reserve the hop before writing so concurrent sends on one pair cannot pass the limit together.
 	b.mu.Lock()
@@ -266,24 +277,48 @@ func (b *Backend) sendLocal(ctx context.Context, s registry.Session, target memb
 		return refused(fmt.Sprintf("Conversation paused after %d messages. A human turn resets the limit.", hops), nil), nil
 	}
 	id := uuid.NewString()
-	err = b.relays.Write(ctx, relay.Delivery{ID: id, Inbox: receiver.SocketPath, ReplyAddress: senderAddress, Message: envelope.Message{From: envelope.Address(s.SocketPath), FromName: s.Name, FromMode: s.FromMode, Body: message}})
-	if err != nil {
+	from := envelope.Address(s.SocketPath)
+	if s.Codex {
+		from, err = b.nativeThreadAddress(s)
+	}
+	d := relay.Delivery{ID: id, Inbox: receiver.SocketPath, ReplyAddress: senderAddress, Message: envelope.Message{From: from, FromName: s.Name, FromMode: s.FromMode, Body: message}}
+	if s.Codex || receiver.Codex {
+		d.ReplyTo = id
+		b.linkReply(d, receiver.MeshKey(), s.MeshKey(), ctx.Value(fallbackReply{}) == nil)
+	}
+	queued := false
+	if err == nil {
+		if receiver.Codex {
+			queued, err = b.writeThread(ctx, receiver, d)
+		} else {
+			err = b.relays.Write(ctx, d)
+		}
+	}
+	note := "Sent. A reply, if any, arrives later as a message from " + target.address + "."
+	switch {
+	case errors.Is(err, codex.ErrUnconfirmed):
+		// The request reached Codex, so the message may run; a resend would queue a second turn.
+		note = "Delivery to " + target.address + " was not confirmed, but it may still arrive. Do not resend it."
+	case err != nil:
 		b.mu.Lock()
+		delete(b.links, id)
 		if b.localHops[pair] > 0 {
 			b.localHops[pair]--
 		}
 		b.mu.Unlock()
 		return refused("The message could not be written to "+target.address+".", nil), nil
+	case queued:
+		note = "Queued for the next idle turn of " + target.address + "."
 	}
-	return mcpserver.SendResult{Accepted: true, ID: &id, To: &target.address, Note: new("Sent. A reply, if any, arrives later as a message from " + target.address + ".")}, nil
+	return mcpserver.SendResult{Accepted: true, ID: &id, To: &target.address, Note: &note}, nil
 }
 
 func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcpserver.SendArgs) (mcpserver.SendResult, error) {
 	conn, halt := b.client.Connection()
-	if halt != nil {
+	if halt != nil && !errors.Is(halt, hub.ErrNoHub) {
 		return refused(haltReason(halt), nil), nil
 	}
-	key := sessionKey(s.Key)
+	key := s.MeshKey()
 	m, ok := b.member(key)
 	if !ok {
 		return refused("This session is not a mesh member.", nil), nil
@@ -304,8 +339,21 @@ func (b *Backend) SendMessage(ctx context.Context, s registry.Session, args mcps
 		}
 		return refused("The message is longer than "+limit+". Shorten it or split it.", nil), nil
 	}
+	if link, linked := b.reply(ctx, s, args); linked {
+		if link.sender != "" {
+			target, ok := b.member(link.sender)
+			if !ok {
+				return refused("The session that sent this message has ended.", nil), nil
+			}
+			return b.sendLocal(ctx, s, target, m.address, args.Message, cmp.Or(conn.Limits.HopLimit, defaultHopLimit))
+		}
+		args.ReplyTo = &link.endpoint
+	}
 	if target, found := b.localTarget(to); found {
 		return b.sendLocal(ctx, s, target, m.address, args.Message, cmp.Or(conn.Limits.HopLimit, defaultHopLimit))
+	}
+	if halt != nil {
+		return refused(haltReason(halt), nil), nil
 	}
 	id := uuid.NewString()
 	req := contract.SendRequest{ID: id, From: contract.SendRequestFrom{Session: key}, Text: args.Message, FromMode: optional(s.FromMode), Origin: contract.SendRequestOriginUnknown}

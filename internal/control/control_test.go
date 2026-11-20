@@ -328,7 +328,7 @@ type humanBackend struct {
 }
 
 func (b humanBackend) Status(s *contract.DaemonStatus) error {
-	s.Sessions = append(s.Sessions, contract.DaemonStatusSessionsItem{Key: sessionKey(b.member), Address: "amesh-a2@project:mac", Role: "member"})
+	s.Sessions = append(s.Sessions, contract.DaemonStatusSessionsItem{Key: b.member.MeshKey(), Address: "amesh-a2@project:mac", Role: "member"})
 	return nil
 }
 

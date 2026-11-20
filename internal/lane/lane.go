@@ -117,7 +117,7 @@ func (c *conversation) resolveParent(ctx context.Context) (registry.Session, err
 	}
 	var parent registry.Session
 	for _, s := range all {
-		if s.SessionID != c.key.parent {
+		if s.SessionID != c.key.parent || s.Codex {
 			continue
 		}
 		if parent.PID != 0 {

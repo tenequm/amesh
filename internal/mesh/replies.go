@@ -40,7 +40,7 @@ func (b *Backend) native(ctx context.Context, log, id string, e relay.Event) err
 	if err != nil {
 		return err
 	}
-	key := sessionKey(s.Key)
+	key := s.MeshKey()
 	ep, ok := b.endpoint(id)
 	if s.PID != e.Peer.PID || !b.IsMember(s.Key) || !b.eligible(s) || !ok || !slices.Contains(ep.parties, key) {
 		return errors.New("relay sender is not a hosted party")
@@ -158,6 +158,9 @@ func (b *Backend) writeNotice(ctx context.Context, conn contract.HelloResponse, 
 		msg.FromName = ep.ref.Name
 	}
 	d := relay.Delivery{Inbox: s.SocketPath, Session: n.session, Log: conn.Log, Message: msg, AcceptWindow: time.Duration(conn.Settings.AcceptWindowMs) * time.Millisecond}
+	if s.Codex {
+		return b.relays.DeliverNotice(ctx, d, source, n.cause, n.peer, n.detail, func(ctx context.Context, d relay.Delivery) error { _, err := b.writeThread(ctx, s, d); return err })
+	}
 	return b.relays.WriteNotice(ctx, d, source, n.cause, n.peer, n.detail)
 }
 

@@ -765,7 +765,7 @@ components:
       type: string
       pattern: '^pm_[A-Za-z0-9_-]{22}$'
     SessionKey:
-      description: '<pid> + "-" + first 8 hex of SHA-256(procStart as the registry stores it) (*proposed*, contract.md section 6).'
+      description: 'Claude Code uses <pid> + "-" + the first 8 hex of SHA-256(procStart). Codex hashes its canonical thread UUID text with SHA-256. The decimal prefix is 2^32 plus the first four digest bytes as a big-endian unsigned integer. The suffix is bytes 4 through 7 as lowercase hex. This preserves the hub key grammar across resume and places Codex outside the kernel PID range.'
       type: string
       pattern: '^[1-9][0-9]{0,9}-[0-9a-f]{8}$'
     EndpointId:
@@ -799,9 +799,10 @@ components:
       x-amesh-open: true
       enum: [idle, busy, offline]
     Kind:
+      description: The local directory identifies a Codex thread as codex. Hubs can represent all registered sessions as session.
       type: string
       x-amesh-open: true
-      enum: [agent, session]
+      enum: [agent, session, codex]
     Epoch:
       description: A connection epoch (contract.md section 5); it changes only when the daemon process holding it changes. Every write and the stream carry the live one; any other answers 409 superseded (A2).
       type: integer
@@ -984,13 +985,13 @@ components:
       required: [epoch, sessionId, name, nameSource, project, status, entrypoint, claudeCode, startedAt]
       properties:
         epoch: {$ref: '#/components/schemas/Epoch'}
-        sessionId: {type: string, description: "Claude Code's session id, an attribute (it changes on /clear)."}
+        sessionId: {type: string, description: "The Claude Code session id (it changes on /clear) or the stable Codex thread UUID."}
         name: {type: string, description: "The registry's name, before address normalisation."}
         nameSource: {type: string, description: 'user or derived (open set).'}
         project: {type: string, description: 'The project name (contract.md section 7).'}
         status: {type: string, enum: [idle, busy], x-amesh-open: false, description: "The registry's status at registration; waiting and others map to busy. Later changes travel in the heartbeat (A2)."}
-        entrypoint: {type: string, description: 'cli or sdk-cli (open set).'}
-        claudeCode: {type: string, description: "The session's Claude Code version."}
+        entrypoint: {type: string, description: 'cli, sdk-cli or codex (open set).'}
+        claudeCode: {type: string, description: "The Claude Code version, or an empty string for a Codex thread."}
         startedAt: {$ref: '#/components/schemas/Ms'}
     SessionInfo:
       type: object
@@ -1169,7 +1170,7 @@ components:
       description: |-
         queued (stored at the hub); sent (the receiving daemon's heartbeat cursor passed it, or any later report for it arrived, D39);
         accepted (written to the inbox, no negative receipt within acceptWindowMs; for an agent
-        target, written into its hub session, A2; final); held (Claude Code holds it for
+        target, written into its hub session, A2; for Codex, acknowledged by turn/start or thread/queue/add; final); held (Claude Code holds it for
         approval); delivered, denied, expired (final, from a hold); refused (the session
         refuses peers; final); dropped (with a reason; final); unknown (written into the inbox and
         still open when the daemon restarted; final, never told, D25). Open set: an unknown state
@@ -1452,7 +1453,7 @@ components:
         line before the closing tag. For a delivery from the hub it names the peer's address and the
         conversation's endpoint id:
         (amesh: <name> cannot see what you write here. To answer, call send_message with to="<address>" and reply_to="<endpoint id>".)
-        For a send between two sessions of one machine it names only the address:
+        A same-machine conversation involving Codex uses the message UUID as reply_to. For two Claude Code sessions it names only the address:
         (amesh: <name> cannot see what you write here. To answer, call send_message with to="<address>".)
         A sender with no assigned address gets the native line, SendMessage with the frame's exact
         from address. send_message with reply_to is sent to that endpoint exactly as a native reply
@@ -1992,8 +1993,8 @@ components:
           c3n-MHUOLraqLSy4lX8rIw
           deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEQCIG5Qni8-LtWc3QN0Siq7dVBISeFHnUdxuyaOXBRzIdiTAiBcTlzzUE_y6_zzoP19t3L5a6wFR_5k4bOTpQd4RVlLMw
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=c3n-MHUOLraqLSy4lX8rIw,bh=deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b,s=MEQCIG5Qni8-LtWc3QN0Siq7dVBISeFHnUdxuyaOXBRzIdiTAiBcTlzzUE_y6_zzoP19t3L5a6wFR_5k4bOTpQd4RVlLMw
+        signature: MEYCIQD88O1CxrqIjHG7QFCxp9Lvz6nbWfIrEi89PUFM28vmOwIhAJNVmRjER3jMKR62lKIGp3gX9aNyyVqSEfKKeTPji_p0
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=c3n-MHUOLraqLSy4lX8rIw,bh=deb49541799facb6913807e1cffdab2dbcdefe077a77fbab1ae0173fc48aa32b,s=MEYCIQD88O1CxrqIjHG7QFCxp9Lvz6nbWfIrEi89PUFM28vmOwIhAJNVmRjER3jMKR62lKIGp3gX9aNyyVqSEfKKeTPji_p0
         signatureValid: true
     sigEventsConnect:
       summary: 'Valid, GET /peer/events'
@@ -2017,8 +2018,8 @@ components:
           gDZl6DWT3atXh6Z_x2AT1A
           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEQCIF8UntIgwiiFjruURW9OVKXRjvLbncxAqemIJyL4EndNAiBJZ1KmuTkE-rx0JiQ00Ik-RqrwD3ty8xLmc8qiBMyoHA
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEQCIF8UntIgwiiFjruURW9OVKXRjvLbncxAqemIJyL4EndNAiBJZ1KmuTkE-rx0JiQ00Ik-RqrwD3ty8xLmc8qiBMyoHA
+        signature: MEUCIBZF52W3IurgGwZ3iorLUpVYbSCrLN-L2enCtWKFG6pOAiEA4QMessuTYkEmvKNVoLrdet4DamTSJO3GJlVXQbOFN-8
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=gDZl6DWT3atXh6Z_x2AT1A,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEUCIBZF52W3IurgGwZ3iorLUpVYbSCrLN-L2enCtWKFG6pOAiEA4QMessuTYkEmvKNVoLrdet4DamTSJO3GJlVXQbOFN-8
         signatureValid: true
     sigGetPeersFilter:
       summary: 'Valid, GET /peer/peers with a filter'
@@ -2042,8 +2043,8 @@ components:
           4eIavNJcFsJcPJOWdcqsfg
           e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEYCIQCFO7cMAMhQNh54s2WJpJ7etmQDVi2ugPs80x92n7ZB_QIhAI8ARd-7NPaTHLkt27kN8cvgkvfXW_Ow6OS-RW-h1mmH
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQCFO7cMAMhQNh54s2WJpJ7etmQDVi2ugPs80x92n7ZB_QIhAI8ARd-7NPaTHLkt27kN8cvgkvfXW_Ow6OS-RW-h1mmH
+        signature: MEYCIQCd5LhRwcvDGPaPBdbZ5SGgNLdj2UrqM-c_l6a1NE0IDgIhAM4YpEHVMlRyxl_txz4J-2ZIBPdU7CYkYPkVZyXG4pGC
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=4eIavNJcFsJcPJOWdcqsfg,bh=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,s=MEYCIQCd5LhRwcvDGPaPBdbZ5SGgNLdj2UrqM-c_l6a1NE0IDgIhAM4YpEHVMlRyxl_txz4J-2ZIBPdU7CYkYPkVZyXG4pGC
         signatureValid: true
     sigPostMessage:
       summary: 'Valid, POST /peer/messages'
@@ -2067,8 +2068,8 @@ components:
           f302A6d7AdJeQ4Xd1umgBQ
           76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCICP4ao9Ma-xjJFWqgZntJMGAQFMmhjudMry6ScwX7iqDAiEA6Z6UHft7uNtycEAidXkz7o4ZRX-olnj5ljer5YxhUkQ
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=f302A6d7AdJeQ4Xd1umgBQ,bh=76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82,s=MEUCICP4ao9Ma-xjJFWqgZntJMGAQFMmhjudMry6ScwX7iqDAiEA6Z6UHft7uNtycEAidXkz7o4ZRX-olnj5ljer5YxhUkQ
+        signature: MEUCIFUs3hqWrjqlZe6buW6ZVxNTtavntTGbnzPsXCQ5S5gUAiEA4uGkl0q6NyMXfcC7zjnCsYOxKnWhKzfHR8wr1l1ShEk
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=f302A6d7AdJeQ4Xd1umgBQ,bh=76db4cfdc10521c2f1982f653a93d238c0cad37f4a503b74c39395cad2195a82,s=MEUCIFUs3hqWrjqlZe6buW6ZVxNTtavntTGbnzPsXCQ5S5gUAiEA4uGkl0q6NyMXfcC7zjnCsYOxKnWhKzfHR8wr1l1ShEk
         signatureValid: true
     sigBadChangedBody:
       summary: 'Tampered body, must not verify'
@@ -2092,8 +2093,8 @@ components:
           agYlKuRtFDQDhynLE0sM7g
           316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe
           pm_PCly-PiMxyo5IXRSo4i70g
-        signature: MEUCIQD36eOXUvlKTpeGQqzzqVE8tEBWY3VT8EnwiyWvWEPYjgIgMAxLAhW0W9W_vJje94WDRK9g2bPkT2IHxPu0dnGSGOU
-        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=agYlKuRtFDQDhynLE0sM7g,bh=316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe,s=MEUCIQD36eOXUvlKTpeGQqzzqVE8tEBWY3VT8EnwiyWvWEPYjgIgMAxLAhW0W9W_vJje94WDRK9g2bPkT2IHxPu0dnGSGOU
+        signature: MEUCIQCPhDA_8whg0a-1Eexdq0gdhslepkvzjewh_Q23AODWJwIgERKPme8YftzXwxps0DXUs9OJGTWCSyt0r6hIhLrj608
+        authorization: Amesh-Sig v=1,p=1,d=pm_PCly-PiMxyo5IXRSo4i70g,t=1795089600,n=agYlKuRtFDQDhynLE0sM7g,bh=316617b4958f908dab2628f1f4ca40f868faebb9f472285206876be6efea4fbe,s=MEUCIQCPhDA_8whg0a-1Eexdq0gdhslepkvzjewh_Q23AODWJwIgERKPme8YftzXwxps0DXUs9OJGTWCSyt0r6hIhLrj608
         signatureValid: false
         note: Signed over the original body hash; the header carries the changed body hash, so the signature does not verify.
     envAgentMessage:

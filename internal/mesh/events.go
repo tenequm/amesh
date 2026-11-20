@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tenequm/amesh/internal/codex"
 	"github.com/tenequm/amesh/internal/contract"
 	"github.com/tenequm/amesh/internal/envelope"
 	"github.com/tenequm/amesh/internal/registry"
@@ -148,7 +149,13 @@ func (b *Backend) prepareLog(ctx context.Context, conn contract.HelloResponse) e
 	}
 	for id, e := range entries {
 		status, reason := contract.DeliveryStateUnknown, contract.DropReason("")
-		if e.Phase == state.Writing {
+		b.mu.RLock()
+		thread := b.members[e.Session].session.Codex
+		b.mu.RUnlock()
+		if thread && e.Phase == state.Written {
+			status = contract.DeliveryStateAccepted
+		}
+		if !thread && e.Phase == state.Writing {
 			status, reason = contract.DeliveryStateDropped, contract.DropReasonInterrupted
 		}
 		if err = b.report(ctx, conn.Log, id, e.Session, status, reason); err != nil {
@@ -176,6 +183,19 @@ func (b *Backend) deliverySession(ctx context.Context, key string) (registry.Ses
 func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg contract.MessageEvent) error {
 	key := msg.Session
 	if known, err := b.store.Contains(conn.Log, msg.ID); known || err != nil {
+		if m, _ := b.member(key); err == nil && m.session.Codex {
+			entries, e := b.store.OpenEntries(conn.Log)
+			if e != nil {
+				return e
+			}
+			if open, ok := entries[msg.ID]; ok {
+				status := contract.DeliveryStateUnknown
+				if open.Phase == state.Written {
+					status = contract.DeliveryStateAccepted
+				}
+				return b.report(ctx, conn.Log, msg.ID, key, status, "")
+			}
+		}
 		return err
 	}
 	s, live, err := b.deliverySession(ctx, key)
@@ -205,6 +225,23 @@ func (b *Backend) receive(ctx context.Context, conn contract.HelloResponse, msg 
 		return errors.New("message endpoint has no bound relay")
 	}
 	d := relay.Delivery{Inbox: s.SocketPath, ReplyAddress: msg.Endpoint.Peer, ReplyTo: msg.Endpoint.ID, ID: msg.ID, Session: key, Log: conn.Log, AcceptWindow: time.Duration(conn.Settings.AcceptWindowMs) * time.Millisecond, Message: envelope.Message{From: ep.from, FromSession: msg.Endpoint.ID, FromName: msg.Endpoint.Name, FromMode: value(msg.FromMode), HopChain: msg.HopChain, Body: msg.Text}}
+	if s.Codex {
+		b.linkReply(d, key, "", true)
+		_, err = b.writeThread(ctx, s, d)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil && !errors.Is(err, codex.ErrUnconfirmed) {
+			b.mu.Lock()
+			delete(b.links, msg.ID)
+			b.mu.Unlock()
+			return b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateDropped, contract.DropReasonRouteFailed)
+		}
+		if err != nil {
+			return b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateUnknown, "")
+		}
+		return b.report(ctx, conn.Log, msg.ID, key, contract.DeliveryStateAccepted, "")
+	}
 	err = b.relays.Write(ctx, d)
 	if err == nil || ctx.Err() != nil {
 		return err

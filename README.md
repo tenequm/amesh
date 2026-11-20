@@ -1,13 +1,13 @@
 # amesh
 
-`amesh` lets Claude Code sessions message each other. One daemon runs per machine. Each Claude Code session talks to it through a small MCP server (`amesh mcp`), and peer messages arrive in the session as native cross-session messages.
+`amesh` lets Claude Code and Codex sessions message each other through a per-machine daemon and a stdio MCP server (`amesh mcp`).
 
 It has two modes:
 
 - **Lane mode** works on one machine with no other setup. A session whose MCP server runs as `amesh mcp --parent <session id>` gets one tool, `send_to_parent`, and the session that launched it answers with a native `SendMessage`.
 - **Mesh mode** connects sessions to a hub, so they can find and message agents and Claude Code sessions on other machines with the `list_peers` and `send_message` tools. The hub is a [nanoclaw](https://github.com/tenequm/nanoclaw) host with its peer channel enabled ([docs/peer-channel.md](https://github.com/tenequm/nanoclaw/blob/main/docs/peer-channel.md)). The wire contract is [api/openapi.yaml](api/openapi.yaml).
 
-amesh runs on macOS and Linux and needs a Claude Code version with cross-session messaging.
+amesh runs on macOS and Linux. Claude Code peers need a version with native cross-session messaging.
 
 ## Install
 
@@ -55,9 +55,23 @@ In that config directory's `settings.json`:
 
 The `PreToolUse` hook keeps the mesh tools away from subagents. The `UserPromptSubmit` hook tells the daemon when a person typed in a session, which resets the hop limit of that session's conversations. If you run Claude Code with more than one config directory (`CLAUDE_CONFIG_DIR`), list them all in `AMESH_CLAUDE_CONFIG_DIRS`.
 
+## Connect Codex
+
+Add a user-scope MCP server in the Codex configuration:
+
+```toml
+[mcp_servers.amesh]
+command = "amesh"
+args = ["mcp"]
+```
+
+Run the daemon with access to the same Codex home, `lsof`, `sqlite3` and `codex`. The daemon identifies a thread by its writer lock and confirms the thread ID on tool calls. The newest pipe under a shared host takes precedence while older threads remain loaded. Use the address from `list_peers` to send a message.
+
+On Codex 0.170.0, the local app-server can steer a busy hosted thread or start an idle one. Other hosts, including an embedded TUI or a desktop app with a private app-server, consume messages from the durable queue on their next idle turn. Peer input identifies the sender and ends with the tool call for replying. If a dedicated peer turn produces only a final answer, amesh sends that answer back to the sender.
+
 ## Point it at a hub
 
-Without a hub URL the daemon runs lane mode only, and `list_peers` and `send_message` answer that no hub is configured. To join a mesh:
+Without a hub URL, registered sessions can list and message peers on the same machine. The default machine label is `local`. To reach peers on other machines:
 
 1. Pick a machine name (lowercase letters, digits and `-`, at most 16 characters) and enroll:
 
@@ -86,7 +100,7 @@ Flags override environment variables. Global flags go before the subcommand. `da
 | `-claude-config-dirs` | `AMESH_CLAUDE_CONFIG_DIRS` | `~/.claude` |
 | `-exclude` | `AMESH_EXCLUDE` | No exclusion roots |
 | `-machine-name` | `AMESH_MACHINE_NAME` | Empty until you enroll |
-| `-hub-url` | `AMESH_HUB_URL` | Empty: no hub, lane mode only |
+| `-hub-url` | `AMESH_HUB_URL` | Empty: same-machine peers only |
 
 Directory lists use a colon separator. Paths accept an absolute path or a leading `~/`. Sessions in any directory listed in `AMESH_CLAUDE_CONFIG_DIRS` can join the mesh. Set `AMESH_EXCLUDE` to refuse mesh pipes for sessions whose working directory is at or under one of its roots; lane pipes are not affected.
 
